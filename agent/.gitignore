@@ -6,3 +6,4 @@ agent.exe
 # Local runtime files
 config.json
 *.models.dev.json
+.gotmp/
