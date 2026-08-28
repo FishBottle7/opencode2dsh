@@ -147,6 +147,59 @@ Phase 0 ──► Phase 1 ──┬──► Phase 2 ──► 交付
 | R4 | 裁剪引入语义回归 | 0.4-0.8 单测红 | 遵守「拷贝即冻结」：先全量拷贝过测、再裁剪，每次裁剪后重跑单测 |
 | R5 | Windows 信号差异 | 1.3/3.6 验收失败 | Windows 无 SIGTERM 语义：用 `taskkill /T`（带 /F 才强制）；插件侧以 stdout 关闭 + healthz 探测判定死亡 |
 
+## 附录 A — 任务 1.1 核实结论：DSH provider 注册协议（2026-08-28，实机核实）
+
+**环境**：DSH CLI `@deepseek-ai/dsh@0.1.1-rc.2`（npm 全局安装，cordis 插件体系），web profile 位于 `~/.dsh/profiles/web/`。
+
+**结论：DSH 支持插件运行时动态注册 provider 与模型清单，无需重启。** provider.ts 采用「运行时注册」，不退化为静态配置片段。
+
+### A.1 LLM 服务面（`@deepseek-ai/dsh-llm`，`lib/index.js`）
+
+- `ctx.llm.registerAdapter(providers: string[], adapter)`（index.js:1174）：为若干 provider 路由注册 adapter；随插件 fiber 生命周期自动注销；`handle.replace(routes)` 原子换路由集，并广播 `llm/adapters-updated`。
+- adapter 接口（index.js:1073 `LlmAdapter` 基类）：
+  - `providerInfo(provider)` → `{ id, name }` 显示元数据；
+  - `listModels(provider)` → `{ provider, id, name, description?, inputModalities? }[]`，**目录仅为建议性**（advisory），不参与请求校验；
+  - `resolveModel(provider, model, signal)` → 精确模型元数据（`context.contextWindow`、`defaultMaxTokens`、`reasoning.efforts` 等）；
+  - `prepareCall(provider, model, signal)` → `{ model, stream }`；
+  - `stream(options)` → 流式生成；请求须带 `attributionHeaders()`（`user-agent`）。
+- `registerConfigurableProviders(entries)`（index.js:1251）：可选，把 provider 挂进配置目录（供 Web 设置页显示/编辑）；`registerModelDiscovery(ns, discover)`（index.js:1315）：可选，供设置页「探测端点模型」。
+
+### A.2 现成 OpenAI 兼容适配层：`@deepseek-ai/dsh-llm-pi-ai`
+
+内置插件 `llm-pi-ai`（settings 命名空间 `llm-pi-ai`）即为「OpenAI 兼容端点接入」的标准路径（基于 `@earendil-works/pi-ai`）：
+
+```yaml
+# ~/.dsh/settings.yaml
+llm-pi-ai:
+  providers:
+    opencode2dsh:
+      displayName: opencode2dsh
+      apiKeyEnv: OPENCODE2DSH_TOKEN      # 走 ctx.credentials 解析；协议 openai-completions
+      api: openai-completions
+      baseURL: http://127.0.0.1:<port>/v1
+      models:
+        - id: <agent /v1/models 返回的 id>
+          name: <显示名>
+```
+
+实机已有两个手写 provider（abrdns/pangmao）按此形态工作。profile 字段含 `headers`（dict）、`compat`、`retryPolicy` 等；`apiKeyEnv` 是凭证引用（`ctx.credentials.resolve`），值可由 `ctx.credentials.set(ref, token)` 以编程方式写入（dsh-credentials README「Surface」节），配置文件里永远只有引用没有秘密。
+
+### A.3 第三方 cordis 插件形态（实机先例 `@superfish058/dsh-llm-proxy@1.1.0`）
+
+- npm 包 `type: module`，`main: lib/index.js`，导出 `name`/`inject`/`apply`（可加 `Config`/`schema`）；
+- 包根附 `cordis.patch.yml`：bundle patch，`- insert: [{ id, name, config }]` 把插件插进运行图（cordis-plugin-include/loader 机制）；
+- 安装：`dsh plugin --profile web add <pkg>`（pnpm 转发到 profile 目录），并把包名加进 profile `package.json` 的 `dsh.profile.bundles`。
+
+### A.4 opencode2dsh 的 provider.ts 定案
+
+两段式：
+
+1. **进程管理**（本项目独有职责）：spawn agent.exe、READY 握手拿端口、看护重启——任何现有插件都不做这件事，必须自己写（agent-process.ts）。
+2. **provider 接入**：**不自己实现 LlmAdapter**，改为插件启动/模型刷新时，用 `ctx.settings`（`settings.mutate('llm-pi-ai', …)`）确保 `llm-pi-ai.providers.opencode2dsh` 路由存在并指向 `http://127.0.0.1:<port>/v1`，模型清单从 agent `GET /v1/models` 拉取后写入该路由的 `models` 数组；token 经 `ctx.credentials.set(credentialRef('OPENCODE2DSH_TOKEN'), token)` 写入。流式/重试/错误映射复用 pi-ai 与 dsh-llm-retry 的现成实现，Phase 3 的「DSH 端错误 UX」由这条现成链路承担。
+   - 若实测发现 settings 写入在无 UI 的 headless 启动序中不可用，退路：改走 `ctx.llm.registerAdapter` 自实现薄 adapter（仅转发 fetch 到本地代理），接口面见 A.1。
+
+**对 plan.md 的影响**：1.5 的产出从「实现 LlmAdapter」改为「settings/credentials 写入 + 模型清单刷新」；验收标准不变。
+
 ## 交付物清单
 
 1. `agent/`：Go module（零第三方依赖），`cmd/agent` 二进制源码 + 单测 + `scripts/verify-static-models`。
