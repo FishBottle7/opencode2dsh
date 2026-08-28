@@ -1,0 +1,8 @@
+# Build artifacts
+agent
+agent.exe
+*.test
+
+# Local runtime files
+config.json
+*.models.dev.json
