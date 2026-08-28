@@ -1,6 +1,6 @@
 # Build artifacts
-agent
-agent.exe
+/agent
+/agent.exe
 *.test
 
 # Local runtime files
