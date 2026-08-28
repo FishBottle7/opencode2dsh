@@ -99,7 +99,9 @@ func (c *ModelCatalog) anonymousDecision(model string) AnonymousDecision {
 	return AnonymousDecision{Allowed: isFreeModel(model), Source: "name_fallback_metadata_pending"}
 }
 
-func (c *ModelCatalog) DiagnosticAnonymous(model string) AnonymousDecision {
+// AnonymousDecision exposes the decision for diagnostics and the /v1/models
+// filter in the gateway.
+func (c *ModelCatalog) AnonymousDecision(model string) AnonymousDecision {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.anonymousDecision(model)

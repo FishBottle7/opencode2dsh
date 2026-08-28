@@ -56,19 +56,19 @@ func TestCatalogDecisionMergeWithMetadata(t *testing.T) {
 	}
 	catalog := NewModelCatalog(store)
 
-	if d := catalog.DiagnosticAnonymous("costless-one"); !d.Allowed || d.Source != "metadata_free" {
+	if d := catalog.AnonymousDecision("costless-one"); !d.Allowed || d.Source != "metadata_free" {
 		t.Fatalf("S1∩S2: metadata free must allow, got %+v", d)
 	}
-	if d := catalog.DiagnosticAnonymous("paid-one"); d.Allowed {
+	if d := catalog.AnonymousDecision("paid-one"); d.Allowed {
 		t.Fatalf("S1∩S2: metadata paid must deny, got %+v", d)
 	}
-	if d := catalog.DiagnosticAnonymous("legacy-zero"); d.Allowed {
+	if d := catalog.AnonymousDecision("legacy-zero"); d.Allowed {
 		t.Fatalf("deprecated must deny even with free in the name, got %+v", d)
 	}
 
 	// S2 not ready => name fallback (models.go:257 upstream behavior).
 	pending := NewModelCatalog(&ModelMetadataStore{models: map[string]ModelPrice{}})
-	if d := pending.DiagnosticAnonymous("xx-free-xx"); !d.Allowed || d.Source != "name_free" {
+	if d := pending.AnonymousDecision("xx-free-xx"); !d.Allowed || d.Source != "name_free" {
 		t.Fatalf("pending metadata must fall back to name, got %+v", d)
 	}
 }
@@ -80,7 +80,7 @@ func TestCatalogStaticOverridesOnlyUnknownMetadata(t *testing.T) {
 
 	// metadata missing the model entirely -> static vouches.
 	missing := NewModelCatalog(&ModelMetadataStore{models: map[string]ModelPrice{"other": {ID: "other"}}, updatedAt: testTime()})
-	if d := missing.DiagnosticAnonymous("verified-one"); !d.Allowed || d.Source != "static_verified" {
+	if d := missing.AnonymousDecision("verified-one"); !d.Allowed || d.Source != "static_verified" {
 		t.Fatalf("static entry must be allowed when metadata does not know it, got %+v", d)
 	}
 
@@ -90,13 +90,13 @@ func TestCatalogStaticOverridesOnlyUnknownMetadata(t *testing.T) {
 		updatedAt: testTime(),
 	}
 	known := NewModelCatalog(store)
-	if d := known.DiagnosticAnonymous("verified-paid"); d.Allowed {
+	if d := known.AnonymousDecision("verified-paid"); d.Allowed {
 		t.Fatalf("metadata paid must not be overridden by the static list, got %+v", d)
 	}
 
 	// pending metadata -> static vouches (design.md 4.2 fallback chain).
 	pending := NewModelCatalog(&ModelMetadataStore{models: map[string]ModelPrice{}})
-	if d := pending.DiagnosticAnonymous("verified-one"); !d.Allowed || d.Source != "static_verified" {
+	if d := pending.AnonymousDecision("verified-one"); !d.Allowed || d.Source != "static_verified" {
 		t.Fatalf("static must vouch while metadata is pending, got %+v", d)
 	}
 }

@@ -35,3 +35,10 @@ func staticFreeList() []string {
 	out = append(out, staticFreeModels...)
 	return out
 }
+
+// SetStaticFreeModelsForTesting replaces the active S3 list. It exists so
+// cross-package tests (gateway) can pin the static list; production code must
+// never call it.
+func SetStaticFreeModelsForTesting(ids []string) {
+	staticFreeModels = append([]string(nil), ids...)
+}
