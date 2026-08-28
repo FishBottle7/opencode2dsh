@@ -1,0 +1,8 @@
+# Dependencies
+node_modules/
+
+# Build output
+packages/plugin/lib/
+
+# Logs / local state
+*.log

@@ -1,0 +1,170 @@
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+import { existsSync } from 'node:fs'
+
+import { AgentProcess, type ReadyInfo } from './agent-process.js'
+import { configPaths, ensureToken, resolveConfig, writeAgentConfig, type Opencode2dshConfig } from './config.js'
+import { fetchModels, registerProvider } from './provider.js'
+
+/**
+ * opencode2dsh DSH cordis plugin entry.
+ *
+ * Lifecycle (plan.md 1.6):
+ *  - apply(): prepare data dir + token + agent-config.json, spawn the agent,
+ *    wait for READY, register the llm-pi-ai provider route, schedule refresh.
+ *  - dispose(): stop the refresh timer, terminate the agent tree (graceful,
+ *    then force). The cordis fiber disposal guarantees this runs on plugin
+ *    reload/unload and on DSH shutdown, so no orphan process survives.
+ */
+
+// Minimal structural typing against the host ctx; keeps the plugin independent
+// of the exact @deepseek-ai/cordis version DSH ships.
+interface PluginContext {
+  logger: { info(...args: unknown[]): void; warn(...args: unknown[]): void; error(...args: unknown[]): void }
+  credentials?: { set(ref: string, value: string): Promise<void> }
+  settings?: {
+    get(ns: string): unknown
+    mutate(ns: string, ops: Array<{ op: 'set' | 'unset'; path: Array<string | number>; value?: unknown }>): Promise<void>
+  }
+  effect?(fn: () => () => void): unknown
+}
+
+export const name = 'opencode2dsh'
+export const inject = ['credentials', 'settings'] as const
+export function apply(ctx: PluginContext, config: Opencode2dshConfig = {}): { ready: Promise<ReadyInfo> } {
+  const cfg = resolveConfig(config)
+  const paths = configPaths(join(homedir(), '.opencode2dsh'))
+  const logger = ctx.logger
+
+  let agent: AgentProcess | null = null
+  let refreshTimer: NodeJS.Timeout | null = null
+  let disposed = false
+  let readyResolve: (info: ReadyInfo) => void = () => {}
+  const ready = new Promise<ReadyInfo>((resolve) => {
+    readyResolve = resolve
+  })
+
+  const onLog = (line: string) => {
+    // Agent structured logs arrive as single JSON lines on stderr/stdout.
+    logger.info(`[agent] ${line}`)
+  }
+
+  async function refreshModels(info: ReadyInfo, token: string): Promise<void> {
+    try {
+      const models = await fetchModels(info.port, token)
+      if (ctx.credentials && ctx.settings) {
+        await registerProvider(
+          {
+            credentials: ctx.credentials,
+            settings: ctx.settings,
+            logger: { info: (m) => logger.info(m), warn: (m) => logger.warn(m) },
+          },
+          { providerId: cfg.providerId, apiKeyEnv: cfg.apiKeyEnv, port: info.port },
+          token,
+          models,
+        )
+      } else {
+        logger.warn('opencode2dsh: credentials/settings services unavailable; provider route not registered')
+      }
+    } catch (err) {
+      logger.warn(`opencode2dsh: model refresh failed: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+
+  function scheduleRefresh(info: ReadyInfo, token: string): void {
+    if (refreshTimer) clearTimeout(refreshTimer)
+    refreshTimer = setTimeout(() => {
+      if (disposed) return
+      void refreshModels(info, token).then(() => {
+        if (!disposed && agent?.getState() === 'ready') scheduleRefresh(info, token)
+      })
+    }, cfg.refreshSeconds * 1000)
+  }
+
+  async function startOnce(): Promise<ReadyInfo> {
+    const token = await ensureToken(paths)
+    await writeAgentConfig(paths, { token, refreshSeconds: cfg.refreshSeconds })
+    const binary = cfg.agentPath ?? defaultAgentPath()
+    agent = new AgentProcess(binary, ['--config', paths.configPath, '--print-ready', ...(cfg.agentArgs ?? [])], {
+      restartDelayMs: cfg.restartDelayMs,
+      restartMaxDelayMs: cfg.restartMaxDelayMs,
+      maxConsecutiveCrashes: cfg.maxConsecutiveCrashes,
+      onLog,
+    })
+    agent.on('exit-restart', (delay, crashes) => {
+      logger.warn(`opencode2dsh: agent exited unexpectedly; restarting in ${delay}ms (attempt ${crashes})`)
+    })
+    agent.on('circuit-tripped', (crashes) => {
+      logger.error(`opencode2dsh: agent crashed ${crashes} times consecutively; giving up`)
+    })
+    agent.on('state', (state) => {
+      if (state === 'ready') logger.info('opencode2dsh: agent ready')
+    })
+    const info = await agent.start()
+    readyResolve(info)
+    await refreshModels(info, token)
+    scheduleRefresh(info, token)
+    return info
+  }
+
+  void startOnce().catch((err) => {
+    logger.error(`opencode2dsh: failed to start agent: ${err instanceof Error ? err.message : String(err)}`)
+  })
+
+  // Register disposer on the plugin fiber so reload/unload/shutdown reaps the
+  // child process (plan.md Phase 1 acceptance: no orphans).
+  const maybeEffect = (ctx as { effect?: PluginContext['effect'] }).effect
+  if (typeof maybeEffect === 'function') {
+    maybeEffect.call(ctx, () => () => {
+      void teardown()
+    })
+  }
+
+  async function teardown(): Promise<void> {
+    disposed = true
+    if (refreshTimer) {
+      clearTimeout(refreshTimer)
+      refreshTimer = null
+    }
+    if (agent) {
+      await agent.dispose().catch(() => {})
+      agent = null
+    }
+  }
+
+  return { ready }
+}
+
+/**
+ * Locate the agent binary: explicit config wins; then the agent-bin-* optional
+ * dependency for this platform; then a sibling checkout (dev).
+ */
+export function defaultAgentPath(): string {
+  const bin = 'opencode2dsh-agent'
+  const exe = process.platform === 'win32' ? `${bin}.exe` : bin
+  const pkg = `@opencode2dsh/agent-bin-${process.platform}-${process.arch}`
+  try {
+    const req = createRequire(import.meta.url)
+    return req.resolve(`${pkg}/${exe}`)
+  } catch {
+    // dev fallback: the Go module builds agent/agent(.exe) in-repo
+    const sibling = join(__dirnameSafe(), '..', '..', '..', 'agent', exe)
+    if (existsSync(sibling)) return sibling
+    return exe
+  }
+}
+
+import { createRequire } from 'node:module'
+import { fileURLToPath } from 'node:url'
+
+function __dirnameSafe(): string {
+  try {
+    return fileURLToPath(new URL('.', import.meta.url))
+  } catch {
+    return '.'
+  }
+}
+
+export { AgentProcess } from './agent-process.js'
+export { configPaths, ensureToken, resolveConfig, writeAgentConfig, type Opencode2dshConfig } from './config.js'
+export { fetchModels, registerProvider, providerBaseURL, toPiAiModels, type DshSeams } from './provider.js'

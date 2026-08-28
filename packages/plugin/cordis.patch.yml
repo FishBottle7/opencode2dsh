@@ -1,0 +1,9 @@
+# opencode2dsh DSH plugin — bundle patch: insert the plugin row (deployment-global).
+#
+# Defaults need no edits: the plugin spawns the agent on a random loopback port,
+# generates/persists the local token, and registers itself into llm-pi-ai.
+# Override any option via the config object below (see src/config.ts).
+- insert:
+    - id: opencode2dsh
+      name: '@opencode2dsh/dsh-plugin'
+      config: {}
