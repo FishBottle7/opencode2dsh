@@ -9,16 +9,23 @@ package catalog
 // scripts/verify-static-models.(ps1|sh) re-checks this list against the
 // upstream; maintain it whenever a model is added or upstream delists one.
 var staticFreeModels = []string{
-	// calibrated in Phase 0.10; see docs/plan.md acceptance step 5/6
+	"big-pickle",     // verified 2026-08-28: anonymous chat 200 (non-stream + stream)
+	"hy3-free",       // verified 2026-08-28: anonymous chat 200 (non-stream)
+	"mimo-v2.5-free", // verified 2026-08-28: anonymous chat 200 (non-stream)
 }
 
-// staticFreeCandidates are unverified guesses (design.md 4.1). They must pass
-// scripts/verify-static-models before being promoted to staticFreeModels.
+// staticFreeCandidates were exposed by /v1/models on 2026-08-28 but did not
+// complete a successful anonymous chat that day; re-verify before promoting.
 var staticFreeCandidates = []string{
-	// "gpt-oss-120b",      // candidate: verify 2026-02-05
-	// "gpt-oss-20b",       // candidate: verify 2026-02-05
-	// "deepseek-v4-flash", // candidate: verify 2026-02-05
-	// "qwen3-coder-480b",  // candidate: verify 2026-02-05
+	// "deepseek-v4-flash-free"          // 2026-08-28: upstream "Model is unavailable"
+	// "nemotron-3-ultra-free"           // 2026-08-28: upstream returned server_error payload
+	// "laguna-s-2.1-free"               // 2026-08-28: upstream 503 provider error
+	// "nemotron-3.5-lightning-free"     // 2026-08-28: 502 after all attempts
+	// "muse-spark-1.2-contributor-free" // 2026-08-28: 502 after all attempts
+	// "gpt-oss-120b",                   // design-era guess: not in the anonymous /v1/models list on 2026-08-28
+	// "gpt-oss-20b",                    // design-era guess: not in the anonymous /v1/models list on 2026-08-28
+	// "qwen3-coder-480b",               // design-era guess: not in the anonymous /v1/models list on 2026-08-28
+	// "deepseek-v4-flash",              // design-era guess: not in the anonymous /v1/models list on 2026-08-28
 }
 
 func isStaticFreeModel(model string) bool {
