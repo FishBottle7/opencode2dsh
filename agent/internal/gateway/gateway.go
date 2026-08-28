@@ -36,6 +36,9 @@ const (
 
 var version = "dev"
 
+// Version reports the agent build version for /healthz and startup logs.
+func Version() string { return version }
+
 type Gateway struct {
 	cfg        config.Config
 	logger     *slog.Logger
