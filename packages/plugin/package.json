@@ -1,7 +1,7 @@
 {
   "name": "@opencode2dsh/dsh-plugin",
   "version": "0.2.6",
-  "description": "Free anonymous OpenCode Zen models inside DeepSeek Harness (DSH): native LlmAdapter, no API key, no child process; optional Go sidecar included",
+  "description": "Free OpenCode Zen models for DeepSeek Harness (DSH): native dsh-llm adapter plugin, no API key.",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -41,9 +41,18 @@
     "dsh",
     "dsh-plugin",
     "deepseek-harness",
-    "cordis",
     "opencode",
-    "zen"
+    "opencode-zen",
+    "cordis",
+    "cordis-plugin",
+    "llm-adapter",
+    "llm-provider",
+    "free-models",
+    "free-llm",
+    "llm",
+    "ai-models",
+    "typescript",
+    "nodejs"
   ],
   "license": "MIT",
   "dependencies": {
