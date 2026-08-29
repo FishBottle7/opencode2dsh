@@ -1,7 +1,7 @@
 {
   "name": "@opencode2dsh/dsh-plugin",
   "version": "0.2.4",
-  "description": "DSH cordis plugin: spawn and shepherd the opencode2dsh agent (local OpenCode Zen anonymous-lane proxy) and register it as an llm-pi-ai provider",
+  "description": "Free anonymous OpenCode Zen models inside DeepSeek Harness (DSH): native LlmAdapter, no API key, no child process; optional Go sidecar included",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -11,10 +11,21 @@
   },
   "files": [
     "lib",
-    "bin",
     "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/FishBottle7/opencode2dsh.git"
+  },
+  "homepage": "https://github.com/FishBottle7/opencode2dsh#readme",
+  "bugs": "https://github.com/FishBottle7/opencode2dsh/issues",
+  "author": "FishBottle7 (https://github.com/FishBottle7)",
+  "engines": {
+    "node": ">=20"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
@@ -22,7 +33,7 @@
   },
   "scripts": {
     "build": "tsdown src/index.ts --format esm --dts --out-dir lib",
-    "prepack": "pnpm build && node ../../scripts/stamp-bin.mjs",
+    "prepack": "pnpm build && node ../../scripts/prepare-package.mjs",
     "typecheck": "tsc --noEmit",
     "test": "node --test \"test/*.test.ts\""
   },

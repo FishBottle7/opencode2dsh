@@ -10,11 +10,12 @@ export interface Opencode2dshConfig {
   /**
    * Integration mode. `adapter` (default) registers a DSH LlmAdapter that
    * streams directly from the Zen anonymous lane — no child process. `sidecar`
-   * spawns the Go agent binary and registers an llm-pi-ai route to it
-   * (legacy/dev mode; requires the agent binary).
+   * (legacy, not bundled with the published package) spawns the Go agent
+   * binary and registers an llm-pi-ai route to it; build the agent from
+   * legacy/agent and pass agentPath.
    */
   mode?: 'adapter' | 'sidecar'
-  /** Path to the agent binary (sidecar mode). Default: resolve from agent-bin-* optionalDependencies, else platform fallback. */
+  /** Path to the agent binary (sidecar mode). Not bundled: build from legacy/agent. */
   agentPath?: string
   /** Extra CLI args forwarded to the agent (after --config). */
   agentArgs?: string[]

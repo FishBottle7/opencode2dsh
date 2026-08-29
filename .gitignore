@@ -4,7 +4,10 @@ node_modules/
 # Build output
 packages/plugin/lib/
 packages/plugin/bin/
-packages/agent-bin-*/
+packages/plugin/README.md
+packages/plugin/README.zh-CN.md
+packages/plugin/LICENSE
+legacy/agent/.gotmp/
 
 # Logs / local state
 *.log

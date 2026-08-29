@@ -239,34 +239,23 @@ function applySidecar(ctx: PluginContext, config: Opencode2dshConfig): { ready: 
 }
 
 /**
- * Locate the agent binary: explicit config wins; then the bundled copy in the
- * plugin package (`bin/`, stamped at pack time from the repo build); then the
- * agent-bin-* optional dependency for this platform; then a sibling checkout (dev).
+ * Locate the agent binary (sidecar mode, legacy — the published package does
+ * not bundle it): explicit config wins; then a sibling `legacy/agent` dev
+ * build; then a bare name on PATH.
  */
 export function defaultAgentPath(): string {
   const bin = 'opencode2dsh-agent'
   const exe = process.platform === 'win32' ? `${bin}.exe` : bin
-  // __dirnameSafe() is the directory of the compiled file (lib/ when installed,
-  // src/ when run from source); the package root is one level up in both.
-  const packageRoot = join(__dirnameSafe(), '..')
-  const bundled = join(packageRoot, 'bin', exe)
-  if (existsSync(bundled)) return bundled
-  const pkg = `@opencode2dsh/agent-bin-${process.platform}-${process.arch}`
-  try {
-    const req = createRequire(import.meta.url)
-    return req.resolve(`${pkg}/${exe}`)
-  } catch {
-    // dev fallback: the Go module builds agent/agent(.exe) in-repo. From src/
-    // the repo root is three levels up; from lib/ two.
-    const here = __dirnameSafe()
-    for (const sibling of [join(here, '..', '..', '..', 'agent', exe), join(here, '..', '..', 'agent', exe)]) {
-      if (existsSync(sibling)) return sibling
-    }
-    return exe
+  const here = __dirnameSafe()
+  for (const sibling of [
+    join(here, '..', '..', '..', 'legacy', 'agent', exe),
+    join(here, '..', '..', 'legacy', 'agent', exe),
+  ]) {
+    if (existsSync(sibling)) return sibling
   }
+  return exe
 }
 
-import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
 
 function __dirnameSafe(): string {
