@@ -2,7 +2,7 @@
 
 # opencode2dsh
 
-**Free anonymous OpenCode Zen models, natively inside DSH (DeepSeek Harness).**
+**Free OpenCode Zen models, natively inside DSH (DeepSeek Harness).**
 
 No API key. No registration. No extra process.
 
@@ -50,26 +50,6 @@ Once listed in the community plugin market, you can also install it from
 
 Requires DSH (DeepSeek Harness) with a web profile; Node.js ≥ 20 (already
 present if DSH runs); outbound HTTPS to `opencode.ai` and `models.dev`.
-
-## Models
-
-The live catalog currently exposes these verified-free models:
-
-| Model | Notes |
-| --- | --- |
-| `big-pickle` | verified anonymous chat (stream + non-stream) |
-| `deepseek-v4-flash-free` | |
-| `hy3-free` | streams reasoning blocks |
-| `laguna-s-2.1-free` | |
-| `ling-3.0-flash-fin-free` | |
-| `mimo-v2.5-free` | |
-| `muse-spark-1.2-contributor-free` | |
-| `nemotron-3-ultra-free` | |
-| `nemotron-3.5-lightning-free` | |
-
-The upstream catalog changes over time; the plugin refreshes it every few
-minutes and only exposes models confirmed free by name or by zero-cost
-metadata. Models are text-only (images are stripped by DSH before dispatch).
 
 ## Configuration
 
