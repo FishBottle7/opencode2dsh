@@ -78,14 +78,24 @@ export class ZenAdapter {
     return { id: provider, name: PROVIDER_ID }
   }
 
-  /** Advisory catalog for the DSH model picker. */
+  /**
+   * dsh-llm calls this unconditionally at registration (index.js:1208).
+   * undefined = the host default retry policy, matching sidecar behavior.
+   */
+  providerRetryPolicy(_provider: string): undefined {
+    return undefined
+  }
+
+  /** Advisory catalog for the DSH model picker (deduped; dsh-llm rejects duplicates). */
   listModels(provider: string): Array<{ provider: string; id: string; name: string; inputModalities: string[] }> {
-    return this.#catalog.list().map((id) => ({
-      provider,
-      id,
-      name: id,
-      inputModalities: ['text'],
-    }))
+    const seen = new Set<string>()
+    const models: Array<{ provider: string; id: string; name: string; inputModalities: string[] }> = []
+    for (const id of this.#catalog.list()) {
+      if (seen.has(id)) continue
+      seen.add(id)
+      models.push({ provider, id, name: id, inputModalities: ['text'] })
+    }
+    return models
   }
 
   resolveModel(provider: string, model: string): {
