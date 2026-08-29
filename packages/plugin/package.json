@@ -1,6 +1,6 @@
 {
   "name": "@opencode2dsh/dsh-plugin",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "Free anonymous OpenCode Zen models inside DeepSeek Harness (DSH): native LlmAdapter, no API key, no child process; optional Go sidecar included",
   "type": "module",
   "main": "lib/index.js",
