@@ -48,24 +48,6 @@ dsh plugin --profile web add @opencode2dsh/dsh-plugin
 需要带 web profile 的 DSH（DeepSeek Harness）；Node.js ≥ 20（DSH 能跑就满足）；
 出站 HTTPS 需可达 `opencode.ai` 与 `models.dev`。
 
-## 模型
-
-实时目录当前暴露这些已验证的免费模型：
-
-| 模型 | 备注 |
-| --- | --- |
-| `big-pickle` | 已验证匿名对话（流式 + 非流式） |
-| `deepseek-v4-flash-free` | |
-| `hy3-free` | 会输出 reasoning 块 |
-| `laguna-s-2.1-free` | |
-| `ling-3.0-flash-fin-free` | |
-| `mimo-v2.5-free` | |
-| `muse-spark-1.2-contributor-free` | |
-| `nemotron-3-ultra-free` | |
-| `nemotron-3.5-lightning-free` | |
-
-上游目录会随时间变化；插件每隔几分钟自动刷新，只暴露按名称或零成本元数据
-确认免费的模型。所有模型均为纯文本（图片在派发前由 DSH 自动剥离）。
 
 ## 配置
 
