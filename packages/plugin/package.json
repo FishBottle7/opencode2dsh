@@ -1,6 +1,6 @@
 {
   "name": "@opencode2dsh/dsh-plugin",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "DSH cordis plugin: spawn and shepherd the opencode2dsh agent (local OpenCode Zen anonymous-lane proxy) and register it as an llm-pi-ai provider",
   "type": "module",
   "main": "lib/index.js",
