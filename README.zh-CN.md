@@ -48,7 +48,6 @@ dsh plugin --profile web add @opencode2dsh/dsh-plugin
 需要带 web profile 的 DSH（DeepSeek Harness）；Node.js ≥ 20（DSH 能跑就满足）；
 出站 HTTPS 需可达 `opencode.ai` 与 `models.dev`。
 
-
 ## 配置
 
 默认配置开箱即用。需要覆盖时，编辑 profile 的 `cordis.patch.yml`：
