@@ -6,8 +6,8 @@
 
 No API key. No registration. No extra process.
 
-[![npm](https://img.shields.io/npm/v/@opencode2dsh/dsh-plugin)](https://www.npmjs.com/package/@opencode2dsh/dsh-plugin)
-[![license](https://img.shields.io/npm/l/@opencode2dsh/dsh-plugin)](./LICENSE)
+[![npm](https://img.shields.io/npm/v/@opencode2dsh%2Fdsh-plugin)](https://www.npmjs.com/package/@opencode2dsh/dsh-plugin)
+[![license](https://img.shields.io/npm/l/@opencode2dsh%2Fdsh-plugin)](https://github.com/FishBottle7/opencode2dsh/blob/master/LICENSE)
 [![node](https://img.shields.io/badge/node-%E2%89%A520-brightgreen)](https://nodejs.org)
 [![DeepSeek Harness](https://img.shields.io/badge/DeepSeek%20Harness-plugin-blue)](https://github.com/FishBottle7/opencode2dsh)
 
@@ -38,15 +38,27 @@ nothing to host.
 
 ## Install
 
+**From the plugin market** (recommended, once this repo is listed there):
+in DSH open **Settings → Plugin Market**, search `opencode2dsh`, one-click
+install.
+
+**From npm**:
+
 ```sh
 dsh plugin --profile web add @opencode2dsh/dsh-plugin
 ```
 
-Restart DSH (`dsh web`), open the model picker, and pick a model from the
-**opencode2dsh** group.
+**From source** (build the tarball yourself):
 
-Once listed in the community plugin market, you can also install it from
-**Settings → Plugin Market** with one click.
+```sh
+git clone https://github.com/FishBottle7/opencode2dsh.git
+cd opencode2dsh/packages/plugin
+pnpm install && pnpm pack
+dsh plugin --profile web add ./opencode2dsh-dsh-plugin-<version>.tgz
+```
+
+**Verify**: restart `dsh web`, open the model picker, and pick a model from
+the **opencode2dsh** group.
 
 Requires DSH (DeepSeek Harness) with a web profile; Node.js ≥ 20 (already
 present if DSH runs); outbound HTTPS to `opencode.ai` and `models.dev`.

@@ -6,8 +6,8 @@
 
 无需 API Key。无需注册。无需额外进程。
 
-[![npm](https://img.shields.io/npm/v/@opencode2dsh/dsh-plugin)](https://www.npmjs.com/package/@opencode2dsh/dsh-plugin)
-[![license](https://img.shields.io/npm/l/@opencode2dsh/dsh-plugin)](./LICENSE)
+[![npm](https://img.shields.io/npm/v/@opencode2dsh%2Fdsh-plugin)](https://www.npmjs.com/package/@opencode2dsh/dsh-plugin)
+[![license](https://img.shields.io/npm/l/@opencode2dsh%2Fdsh-plugin)](https://github.com/FishBottle7/opencode2dsh/blob/master/LICENSE)
 [![node](https://img.shields.io/badge/node-%E2%89%A520-brightgreen)](https://nodejs.org)
 [![DeepSeek Harness](https://img.shields.io/badge/DeepSeek%20Harness-plugin-blue)](https://github.com/FishBottle7/opencode2dsh)
 
@@ -37,13 +37,25 @@ OpenCode 官方 CLI 无需登录即可使用的那批免费模型，它们会以
 
 ## 安装
 
+**从插件市场安装**（推荐，收录后可用）：在 DSH 里打开 **设置 → 插件市场**，
+搜索 `opencode2dsh`，一键安装。
+
+**从 npm 安装**：
+
 ```sh
 dsh plugin --profile web add @opencode2dsh/dsh-plugin
 ```
 
-重启 DSH（`dsh web`），打开模型选择器，在 **opencode2dsh** 分组里选模型即可。
+**从源码安装**（自行打包）：
 
-上架社区插件市场后，也可以在 **设置 → 插件市场** 里一键安装。
+```sh
+git clone https://github.com/FishBottle7/opencode2dsh.git
+cd opencode2dsh/packages/plugin
+pnpm install && pnpm pack
+dsh plugin --profile web add ./opencode2dsh-dsh-plugin-<version>.tgz
+```
+
+**验证**：重启 `dsh web`，打开模型选择器，在 **opencode2dsh** 分组里选模型即可。
 
 需要带 web profile 的 DSH（DeepSeek Harness）；Node.js ≥ 20（DSH 能跑就满足）；
 出站 HTTPS 需可达 `opencode.ai` 与 `models.dev`。
