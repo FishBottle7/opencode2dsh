@@ -145,6 +145,8 @@ export interface CatalogOptions {
   now?: () => number
   /** Observability hook: fired after every refresh round (start + interval). */
   onRefresh?: (status: CatalogSnapshot, lastError: string) => void
+  /** Delay between startup retries while the live catalog is empty (default 15s). */
+  startupRetryMs?: number
 }
 
 const METADATA_REFRESH_MS = 24 * 60 * 60 * 1000
@@ -169,6 +171,7 @@ export class ModelCatalog {
   #timer: NodeJS.Timeout | null = null
   #stopped = false
   #onRefresh?: (status: CatalogSnapshot, lastError: string) => void
+  #startupRetryMs: number
 
   constructor(options: CatalogOptions = {}) {
     this.#refreshSeconds = options.refreshSeconds ?? 300
@@ -178,11 +181,23 @@ export class ModelCatalog {
     this.#fetch = options.fetchImpl ?? fetch
     this.#now = options.now ?? Date.now
     this.#onRefresh = options.onRefresh
+    this.#startupRetryMs = options.startupRetryMs ?? 15_000
   }
 
-  /** Start the refresh loop: immediate S1+S2, then per cadence (S2 every 24h). */
+  /**
+   * Start the refresh loop: immediate S1+S2, fast retries while the live
+   * catalog is still empty (the first fetch often races the machine's network
+   * coming up — VPN/TUN reconnect, DNS), then the normal cadence (S2 24h).
+   */
   async start(): Promise<void> {
     await this.refreshOnce()
+    let attempts = 0
+    while (this.#zen.size === 0 && attempts < 4 && !this.#stopped) {
+      attempts += 1
+      await new Promise((resolve) => setTimeout(resolve, this.#startupRetryMs))
+      if (this.#stopped) return
+      await this.refreshOnce()
+    }
     if (this.#stopped) return
     this.#timer = setInterval(() => {
       void this.refreshOnce()

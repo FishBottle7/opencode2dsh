@@ -106,6 +106,27 @@ const metadataBody = {
   },
 }
 
+test('start() fast-retries while the live catalog is empty, then settles into the cadence', async () => {
+  let zenCalls = 0
+  const flaky = (async (url: string | URL) => {
+    if (String(url).includes('/v1/models')) {
+      zenCalls += 1
+      if (zenCalls <= 2) throw new Error('network not ready yet')
+      return new Response(JSON.stringify(zenBody), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    return new Response(JSON.stringify(metadataBody), { status: 200, headers: { 'content-type': 'application/json' } })
+  }) as typeof fetch
+  const catalog = new ModelCatalog({ fetchImpl: flaky, startupRetryMs: 5, refreshSeconds: 3600 })
+  try {
+    await catalog.start()
+    assert.equal(catalog.snapshot().total, 3)
+    assert.equal(zenCalls, 3, 'two failed attempts then one success')
+    assert.equal(catalog.snapshot().status, 'ready')
+  } finally {
+    catalog.stop()
+  }
+})
+
 test('fetchZenModels sends the anonymous CLI disguise and parses ids', async () => {
   const capture: { url?: string; init?: RequestInit } = {}
   const ids = await fetchZenModels('https://opencode.ai/zen/', fakeFetch({ 'https://opencode.ai/zen/v1/models': zenBody }, capture), opencodeUserAgent())

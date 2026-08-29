@@ -82,6 +82,15 @@ function applyAdapter(ctx: PluginContext, config: Opencode2dshConfig): { ready: 
   })
   const adapter = new ZenAdapter(catalog)
 
+  // Register immediately: the provider must appear in the selector right
+  // away, even while the catalog is still warming up (listModels is read
+  // live at selector time, so models appear as refreshes land).
+  ctx.llm.registerAdapter([PROVIDER_ID], adapter)
+  logger.info(`opencode2dsh: adapter registered for "${PROVIDER_ID}" (catalog warms up in background)`)
+  void catalog.start().catch((err) => {
+    logger.error(`opencode2dsh: catalog start failed: ${err instanceof Error ? err.message : String(err)}`)
+  })
+
   // A sidecar leftover (llm-pi-ai.providers.opencode2dsh pointing at a dead
   // local port) would shadow the adapter registration and fail every dispatch
   // with a connection error. Remove it before the route can be used.
@@ -94,17 +103,6 @@ function applyAdapter(ctx: PluginContext, config: Opencode2dshConfig): { ready: 
         logger.warn(`opencode2dsh: stale route cleanup failed: ${err instanceof Error ? err.message : String(err)}`)
       })
   }
-
-  void catalog
-    .start()
-    .then(() => {
-      ctx.llm?.registerAdapter([PROVIDER_ID], adapter)
-      const exposed = catalog.list().length
-      logger.info(`opencode2dsh: adapter registered for "${PROVIDER_ID}" with ${exposed} model(s) (live catalog: ${catalog.snapshot().total} upstream id(s))${catalog.lastError ? `; lastError: ${catalog.lastError}` : ''}`)
-    })
-    .catch((err) => {
-      logger.error(`opencode2dsh: adapter startup failed: ${err instanceof Error ? err.message : String(err)}`)
-    })
 
   const maybeEffect = (ctx as { effect?: PluginContext['effect'] }).effect
   if (typeof maybeEffect === 'function') {
