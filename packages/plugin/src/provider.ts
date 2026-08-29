@@ -31,6 +31,22 @@ export function providerBaseURL(port: number): string {
   return `http://127.0.0.1:${port}/v1`
 }
 
+/**
+ * Remove the llm-pi-ai provider route left behind by sidecar mode. Adapter
+ * mode serves the provider id itself; a stale route pointing at a dead
+ * sidecar port would shadow dispatch and fail every call with a connection
+ * error. Returns true when a route was actually removed.
+ */
+export async function removeProviderRoute(
+  seams: Pick<DshSeams, 'settings'>,
+  providerId: string,
+): Promise<boolean> {
+  const namespace = seams.settings.get('llm-pi-ai') as { providers?: Record<string, unknown> } | undefined
+  if (!namespace?.providers || !(providerId in namespace.providers)) return false
+  await seams.settings.mutate('llm-pi-ai', [{ op: 'unset', path: ['providers', providerId] }])
+  return true
+}
+
 /** Minimal settings/credentials seam so tests can run against fakes. */
 export interface DshSeams {
   credentials: {

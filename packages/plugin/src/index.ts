@@ -6,7 +6,7 @@ import { ModelCatalog, defaultCachePath } from './adapter/catalog.ts'
 import { ZenAdapter, PROVIDER_ID } from './adapter/zen-adapter.ts'
 import { AgentProcess, type ReadyInfo } from './agent-process.js'
 import { configPaths, ensureToken, resolveConfig, writeAgentConfig, type Opencode2dshConfig } from './config.js'
-import { fetchHealth, fetchModels, registerProvider } from './provider.js'
+import { fetchHealth, fetchModels, registerProvider, removeProviderRoute } from './provider.js'
 
 /**
  * opencode2dsh DSH cordis plugin entry.
@@ -63,6 +63,19 @@ function applyAdapter(ctx: PluginContext, config: Opencode2dshConfig): { ready: 
     cachePath: defaultCachePath(join(homedir(), '.opencode2dsh')),
   })
   const adapter = new ZenAdapter(catalog)
+
+  // A sidecar leftover (llm-pi-ai.providers.opencode2dsh pointing at a dead
+  // local port) would shadow the adapter registration and fail every dispatch
+  // with a connection error. Remove it before the route can be used.
+  if (ctx.settings) {
+    removeProviderRoute({ settings: ctx.settings }, cfg.providerId)
+      .then((removed) => {
+        if (removed) logger.info(`opencode2dsh: removed stale sidecar route for "${cfg.providerId}" from llm-pi-ai settings`)
+      })
+      .catch((err) => {
+        logger.warn(`opencode2dsh: stale route cleanup failed: ${err instanceof Error ? err.message : String(err)}`)
+      })
+  }
 
   void catalog
     .start()
