@@ -79,6 +79,19 @@ export async function fetchModels(port: number, token: string, timeoutMs = 10000
   }
 }
 
+/** GET /healthz (no auth); throws on transport failure or non-2xx. */
+export async function fetchHealth(port: number, timeoutMs = 3000): Promise<unknown> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/healthz`, { signal: controller.signal })
+    if (!response.ok) throw new Error(`GET /healthz failed: HTTP ${response.status}`)
+    return await response.json()
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 /**
  * Ensure the credential and the llm-pi-ai provider route reflect the running
  * agent. Safe to call repeatedly (every refresh): writes are no-ops when the

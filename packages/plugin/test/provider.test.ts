@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { toPiAiModels, registerProvider, providerBaseURL, type DshSeams } from '../src/provider.ts'
+import { toPiAiModels, registerProvider, providerBaseURL, fetchHealth, type DshSeams } from '../src/provider.ts'
 
 test('toPiAiModels parses OpenAI-shaped payloads and dedupes', () => {
   const parsed = toPiAiModels({
@@ -59,4 +59,21 @@ test('registerProvider stores token and writes the llm-pi-ai route', async () =>
   assert.equal(setOp.value.apiKeyEnv, 'OPENCODE2DSH_TOKEN')
   assert.equal(setOp.value.api, 'openai-completions')
   assert.deepEqual(setOp.value.models, [{ id: 'm1', name: 'M1' }])
+})
+
+test('fetchHealth parses the healthz payload from a live server', async () => {
+  const { createServer } = await import('node:http')
+  const server = createServer((req, res) => {
+    assert.equal(req.url, '/healthz')
+    res.setHeader('content-type', 'application/json')
+    res.end(JSON.stringify({ status: 'ok', models: { status: 'ready', total: 9 } }))
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = (server.address() as { port: number }).port
+  try {
+    const health = (await fetchHealth(port)) as { models?: { status?: string } }
+    assert.equal(health.models?.status, 'ready')
+  } finally {
+    server.close()
+  }
 })

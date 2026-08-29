@@ -2,25 +2,32 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { existsSync } from 'node:fs'
 
+import { ModelCatalog, defaultCachePath } from './adapter/catalog.ts'
+import { ZenAdapter, PROVIDER_ID } from './adapter/zen-adapter.ts'
 import { AgentProcess, type ReadyInfo } from './agent-process.js'
 import { configPaths, ensureToken, resolveConfig, writeAgentConfig, type Opencode2dshConfig } from './config.js'
-import { fetchModels, registerProvider } from './provider.js'
+import { fetchHealth, fetchModels, registerProvider } from './provider.js'
 
 /**
  * opencode2dsh DSH cordis plugin entry.
  *
- * Lifecycle (plan.md 1.6):
- *  - apply(): prepare data dir + token + agent-config.json, spawn the agent,
- *    wait for READY, register the llm-pi-ai provider route, schedule refresh.
- *  - dispose(): stop the refresh timer, terminate the agent tree (graceful,
- *    then force). The cordis fiber disposal guarantees this runs on plugin
- *    reload/unload and on DSH shutdown, so no orphan process survives.
+ * Two modes (config.mode, default `adapter`):
+ *  - adapter: register a DSH LlmAdapter streaming directly from the Zen
+ *    anonymous lane (marketplace shape: no child process, no binary).
+ *  - sidecar (legacy/dev): prepare data dir + token + agent-config.json,
+ *    spawn the Go agent, wait for READY, register the llm-pi-ai provider
+ *    route, schedule model refresh.
+ *
+ * dispose(): stop timers/catalog, terminate the agent tree (sidecar mode).
+ * The cordis fiber disposal guarantees this runs on plugin reload/unload and
+ * on DSH shutdown.
  */
 
 // Minimal structural typing against the host ctx; keeps the plugin independent
 // of the exact @deepseek-ai/cordis version DSH ships.
 interface PluginContext {
   logger: { info(...args: unknown[]): void; warn(...args: unknown[]): void; error(...args: unknown[]): void }
+  llm?: { registerAdapter(providers: string[], adapter: unknown): unknown }
   credentials?: { set(ref: string, value: string): Promise<void> }
   settings?: {
     get(ns: string): unknown
@@ -30,8 +37,53 @@ interface PluginContext {
 }
 
 export const name = 'opencode2dsh'
-export const inject = ['credentials', 'settings'] as const
+export const inject = ['llm', 'credentials', 'settings'] as const
 export function apply(ctx: PluginContext, config: Opencode2dshConfig = {}): { ready: Promise<ReadyInfo> } {
+  if (resolveConfig(config).mode === 'sidecar') return applySidecar(ctx, config)
+  return applyAdapter(ctx, config)
+}
+
+/**
+ * Adapter mode: catalog + LlmAdapter registration. The adapter registration
+ * is disposed with the plugin fiber (registerAdapter uses ctx.effect
+ * internally); we only own the catalog refresh loop here.
+ */
+function applyAdapter(ctx: PluginContext, config: Opencode2dshConfig): { ready: Promise<{ port: number; version: string }> } {
+  const logger = ctx.logger
+  const cfg = resolveConfig(config)
+  const ready = Promise.resolve({ port: 0, version: 'adapter' })
+
+  if (!ctx.llm || typeof ctx.llm.registerAdapter !== 'function') {
+    logger.error('opencode2dsh: llm service unavailable; adapter mode cannot register')
+    return { ready }
+  }
+
+  const catalog = new ModelCatalog({
+    refreshSeconds: cfg.refreshSeconds,
+    cachePath: defaultCachePath(join(homedir(), '.opencode2dsh')),
+  })
+  const adapter = new ZenAdapter(catalog)
+
+  void catalog
+    .start()
+    .then(() => {
+      ctx.llm?.registerAdapter([PROVIDER_ID], adapter)
+      logger.info(`opencode2dsh: adapter registered for "${PROVIDER_ID}" with ${catalog.list().length} model(s)`)
+    })
+    .catch((err) => {
+      logger.error(`opencode2dsh: adapter startup failed: ${err instanceof Error ? err.message : String(err)}`)
+    })
+
+  const maybeEffect = (ctx as { effect?: PluginContext['effect'] }).effect
+  if (typeof maybeEffect === 'function') {
+    maybeEffect.call(ctx, () => () => {
+      catalog.stop()
+    })
+  }
+  return { ready }
+}
+
+function applySidecar(ctx: PluginContext, config: Opencode2dshConfig): { ready: Promise<ReadyInfo> } {
   const cfg = resolveConfig(config)
   const paths = configPaths(join(homedir(), '.opencode2dsh'))
   const logger = ctx.logger
@@ -49,8 +101,29 @@ export function apply(ctx: PluginContext, config: Opencode2dshConfig = {}): { re
     logger.info(`[agent] ${line}`)
   }
 
-  async function refreshModels(info: ReadyInfo, token: string): Promise<void> {
+  /**
+   * Wait until the agent's model catalog is no longer "pending" (it fetches
+   * the live S1 list a moment after listen; registering before that bakes the
+   * 3-model static fallback into the DSH provider until the next refresh).
+   */
+  async function waitCatalogReady(port: number, timeoutMs = 15000): Promise<void> {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      try {
+        const health = await fetchHealth(port, 2000)
+        const status = (health as { models?: { status?: string } })?.models?.status
+        if (status && status !== 'pending') return
+      } catch {
+        // healthz hiccups right after listen are normal; keep polling
+      }
+      await new Promise((r) => setTimeout(r, 300))
+    }
+    logger.warn('opencode2dsh: catalog still pending after timeout; registering whatever the agent exposes now')
+  }
+
+  async function refreshModels(info: ReadyInfo, token: string, { waitReady = false } = {}): Promise<void> {
     try {
+      if (waitReady) await waitCatalogReady(info.port)
       const models = await fetchModels(info.port, token)
       if (ctx.credentials && ctx.settings) {
         await registerProvider(
@@ -102,7 +175,7 @@ export function apply(ctx: PluginContext, config: Opencode2dshConfig = {}): { re
     })
     const info = await agent.start()
     readyResolve(info)
-    await refreshModels(info, token)
+    await refreshModels(info, token, { waitReady: true })
     scheduleRefresh(info, token)
     return info
   }
@@ -136,20 +209,29 @@ export function apply(ctx: PluginContext, config: Opencode2dshConfig = {}): { re
 }
 
 /**
- * Locate the agent binary: explicit config wins; then the agent-bin-* optional
- * dependency for this platform; then a sibling checkout (dev).
+ * Locate the agent binary: explicit config wins; then the bundled copy in the
+ * plugin package (`bin/`, stamped at pack time from the repo build); then the
+ * agent-bin-* optional dependency for this platform; then a sibling checkout (dev).
  */
 export function defaultAgentPath(): string {
   const bin = 'opencode2dsh-agent'
   const exe = process.platform === 'win32' ? `${bin}.exe` : bin
+  // __dirnameSafe() is the directory of the compiled file (lib/ when installed,
+  // src/ when run from source); the package root is one level up in both.
+  const packageRoot = join(__dirnameSafe(), '..')
+  const bundled = join(packageRoot, 'bin', exe)
+  if (existsSync(bundled)) return bundled
   const pkg = `@opencode2dsh/agent-bin-${process.platform}-${process.arch}`
   try {
     const req = createRequire(import.meta.url)
     return req.resolve(`${pkg}/${exe}`)
   } catch {
-    // dev fallback: the Go module builds agent/agent(.exe) in-repo
-    const sibling = join(__dirnameSafe(), '..', '..', '..', 'agent', exe)
-    if (existsSync(sibling)) return sibling
+    // dev fallback: the Go module builds agent/agent(.exe) in-repo. From src/
+    // the repo root is three levels up; from lib/ two.
+    const here = __dirnameSafe()
+    for (const sibling of [join(here, '..', '..', '..', 'agent', exe), join(here, '..', '..', 'agent', exe)]) {
+      if (existsSync(sibling)) return sibling
+    }
     return exe
   }
 }
@@ -167,4 +249,4 @@ function __dirnameSafe(): string {
 
 export { AgentProcess } from './agent-process.js'
 export { configPaths, ensureToken, resolveConfig, writeAgentConfig, type Opencode2dshConfig } from './config.js'
-export { fetchModels, registerProvider, providerBaseURL, toPiAiModels, type DshSeams } from './provider.js'
+export { fetchHealth, fetchModels, registerProvider, providerBaseURL, toPiAiModels, type DshSeams } from './provider.js'

@@ -7,7 +7,14 @@ import { platform } from 'node:process'
  * Plugin configuration (cordis config object, injected via cordis.patch.yml).
  */
 export interface Opencode2dshConfig {
-  /** Path to the agent binary. Default: resolve from agent-bin-* optionalDependencies, else platform fallback. */
+  /**
+   * Integration mode. `adapter` (default) registers a DSH LlmAdapter that
+   * streams directly from the Zen anonymous lane — no child process. `sidecar`
+   * spawns the Go agent binary and registers an llm-pi-ai route to it
+   * (legacy/dev mode; requires the agent binary).
+   */
+  mode?: 'adapter' | 'sidecar'
+  /** Path to the agent binary (sidecar mode). Default: resolve from agent-bin-* optionalDependencies, else platform fallback. */
   agentPath?: string
   /** Extra CLI args forwarded to the agent (after --config). */
   agentArgs?: string[]

@@ -3,6 +3,8 @@ node_modules/
 
 # Build output
 packages/plugin/lib/
+packages/plugin/bin/
+packages/agent-bin-*/
 
 # Logs / local state
 *.log
