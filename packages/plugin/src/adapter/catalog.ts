@@ -143,6 +143,8 @@ export interface CatalogOptions {
   metadataUrl?: string
   fetchImpl?: typeof fetch
   now?: () => number
+  /** Observability hook: fired after every refresh round (start + interval). */
+  onRefresh?: (status: CatalogSnapshot, lastError: string) => void
 }
 
 const METADATA_REFRESH_MS = 24 * 60 * 60 * 1000
@@ -166,6 +168,7 @@ export class ModelCatalog {
   #now: () => number
   #timer: NodeJS.Timeout | null = null
   #stopped = false
+  #onRefresh?: (status: CatalogSnapshot, lastError: string) => void
 
   constructor(options: CatalogOptions = {}) {
     this.#refreshSeconds = options.refreshSeconds ?? 300
@@ -174,6 +177,7 @@ export class ModelCatalog {
     this.#metadataUrl = options.metadataUrl ?? 'https://models.dev/api.json'
     this.#fetch = options.fetchImpl ?? fetch
     this.#now = options.now ?? Date.now
+    this.#onRefresh = options.onRefresh
   }
 
   /** Start the refresh loop: immediate S1+S2, then per cadence (S2 every 24h). */
@@ -196,6 +200,13 @@ export class ModelCatalog {
 
   async refreshOnce(): Promise<void> {
     await Promise.allSettled([this.refreshZen(), this.refreshMetadata()])
+    if (this.#onRefresh) {
+      try {
+        this.#onRefresh(this.snapshot(), this.#lastError)
+      } catch {
+        // observers must never break the refresh loop
+      }
+    }
   }
 
   async refreshZen(): Promise<void> {

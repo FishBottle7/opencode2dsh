@@ -1,8 +1,9 @@
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { existsSync } from 'node:fs'
+import { writeFile } from 'node:fs/promises'
 
-import { ModelCatalog, defaultCachePath } from './adapter/catalog.ts'
+import { ModelCatalog, defaultCachePath, type CatalogSnapshot } from './adapter/catalog.ts'
 import { ZenAdapter, PROVIDER_ID } from './adapter/zen-adapter.ts'
 import { AgentProcess, type ReadyInfo } from './agent-process.js'
 import { configPaths, ensureToken, resolveConfig, writeAgentConfig, type Opencode2dshConfig } from './config.js'
@@ -58,9 +59,26 @@ function applyAdapter(ctx: PluginContext, config: Opencode2dshConfig): { ready: 
     return { ready }
   }
 
+  // Health snapshot for adapter mode (the agent-mode healthz equivalent):
+  // written after every refresh round so field diagnostics do not depend on
+  // terminal access to the DSH process.
+  const dataDir = join(homedir(), '.opencode2dsh')
+  const statusPath = join(dataDir, 'adapter-status.json')
+  const writeStatus = (status: CatalogSnapshot, lastError: string): void => {
+    void writeFile(
+      statusPath,
+      JSON.stringify({ ...status, lastError, writtenAt: new Date().toISOString() }, null, 2),
+      'utf8',
+    ).catch(() => {})
+  }
+
   const catalog = new ModelCatalog({
     refreshSeconds: cfg.refreshSeconds,
-    cachePath: defaultCachePath(join(homedir(), '.opencode2dsh')),
+    cachePath: defaultCachePath(dataDir),
+    onRefresh: (status, lastError) => {
+      writeStatus(status, lastError)
+      if (lastError) logger.warn(`opencode2dsh: catalog refresh issue: ${lastError}`)
+    },
   })
   const adapter = new ZenAdapter(catalog)
 
@@ -81,7 +99,8 @@ function applyAdapter(ctx: PluginContext, config: Opencode2dshConfig): { ready: 
     .start()
     .then(() => {
       ctx.llm?.registerAdapter([PROVIDER_ID], adapter)
-      logger.info(`opencode2dsh: adapter registered for "${PROVIDER_ID}" with ${catalog.list().length} model(s)`)
+      const exposed = catalog.list().length
+      logger.info(`opencode2dsh: adapter registered for "${PROVIDER_ID}" with ${exposed} model(s) (live catalog: ${catalog.snapshot().total} upstream id(s))${catalog.lastError ? `; lastError: ${catalog.lastError}` : ''}`)
     })
     .catch((err) => {
       logger.error(`opencode2dsh: adapter startup failed: ${err instanceof Error ? err.message : String(err)}`)
