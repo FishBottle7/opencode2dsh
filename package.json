@@ -1,0 +1,13 @@
+{
+  "name": "opencode2dsh",
+  "private": true,
+  "description": "Free OpenCode Zen models for DeepSeek Harness (DSH): native dsh-llm adapter plugin, no API key.",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "dependencies": {
+    "@opencode2dsh/dsh-plugin": "^0.2.6"
+  }
+}
