@@ -6,12 +6,12 @@ Format verified against that repo's `contributing.md` (2026-08-29).
 
 ## The entry file
 
-Add exactly one file: `data/plugins/FishBottle7__opencode2dsh--packages-plugin.yml`
-(monorepo subpackage entry; filename = `<owner>__<repo>--packages-plugin.yml`).
+Add exactly one file: `data/plugins/FishBottle7__opencode2dsh.yml`
+(filename = `<owner>__<repo>.yml`).
 
 ```yaml
-url: https://github.com/FishBottle7/opencode2dsh/tree/master/packages/plugin
-name: FishBottle7/opencode2dsh#plugin
+url: https://github.com/FishBottle7/opencode2dsh
+name: FishBottle7/opencode2dsh
 category: model
 description:
   en: Exposes OpenCode Zen free models to DeepSeek Harness, with no API key.
@@ -30,12 +30,15 @@ Notes on the wording (their review rules):
 - [ ] Repo public on GitHub, pushed, **older than 1 day** with **>= 10 commits**
       (we have 15+ commits; just mind the 1-day age after creating the repo).
 - [ ] `dsh.bundle` manifest reachable **from the URL the entry points at**:
-      the root `package.json` declares no `dsh.bundle`, so the entry must
-      point at the `packages/plugin` subpackage (tree/master URL + `#plugin`
-      name + `--packages-plugin.yml` filename), where
-      `dsh.bundle.patch: ./cordis.patch.yml` is declared. Verified in review:
-      pointing the entry at the repo root fails with
-      "root package.json declares no dsh.bundle".
+      the check reads the `package.json` at the entry URL. The repo ROOT now
+      declares `dsh.bundle.patch: ./cordis.patch.yml` plus an npm dependency
+      on `@opencode2dsh/dsh-plugin` (commit 9c21f9e), so the entry points at
+      the repository root with no `#` suffix and the npm mapping links.
+      History: the first submission pointed at the root but was bounced
+      ("root package.json declares no dsh.bundle"), refiled at the
+      subpackage, then the root was made installable and the entry moved
+      back — root entry wins because it also links the npm package
+      (repository-field substring match) and drops the `#plugin` suffix.
 - [ ] Add the GitHub topic **`dsh-plugin`** to the repo (repo page → gear next to About).
 - [ ] `npm publish --access public` in `packages/plugin` first — npm installs skip
       the build-approval step in the market. The published package's
