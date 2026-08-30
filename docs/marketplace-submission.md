@@ -6,16 +6,16 @@ Format verified against that repo's `contributing.md` (2026-08-29).
 
 ## The entry file
 
-Add exactly one file: `data/plugins/FishBottle7__opencode2dsh.yml`
-(filename = `<owner>__<repo>.yml`).
+Add exactly one file: `data/plugins/FishBottle7__opencode2dsh--packages-plugin.yml`
+(monorepo subpackage entry; filename = `<owner>__<repo>--packages-plugin.yml`).
 
 ```yaml
-url: https://github.com/FishBottle7/opencode2dsh
-name: FishBottle7/opencode2dsh
+url: https://github.com/FishBottle7/opencode2dsh/tree/master/packages/plugin
+name: FishBottle7/opencode2dsh#plugin
 category: model
 description:
-  en: 'Exposes OpenCode Zen''s free models to DeepSeek Harness as a native LlmAdapter provider, with no API key and no extra process.'
-  zh: '将 OpenCode Zen 免费模型以原生 LlmAdapter provider 接入 DeepSeek Harness，无需 API Key，也无须额外进程。'
+  en: Exposes OpenCode Zen free models to DeepSeek Harness, with no API key.
+  zh: 将 OpenCode Zen 免费模型接入 DeepSeek Harness，无需 API Key。
 ```
 
 Notes on the wording (their review rules):
@@ -29,8 +29,13 @@ Notes on the wording (their review rules):
 
 - [ ] Repo public on GitHub, pushed, **older than 1 day** with **>= 10 commits**
       (we have 15+ commits; just mind the 1-day age after creating the repo).
-- [ ] `dsh.bundle` manifest reachable: `packages/plugin/package.json` declares
-      `dsh.bundle.patch` — CI checks root or `packages/` subpackages. Already satisfied.
+- [ ] `dsh.bundle` manifest reachable **from the URL the entry points at**:
+      the root `package.json` declares no `dsh.bundle`, so the entry must
+      point at the `packages/plugin` subpackage (tree/master URL + `#plugin`
+      name + `--packages-plugin.yml` filename), where
+      `dsh.bundle.patch: ./cordis.patch.yml` is declared. Verified in review:
+      pointing the entry at the repo root fails with
+      "root package.json declares no dsh.bundle".
 - [ ] Add the GitHub topic **`dsh-plugin`** to the repo (repo page → gear next to About).
 - [ ] `npm publish --access public` in `packages/plugin` first — npm installs skip
       the build-approval step in the market. The published package's
@@ -63,9 +68,9 @@ Add FishBottle7/opencode2dsh (model)
 Adds one entry: `data/plugins/FishBottle7__opencode2dsh.yml`.
 
 **What it does** — registers a native DSH `LlmAdapter` that streams from
-OpenCode Zen's anonymous free lane (`Authorization: Bearer public`), so the
+OpenCode Zen's free endpoint (`Authorization: Bearer public`), so the
 free models (big-pickle, hy3-free, ...) appear in the model picker without
-any key or sidecar process. Catalog comes from the live `/v1/models` list
+any API key. Catalog comes from the live `/v1/models` list
 intersected with models.dev free-by-metadata, falling back to a disk cache
 and a verified static list; the plugin auto-refreshes and writes a health
 snapshot to `~/.opencode2dsh/adapter-status.json`.
