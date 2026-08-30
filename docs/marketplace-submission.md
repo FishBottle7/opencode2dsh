@@ -14,8 +14,8 @@ url: https://github.com/FishBottle7/opencode2dsh
 name: FishBottle7/opencode2dsh
 category: model
 description:
-  en: 'Exposes OpenCode Zen''s anonymous free models to DeepSeek Harness as a native LlmAdapter provider, with no API key and no extra process.'
-  zh: '将 OpenCode Zen 匿名免费模型以原生 LlmAdapter provider 接入 DeepSeek Harness，无需 API Key，也无须额外进程。'
+  en: 'Exposes OpenCode Zen''s free models to DeepSeek Harness as a native LlmAdapter provider, with no API key and no extra process.'
+  zh: '将 OpenCode Zen 免费模型以原生 LlmAdapter provider 接入 DeepSeek Harness，无需 API Key，也无须额外进程。'
 ```
 
 Notes on the wording (their review rules):
