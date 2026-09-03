@@ -19,17 +19,18 @@ export const ZEN_BASE_URL = 'https://opencode.ai/zen'
 /** Verified against the anonymous lane with a real chat (agent/internal/catalog/static_models.go). */
 export const staticFreeModels: string[] = [
   'big-pickle', // verified 2026-08-28: anonymous chat 200 (non-stream + stream)
-  'hy3-free', // verified 2026-08-28: anonymous chat 200 (non-stream)
   'mimo-v2.5-free', // verified 2026-08-28: anonymous chat 200 (non-stream)
+  'ling-3.0-flash-fin-free', // verified 2026-09-01: anonymous chat 200
+  'nemotron-3.5-lightning-free', // verified 2026-09-01: anonymous chat 200
+  'nemotron-3-ultra-free', // verified 2026-09-01: anonymous chat 200 (7s, earlier timeout was transient)
+  'muse-spark-1.2-contributor-free', // verified 2026-09-01: listed free in docs pricing; 403 region-blocked from our probe, region restriction accepted as non-fatal
 ]
 
 /** Exposed by /v1/models but without a verified anonymous chat yet. */
 export const staticFreeCandidates: string[] = [
-  // 'deepseek-v4-flash-free',          // 2026-08-28: upstream "Model is unavailable"
-  // 'nemotron-3-ultra-free',           // 2026-08-28: upstream server_error payload
-  // 'laguna-s-2.1-free',               // 2026-08-28: upstream 503 provider error
-  // 'nemotron-3.5-lightning-free',     // 2026-08-28: 502 after all attempts
-  // 'muse-spark-1.2-contributor-free', // 2026-08-28: 502 after all attempts
+  // 'deepseek-v4-flash-free',          // models.dev deprecated; 2026-09-01: upstream 400 "Model is unavailable"
+  // 'laguna-s-2.1-free',                // models.dev deprecated; 2026-09-01: upstream 503 (intermittent, failed twice)
+  // 'hy3-free',                        // models.dev deprecated; 2026-09-01: delisted from /v1/models, upstream 401 "not supported"
 ]
 
 export function isFreeModel(model: string): boolean {
@@ -48,7 +49,14 @@ interface ModelPrice {
   deprecated: boolean
 }
 
-/** Decide ports model_metadata.go Decide (192-237) line for line. */
+/** Decide (model_metadata.go Decide, ported with the deprecation fix).
+ *
+ * The upstream short-circuits on isFreeModel before consulting metadata, so a
+ * delisted-but-still-cataloged id like deepseek-v4-flash-free stays exposed
+ * forever. Here the order is: a ready metadata verdict (including deprecated)
+ * always wins; the name fallback only fires when metadata cannot speak
+ * (pending or model missing) — its original documented intent (design.md 4.2).
+ */
 export function decide(model: string, prices: Map<string, ModelPrice>, ready: boolean): AnonymousDecision {
   const nameFree = isFreeModel(model)
   const fallback = (source: string): AnonymousDecision => {
@@ -58,12 +66,11 @@ export function decide(model: string, prices: Map<string, ModelPrice>, ready: bo
   if (!ready || prices.size === 0) return fallback('metadata_pending')
   const price = prices.get(model)
   if (!price) return fallback('metadata_model_missing')
-  const metadataFree = !price.deprecated && price.input === 0 && price.output === 0
-  if (nameFree || metadataFree) {
-    const source = nameFree && metadataFree ? 'name_and_metadata_free' : nameFree ? 'name_free' : 'metadata_free'
-    return { allowed: true, source, known: true }
-  }
   if (price.deprecated) return { allowed: false, source: 'metadata_deprecated', known: true }
+  const metadataFree = price.input === 0 && price.output === 0
+  if (metadataFree) {
+    return { allowed: true, source: nameFree ? 'name_and_metadata_free' : 'metadata_free', known: true }
+  }
   if (price.input === undefined || price.output === undefined) {
     return { allowed: false, source: 'metadata_cost_unknown', known: false }
   }
@@ -155,6 +162,12 @@ const FETCH_TIMEOUT_MS = 30_000
 /**
  * Live model directory with the S1/S2/S3 fallback chain and the timer-driven
  * refresh loop. All state is in-memory; only the models.dev cache persists.
+ *
+ * Decision chain (design.md 4.1/4.2, with the deprecation-first fix):
+ *   1. ready metadata verdict — deprecated/paid deny, free cost allows; a
+ *      "free" name never overrides a negative metadata verdict
+ *   2. metadata cannot speak (pending/missing) — name fallback, or the
+ *      compile-time verified S3 list for known-good ids
  */
 export class ModelCatalog {
   #zen: Set<string> = new Set()
@@ -261,6 +274,14 @@ export class ModelCatalog {
 
   decision(model: string): AnonymousDecision {
     const metadata = decide(model, this.#prices, this.#pricesReady)
+    // The S3 vouch only covers ids metadata cannot speak for. A metadata
+    // verdict of deprecated is Known, but S3 entries are compile-time verified
+    // against the live lane, so an S3 id stays vouched even when stale
+    // metadata claims deprecation (hy3-free case: works after models.dev
+    // flags it, dies only when it leaves the Zen catalog).
+    if (!metadata.allowed && metadata.source === 'metadata_deprecated' && staticFreeModels.includes(model)) {
+      return { allowed: true, source: 'static_verified', known: false }
+    }
     if (!metadata.allowed && !metadata.known && staticFreeModels.includes(model)) {
       return { allowed: true, source: 'static_verified', known: false }
     }

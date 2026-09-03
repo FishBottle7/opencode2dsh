@@ -19,11 +19,12 @@ func newReadyStore(models map[string]ModelPrice) *ModelMetadataStore {
 
 func TestDecideFiveClasses(t *testing.T) {
 	store := newReadyStore(map[string]ModelPrice{
-		"gpt-oss-120b":  {ID: "gpt-oss-120b", Input: zeroCost(), Output: zeroCost()},                 // metadata free
-		"claude-x":      {ID: "claude-x", Input: paidCost(), Output: paidCost()},                   // metadata paid
+		"gpt-oss-120b":  {ID: "gpt-oss-120b", Input: zeroCost(), Output: zeroCost()},                    // metadata free
+		"claude-x":      {ID: "claude-x", Input: paidCost(), Output: paidCost()},                        // metadata paid
 		"retired-model": {ID: "retired-model", Input: zeroCost(), Output: zeroCost(), Deprecated: true}, // deprecated
-		"free-model":    {ID: "free-model", Input: paidCost(), Output: paidCost()},                 // name fallback
-		"no-cost":       {ID: "no-cost"},                                                           // costs unknown
+		"free-model":    {ID: "free-model", Input: paidCost(), Output: paidCost()},                      // name does not override paid metadata
+		"ghost-free":    {ID: "ghost-free", Input: zeroCost(), Output: zeroCost(), Deprecated: true},    // name does not override deprecated
+		"no-cost":       {ID: "no-cost"},                                                                // costs unknown
 	})
 
 	cases := []struct {
@@ -35,7 +36,8 @@ func TestDecideFiveClasses(t *testing.T) {
 		{"gpt-oss-120b", true, "metadata_free", true},
 		{"claude-x", false, "metadata_paid", true},
 		{"retired-model", false, "metadata_deprecated", true},
-		{"free-model", true, "name_free", true},
+		{"free-model", false, "metadata_paid", true},
+		{"ghost-free", false, "metadata_deprecated", true},
 		{"unknown-model", false, "metadata_model_missing", false},
 		{"no-cost", false, "metadata_cost_unknown", false},
 	}
@@ -54,6 +56,12 @@ func TestDecideMetadataPending(t *testing.T) {
 	}
 	if got := store.Decide("anything"); got.Allowed || got.Source != "metadata_pending" {
 		t.Fatalf("pending store must reject non-free names, got %+v", got)
+	}
+	// model missing from ready metadata: the name fallback keeps its original
+	// documented intent of covering unknown ids.
+	ready := newReadyStore(map[string]ModelPrice{"other": {ID: "other", Input: paidCost(), Output: paidCost()}})
+	if got := ready.Decide("new-free"); !got.Allowed || got.Source != "name_free" {
+		t.Fatalf("missing model must fall back to name, got %+v", got)
 	}
 }
 

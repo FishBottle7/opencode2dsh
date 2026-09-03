@@ -80,15 +80,17 @@ func (c *ModelCatalog) Route(model string, hasAnonymous bool) (ModelRoute, error
 	return ModelRoute{}, fmt.Errorf("model %q is not available in the anonymous Zen catalog", model)
 }
 
-// anonymousDecision mirrors models.go:253-258 with the opencode2dsh S3 clause:
-// static entries verified against the anonymous lane may vouch for a model
-// while metadata cannot (pending, missing, or cost-unknown). Metadata verdicts
-// that are Known (paid/deprecated) still win, so real cost data is never
-// overridden by the static list.
+// anonymousDecision merges the metadata verdict with the S3 static vouch.
+// Metadata verdicts that are Known (paid/deprecated) win over the static list
+// with one exception: a compile-time verified S3 id stays vouched against a
+// stale "deprecated" flag (hy3-free case: it kept working after models.dev
+// flagged it and only died when it left the Zen catalog). The name fallback
+// only applies while metadata cannot speak (pending/missing).
 func (c *ModelCatalog) anonymousDecision(model string) AnonymousDecision {
 	if c.metadata != nil {
 		decision := c.metadata.Decide(model)
-		if !decision.Allowed && !decision.Known && isStaticFreeModel(model) {
+		if isStaticFreeModel(model) && !decision.Allowed &&
+			(!decision.Known || decision.Source == "metadata_deprecated") {
 			return AnonymousDecision{Allowed: true, Source: "static_verified", Known: false}
 		}
 		return decision

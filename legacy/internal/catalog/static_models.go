@@ -9,23 +9,20 @@ package catalog
 // scripts/verify-static-models.(ps1|sh) re-checks this list against the
 // upstream; maintain it whenever a model is added or upstream delists one.
 var staticFreeModels = []string{
-	"big-pickle",     // verified 2026-08-28: anonymous chat 200 (non-stream + stream)
-	"hy3-free",       // verified 2026-08-28: anonymous chat 200 (non-stream)
-	"mimo-v2.5-free", // verified 2026-08-28: anonymous chat 200 (non-stream)
+	"big-pickle",                      // verified 2026-08-28: anonymous chat 200 (non-stream + stream)
+	"mimo-v2.5-free",                  // verified 2026-08-28: anonymous chat 200 (non-stream)
+	"ling-3.0-flash-fin-free",         // verified 2026-09-01: anonymous chat 200
+	"nemotron-3.5-lightning-free",     // verified 2026-09-01: anonymous chat 200
+	"nemotron-3-ultra-free",           // verified 2026-09-01: anonymous chat 200 (7s; earlier timeout was transient)
+	"muse-spark-1.2-contributor-free", // verified 2026-09-01: docs pricing Free; 403 region-blocked from our probe, accepted
 }
 
-// staticFreeCandidates were exposed by /v1/models on 2026-08-28 but did not
-// complete a successful anonymous chat that day; re-verify before promoting.
+// staticFreeCandidates were exposed by /v1/models but did not complete a
+// successful anonymous chat; re-verify before promoting.
 var staticFreeCandidates = []string{
-	// "deepseek-v4-flash-free"          // 2026-08-28: upstream "Model is unavailable"
-	// "nemotron-3-ultra-free"           // 2026-08-28: upstream returned server_error payload
-	// "laguna-s-2.1-free"               // 2026-08-28: upstream 503 provider error
-	// "nemotron-3.5-lightning-free"     // 2026-08-28: 502 after all attempts
-	// "muse-spark-1.2-contributor-free" // 2026-08-28: 502 after all attempts
-	// "gpt-oss-120b",                   // design-era guess: not in the anonymous /v1/models list on 2026-08-28
-	// "gpt-oss-20b",                    // design-era guess: not in the anonymous /v1/models list on 2026-08-28
-	// "qwen3-coder-480b",               // design-era guess: not in the anonymous /v1/models list on 2026-08-28
-	// "deepseek-v4-flash",              // design-era guess: not in the anonymous /v1/models list on 2026-08-28
+	// "deepseek-v4-flash-free"          // models.dev deprecated; 2026-09-01: upstream 400 "Model is unavailable"
+	// "laguna-s-2.1-free"                // models.dev deprecated; 2026-09-01: upstream 503 (intermittent, failed twice)
+	// "hy3-free"                         // models.dev deprecated; 2026-09-01: delisted from /v1/models, upstream 401 "not supported"
 }
 
 func isStaticFreeModel(model string) bool {

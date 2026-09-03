@@ -47,10 +47,10 @@ func TestCatalogDynamicListFiltersStatic(t *testing.T) {
 func TestCatalogDecisionMergeWithMetadata(t *testing.T) {
 	store := &ModelMetadataStore{
 		models: map[string]ModelPrice{
-			"costless-one":  {ID: "costless-one", Input: zeroCost(), Output: zeroCost()},
-			"paid-one":  {ID: "paid-one", Input: paidCost(), Output: paidCost()},
+			"costless-one": {ID: "costless-one", Input: zeroCost(), Output: zeroCost()},
+			"paid-one":     {ID: "paid-one", Input: paidCost(), Output: paidCost()},
 			"legacy-zero":  {ID: "legacy-zero", Input: zeroCost(), Output: zeroCost(), Deprecated: true},
-			"third-party": {ID: "third-party", Input: paidCost(), Output: paidCost()},
+			"ghost-free":   {ID: "ghost-free", Input: zeroCost(), Output: zeroCost(), Deprecated: true},
 		},
 		updatedAt: testTime(),
 	}
@@ -64,6 +64,11 @@ func TestCatalogDecisionMergeWithMetadata(t *testing.T) {
 	}
 	if d := catalog.AnonymousDecision("legacy-zero"); d.Allowed {
 		t.Fatalf("deprecated must deny even with free in the name, got %+v", d)
+	}
+	// ghost-free is not a compile-time verified id: stale deprecation metadata
+	// denies it (the deepseek-v4-flash-free regression).
+	if d := catalog.AnonymousDecision("ghost-free"); d.Allowed {
+		t.Fatalf("cataloged-but-deprecated id must not be resurrected by the name, got %+v", d)
 	}
 
 	// S2 not ready => name fallback (models.go:257 upstream behavior).
@@ -86,7 +91,7 @@ func TestCatalogStaticOverridesOnlyUnknownMetadata(t *testing.T) {
 
 	// metadata knows it as paid -> honest denial wins (R3).
 	store := &ModelMetadataStore{
-		models: map[string]ModelPrice{"verified-paid": {ID: "verified-paid", Input: paidCost(), Output: paidCost()}},
+		models:    map[string]ModelPrice{"verified-paid": {ID: "verified-paid", Input: paidCost(), Output: paidCost()}},
 		updatedAt: testTime(),
 	}
 	known := NewModelCatalog(store)
@@ -98,6 +103,16 @@ func TestCatalogStaticOverridesOnlyUnknownMetadata(t *testing.T) {
 	pending := NewModelCatalog(&ModelMetadataStore{models: map[string]ModelPrice{}})
 	if d := pending.AnonymousDecision("verified-one"); !d.Allowed || d.Source != "static_verified" {
 		t.Fatalf("static must vouch while metadata is pending, got %+v", d)
+	}
+
+	// stale deprecation metadata against a compile-time verified id -> the
+	// S3 vouch survives (hy3-free case: works after models.dev flags it).
+	stale := NewModelCatalog(&ModelMetadataStore{
+		models:    map[string]ModelPrice{"verified-one": {ID: "verified-one", Input: zeroCost(), Output: zeroCost(), Deprecated: true}},
+		updatedAt: testTime(),
+	})
+	if d := stale.AnonymousDecision("verified-one"); !d.Allowed || d.Source != "static_verified" {
+		t.Fatalf("static vouch must survive a stale deprecated flag, got %+v", d)
 	}
 }
 

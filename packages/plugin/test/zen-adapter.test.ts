@@ -44,9 +44,9 @@ test('prepareCall returns the resolved model and a stream dispatcher', async () 
 
 test('listModels mirrors the catalog without duplicates', () => {
   const adapter = new ZenAdapter({
-    list: () => ['big-pickle', 'big-pickle', 'hy3-free'],
+    list: () => ['big-pickle', 'big-pickle', 'mimo-v2.5-free'],
     decision: () => ({ allowed: true, source: 'test', known: true }),
   })
   const models = adapter.listModels('opencode2dsh')
-  assert.deepEqual(models.map((m) => m.id), ['big-pickle', 'hy3-free'])
+  assert.deepEqual(models.map((m) => m.id), ['big-pickle', 'mimo-v2.5-free'])
 })

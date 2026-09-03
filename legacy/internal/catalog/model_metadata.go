@@ -180,24 +180,24 @@ func (store *ModelMetadataStore) Decide(model string) AnonymousDecision {
 	if !exists {
 		return fallback("metadata_model_missing")
 	}
+	// Deprecation outranks the name: a delisted-but-still-cataloged id
+	// (deepseek-v4-flash-free) must not be resurrected by a "free" suffix.
+	// The name fallback above only fires while metadata cannot speak.
+	if price.Deprecated {
+		return AnonymousDecision{Allowed: false, Source: "metadata_deprecated", Known: true,
+			Deprecated: true, InputCost: price.Input, OutputCost: price.Output}
+	}
 	decision := AnonymousDecision{
 		Known: true, Deprecated: price.Deprecated, InputCost: price.Input, OutputCost: price.Output,
 	}
-	metadataFree := !price.Deprecated && price.Input != nil && price.Output != nil && *price.Input == 0 && *price.Output == 0
-	if nameFree || metadataFree {
+	metadataFree := price.Input != nil && price.Output != nil && *price.Input == 0 && *price.Output == 0
+	if metadataFree {
 		decision.Allowed = true
-		switch {
-		case nameFree && metadataFree:
+		if nameFree {
 			decision.Source = "name_and_metadata_free"
-		case nameFree:
-			decision.Source = "name_free"
-		default:
+		} else {
 			decision.Source = "metadata_free"
 		}
-		return decision
-	}
-	if price.Deprecated {
-		decision.Source = "metadata_deprecated"
 		return decision
 	}
 	if price.Input == nil || price.Output == nil {
