@@ -11,3 +11,6 @@ legacy/agent/.gotmp/
 
 # Logs / local state
 *.log
+
+# Local drafts
+xiaohongshu-post.md
