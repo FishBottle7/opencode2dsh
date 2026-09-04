@@ -31,6 +31,26 @@ export interface Opencode2dshConfig {
   restartMaxDelayMs?: number
   /** Consecutive crash count that trips the circuit breaker. */
   maxConsecutiveCrashes?: number
+  /**
+   * IP-pool exit routing (docs/ip-pool.md). Everything below is pure plugin
+   * config; the settings page (IP-6) will own these live, this object is
+   * the cordis.patch.yml seam.
+   */
+  ipPool?: IpPoolConfig
+}
+
+/** docs/ip-pool.md section 5.1 schema (subset owned by config today). */
+export interface IpPoolConfig {
+  /** Master switch; false keeps the process exactly as today (direct). */
+  enabled?: boolean
+  /** Manually added plain proxies: 'http://h:p' or 'socks5://h:p'. */
+  manual?: string[]
+  /** Fixed primary exit address (docs/ip-pool.md 3.6). */
+  pinnedExitId?: string
+  /** Absolute pinning: never rotate, never direct-fallback (3.6). */
+  pinnedStrict?: boolean
+  /** Hosts whose traffic goes through the pool (default opencode.ai). */
+  proxyHosts?: string[]
 }
 
 export const defaults = {

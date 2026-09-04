@@ -7,6 +7,7 @@ import { ModelCatalog, defaultCachePath, type CatalogSnapshot } from './adapter/
 import { ZenAdapter, PROVIDER_ID } from './adapter/zen-adapter.ts'
 import { AgentProcess, type ReadyInfo } from './agent-process.js'
 import { configPaths, ensureToken, resolveConfig, writeAgentConfig, type Opencode2dshConfig } from './config.js'
+import { startIpPool, type IpPoolRuntime } from './ip-pool.ts'
 import { fetchHealth, fetchModels, registerProvider, removeProviderRoute } from './provider.js'
 
 /**
@@ -59,9 +60,15 @@ function applyAdapter(ctx: PluginContext, config: Opencode2dshConfig): { ready: 
     return { ready }
   }
 
-  // Health snapshot for adapter mode (the agent-mode healthz equivalent):
-  // written after every refresh round so field diagnostics do not depend on
-  // terminal access to the DSH process.
+  // IP-pool exit routing (docs/ip-pool.md IP-1: manual proxies + pinned).
+  // Opt-in; disabled keeps the process byte-for-byte on the direct path.
+  const ipPoolRuntimePromise: Promise<IpPoolRuntime | null> = cfg.ipPool?.enabled
+    ? startIpPool(cfg, logger).catch((err) => {
+        logger.warn(`opencode2dsh: ip pool start failed: ${err instanceof Error ? err.message : String(err)}`)
+        return null
+      })
+    : Promise.resolve(null)
+
   const dataDir = join(homedir(), '.opencode2dsh')
   const statusPath = join(dataDir, 'adapter-status.json')
   const writeStatus = (status: CatalogSnapshot, lastError: string): void => {
@@ -108,6 +115,7 @@ function applyAdapter(ctx: PluginContext, config: Opencode2dshConfig): { ready: 
   if (typeof maybeEffect === 'function') {
     maybeEffect.call(ctx, () => () => {
       catalog.stop()
+      void ipPoolRuntimePromise.then((runtime) => runtime?.dispose())
     })
   }
   return { ready }

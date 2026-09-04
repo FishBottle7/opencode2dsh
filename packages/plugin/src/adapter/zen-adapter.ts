@@ -5,6 +5,7 @@ import { ModelCatalog, ZEN_BASE_URL } from './catalog.ts'
 import { toStreamChunks, type HarnessChunk, type PiEvent } from './events.ts'
 import { deriveRequestIDs, disguiseHeaders } from './ids.ts'
 import { toPiContext, type HarnessGenerateOptions } from './messages.ts'
+import { routingContext, type RoutingContext } from '../pool/dispatcher.ts'
 
 /**
  * The TS adapter: registers as a DSH LlmAdapter for the `opencode2dsh` route
@@ -131,8 +132,27 @@ export class ZenAdapter {
     const context = toPiContext(options)
     const ids = deriveRequestIDs(options.messages)
     const model = toPiModel(options.model)
+    // IP-pool routing context (docs/ip-pool.md 3.3): pi-ai builds the request
+    // body and dispatches it on separate layers with no channel for "which
+    // model is this fetch for", so the per-request context rides AsyncLocalStorage.
+    // Wrapping the generator body (not the generator object) keeps the ALS
+    // store alive for every fetch the stream performs.
+    const contextStore: RoutingContext = { model: options.model, session: ids.session }
+    const self = this
+    const events = routingContext.run(contextStore, () =>
+      self.#eventsFor(options, context, ids, model),
+    )
+    yield* toStreamChunks(events as unknown as AsyncIterable<PiEvent>, model.contextWindow)
+  }
+
+  #eventsFor(
+    options: HarnessGenerateOptions,
+    context: ReturnType<typeof toPiContext>,
+    ids: ReturnType<typeof deriveRequestIDs>,
+    model: ReturnType<typeof toPiModel>,
+  ): unknown {
     // Structural boundary: PiContext (own types, unit-tested) -> pi-ai Context.
-    const events = this.#provider.streamSimple(model, context as unknown as Context, {
+    return this.#provider.streamSimple(model, context as unknown as Context, {
       apiKey: ANONYMOUS_KEY,
       sessionId: ids.session,
       headers: disguiseHeaders(ids),
@@ -141,7 +161,6 @@ export class ZenAdapter {
       temperature: options.temperature,
       maxTokens: options.maxTokens,
     })
-    yield* toStreamChunks(events as unknown as AsyncIterable<PiEvent>, model.contextWindow)
   }
 
   /** Expose the live catalog snapshot for diagnostics. */

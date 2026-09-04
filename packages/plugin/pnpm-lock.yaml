@@ -11,6 +11,9 @@ importers:
       '@earendil-works/pi-ai':
         specifier: ^0.82.1
         version: 0.82.1(ws@8.21.3)(zod@4.4.3)
+      undici:
+        specifier: ^8.10.1
+        version: 8.10.1
     devDependencies:
       '@deepseek-ai/cordis':
         specifier: ^4.0.1
@@ -742,6 +745,10 @@ packages:
 
   undici-types@7.18.2:
     resolution: {integrity: sha512-AsuCzffGHJybSaRrmr5eHr81mwJU3kjw6M+uprWvCXiNeN9SOGwQ3Jn8jb8m3Z6izVgknn1R0FTCEAP2QrLY/w==}
+
+  undici@8.10.1:
+    resolution: {integrity: sha512-YQ3WlbqjYMmNpdvDH64jAgLjxuAR9+649calDWhbshYaeQGO2bR4nI94ORJmwI3J9YhoKQnpyGOK+0zlWS5N5Q==}
+    engines: {node: '>=22.19.0'}
 
   web-streams-polyfill@3.3.3:
     resolution: {integrity: sha512-d2JWLCivmZYTSIoge9MsgFCZrt571BikcWGYkjC1khllbTeDlGqZ2D8vD8E/lJa8WGWbb7Plm8/XJYV7IJHZZw==}
@@ -1562,6 +1569,8 @@ snapshots:
       unconfig-core: 7.5.0
 
   undici-types@7.18.2: {}
+
+  undici@8.10.1: {}
 
   web-streams-polyfill@3.3.3: {}
 
