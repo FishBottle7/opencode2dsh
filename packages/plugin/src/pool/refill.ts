@@ -36,6 +36,8 @@ export class RefillScheduler {
   readonly #deps: RefillDeps
   readonly #breaker = new SourceBreaker()
   #intervalMs: number
+  /** Candidate cap per source per round (a source can return thousands of
+   *  rows; admission cost is 4 requests per candidate). */
   #maxPerRound: number
   #timer: NodeJS.Timeout | null = null
   #running = false
@@ -46,7 +48,7 @@ export class RefillScheduler {
     this.#pool = pool
     this.#deps = deps
     this.#intervalMs = options.intervalMs ?? 10 * 60_000
-    this.#maxPerRound = options.maxAdmissionsPerRound ?? 50
+    this.#maxPerRound = options.maxAdmissionsPerRound ?? 10
   }
 
   get lastRound(): { admitted: number; rejected: number; fetched: number; state: string; at: number } {
@@ -91,23 +93,39 @@ export class RefillScheduler {
     let fetched = 0
     let admitted = 0
     let rejected = 0
+    // Candidate cap: a single source can list thousands of rows, and every
+    // candidate costs up to four admission requests (docs 4.5 — admission
+    // shares the bounded probe concurrency). Shuffle then cap per round.
+    const candidateCap = quota * 3 // surplus headroom for rejects
+    const perSourceCap = 30
     const candidates: Array<{ address: string; host: string; port: number; protocol: 'http' | 'socks5' }> = []
     const seen = new Set<string>(this.#poolAddresses())
 
     for (const source of sources) {
-      if (candidates.length >= quota * 3) break // surplus headroom for rejects
+      if (candidates.length >= candidateCap) break
       try {
         const result = this.#deps.fetchSourceImpl
           ? await this.#deps.fetchSourceImpl(source, this.#deps.fetchImpl ?? fetch)
           : await fetchSource(source, this.#deps.fetchImpl ?? fetch)
         this.#breaker.recordSuccess(source.url)
         fetched += result.addresses.length
-        for (const entry of result.addresses) {
+        // shuffle before capping: free lists are not uniformly distributed
+        // (freshness/quality vary), a random sample beats the head of the list
+        const rows = result.addresses.slice()
+        for (let i = rows.length - 1; i > 0; i -= 1) {
+          const j = Math.floor(Math.random() * (i + 1))
+          ;[rows[i], rows[j]] = [rows[j]!, rows[i]!]
+        }
+        let fromThisSource = 0
+        for (const entry of rows) {
+          if (candidates.length >= candidateCap) break
+          if (fromThisSource >= perSourceCap) break
           if (seen.has(entry.address)) continue
           seen.add(entry.address)
           // Free pools are HTTP-only for MVP (socks5 candidates are backlog, 8).
           if (source.protocol !== 'http') continue
           candidates.push({ ...entry, protocol: 'http' })
+          fromThisSource += 1
         }
       } catch {
         this.#breaker.recordFailure(source.url)
