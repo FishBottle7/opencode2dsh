@@ -39,11 +39,90 @@ export interface AdmissionDeps {
   logger?: { warn(message: string): void }
 }
 
-export interface AdmissionResult {
-  admitted: boolean
-  node?: ExitNode
-  /** Step that rejected the candidate, with the reason (diagnostics). */
-  reason?: string
+export interface EchoFacts {
+  exitIP: string
+  exitLocation: string
+  latencyMs: number
+}
+
+/**
+ * Coarse screen (admission steps 1+2, docs/ip-pool.md 4.5 修订): one request
+ * through the candidate to the ip echo. This step touches only the wild
+ * candidate and a public IP service — never the anonymous lane — so callers
+ * may fan it out at high concurrency (admissionFanout; GoProxy uses 300 for
+ * the same reason). Steps 3-4 (which spend anonymous-lane quota) stay on the
+ * bounded Prober.
+ */
+export async function coarseScreen(
+  deps: Pick<AdmissionDeps, 'undici' | 'ipEchoUrl' | 'blockedCountries' | 'logger'>,
+  candidate: { address: string; protocol: 'http' | 'socks5' },
+  options: { relaxed?: boolean; pinned?: boolean; timeoutMs?: number } = {},
+): Promise<EchoFacts | { rejected: string }> {
+  const ipEcho = deps.ipEchoUrl ?? DEFAULT_IP_ECHO
+  const timeout = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
+  const blocked = new Set(deps.blockedCountries ?? ['CN'])
+  const maxResponseMs = options.relaxed ? RELAXED_RESPONSE_MS : 3_000
+
+  let agent: Dispatcher | null = null
+  try {
+    agent = new deps.undici.ProxyAgent({
+      uri: candidate.protocol === 'socks5' ? `socks5://${candidate.address}` : `http://${candidate.address}`,
+    })
+  } catch (err) {
+    return { rejected: `agent-build: ${err instanceof Error ? err.message : String(err)}` }
+  }
+  try {
+    const started = Date.now()
+    const echo = await withTimeout(
+      deps.undici.request(ipEcho, { dispatcher: agent }),
+      timeout,
+      'probe',
+    )
+    const latencyMs = Date.now() - started
+    if (echo.statusCode !== 200) return { rejected: `echo HTTP ${echo.statusCode}` }
+    let body: EchoResponse
+    try {
+      body = JSON.parse(await echo.body.text()) as EchoResponse
+    } catch {
+      return { rejected: 'echo body not JSON' }
+    }
+    if (body.status !== 'success' || !body.query) return { rejected: 'echo did not report an exit IP' }
+    const country = body.countryCode?.toUpperCase() ?? ''
+    if (blocked.has(country)) return { rejected: `geo-blocked ${country}` }
+    if (latencyMs > maxResponseMs && !options.pinned) {
+      return { rejected: `latency ${latencyMs}ms > ${maxResponseMs}ms` }
+    }
+    return {
+      exitIP: body.query,
+      exitLocation: `${body.countryCode} ${body.city}`.trim(),
+      latencyMs,
+    }
+  } catch (err) {
+    return { rejected: err instanceof Error ? err.message : String(err) }
+  } finally {
+    void agent.close().catch(() => {})
+  }
+}
+
+/** Bounded fan-out helper for the coarse screen (wild candidates only). */
+export async function coarseScreenBatch(
+  deps: Parameters<typeof coarseScreen>[0],
+  candidates: Array<{ address: string; protocol: 'http' | 'socks5' }>,
+  options: { fanout?: number; relaxed?: boolean; timeoutMs?: number } = {},
+): Promise<Map<string, EchoFacts>> {
+  const fanout = Math.max(1, options.fanout ?? 100)
+  const results = new Map<string, EchoFacts>()
+  const queue = [...candidates]
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const candidate = queue.shift()
+      if (candidate === undefined) return
+      const verdict = await coarseScreen(deps, candidate, options)
+      if ('exitIP' in verdict) results.set(candidate.address, verdict)
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(fanout, candidates.length) }, () => worker()))
+  return results
 }
 
 interface EchoResponse {
@@ -76,17 +155,26 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 
 /** One admission probe for one candidate address. Pure effects: returns the
  *  verdict; the caller (refill scheduler) applies it to the pool. */
+export interface AdmissionResult {
+  admitted: boolean
+  node?: ExitNode
+  /** Step that rejected the candidate, with the reason (diagnostics). */
+  reason?: string
+}
+
 export async function admitCandidate(
   deps: AdmissionDeps,
   candidate: { address: string; protocol: 'http' | 'socks5'; source: ExitNode['source'] },
-  options: { relaxed?: boolean; pinned?: boolean; timeoutMs?: number } = {},
+  options: {
+    relaxed?: boolean
+    pinned?: boolean
+    timeoutMs?: number
+    /** Pre-screened echo facts (coarseScreen output): skips steps 1-2. */
+    echoFacts?: EchoFacts
+  } = {},
 ): Promise<AdmissionResult> {
   const zenBase = deps.zenBaseUrl ?? ZEN_BASE_URL
-  const ipEcho = deps.ipEchoUrl ?? DEFAULT_IP_ECHO
   const timeout = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
-  const blocked = new Set(deps.blockedCountries ?? ['CN'])
-  const fast = !options.relaxed
-  const maxResponseMs = fast ? 3_000 : RELAXED_RESPONSE_MS
   const smokeModel = deps.smokeModel ?? 'big-pickle'
 
   let agent: Dispatcher | null = null
@@ -98,7 +186,7 @@ export async function admitCandidate(
     return { admitted: false, reason: `agent-build: ${err instanceof Error ? err.message : String(err)}` }
   }
 
-  const request = <T>(url: string, init: { method?: string; headers?: Record<string, string>; body?: string } = {}) =>
+  const request = (url: string, init: { method?: string; headers?: Record<string, string>; body?: string } = {}) =>
     withTimeout(
       deps.undici.request(url, { dispatcher: agent!, ...init }),
       timeout,
@@ -106,30 +194,16 @@ export async function admitCandidate(
     )
 
   try {
-    let exitIP = ''
-    let location = ''
-    let latencyMs = 0
-
-    // Steps 1+2: connectivity, latency, exit IP, geo (one request).
-    const started = Date.now()
-    const echo = await request(ipEcho)
-    latencyMs = Date.now() - started
-    if (echo.statusCode !== 200) return { admitted: false, reason: `echo HTTP ${echo.statusCode}` }
-    let echoBody: EchoResponse
-    try {
-      echoBody = JSON.parse(await echo.body.text()) as EchoResponse
-    } catch {
-      return { admitted: false, reason: 'echo body not JSON' }
-    }
-    if (echoBody.status !== 'success' || !echoBody.query) {
-      return { admitted: false, reason: 'echo did not report an exit IP' }
-    }
-    exitIP = echoBody.query
-    location = `${echoBody.countryCode} ${echoBody.city}`.trim()
-    const country = echoBody.countryCode?.toUpperCase() ?? ''
-    if (blocked.has(country)) return { admitted: false, reason: `geo-blocked ${country}` }
-    if (latencyMs > maxResponseMs && !options.pinned) {
-      return { admitted: false, reason: `latency ${latencyMs}ms > ${maxResponseMs}ms` }
+    // Steps 1+2 run inline only when the caller has not pre-screened the
+    // candidate (coarseScreen/batch output = echoFacts; the refill loop
+    // always pre-screens free candidates at high fan-out).
+    let facts: EchoFacts
+    if (options.echoFacts) {
+      facts = options.echoFacts
+    } else {
+      const verdict = await coarseScreen(deps, candidate, options)
+      if ('rejected' in verdict) return { admitted: false, reason: verdict.rejected }
+      facts = verdict
     }
 
     // Step 3: HTTPS tunnel to the real upstream (models list, Bearer public).
@@ -162,10 +236,10 @@ export async function admitCandidate(
         protocol: candidate.protocol,
         source: candidate.source,
         pinned: options.pinned ?? false,
-        exitIP,
-        exitLocation: location,
-        latencyMs,
-        quality: gradeOf(latencyMs),
+        exitIP: facts.exitIP,
+        exitLocation: facts.exitLocation,
+        latencyMs: facts.latencyMs,
+        quality: gradeOf(facts.latencyMs),
         addedAt: Date.now(),
       },
     }

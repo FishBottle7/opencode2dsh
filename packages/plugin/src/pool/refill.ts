@@ -14,13 +14,17 @@ import type { Dispatcher } from 'undici'
 import { ExitPool } from './pool.ts'
 import { Prober, type ProbeTask } from './prober.ts'
 import { SourceBreaker, dedupeAddresses, fetchSource, selectSources, type FetchResult, type FreeSource } from './sources.ts'
-import { admitCandidate, type AdmissionDeps } from './admission.ts'
+import { admitCandidate, coarseScreenBatch, type AdmissionDeps } from './admission.ts'
 
 export interface RefillDeps extends AdmissionDeps {
   prober: Prober
   /** Source tier fetch (injectable). */
   fetchImpl?: typeof fetch
   fetchSourceImpl?: (source: FreeSource, fetchImpl: typeof fetch) => Promise<FetchResult>
+  /** Coarse-screen fan-out (docs/ip-pool.md 4.5: wild candidates only —
+   *  steps 1-2 touch no anonymous-lane quota, so this may run hot).
+   *  Trusted sources never pass through here. */
+  admissionFanout?: number
 }
 
 export interface RefillOptions {
@@ -42,7 +46,7 @@ export class RefillScheduler {
   #timer: NodeJS.Timeout | null = null
   #running = false
   #stopped = false
-  #lastRound = { admitted: 0, rejected: 0, fetched: 0, state: 'healthy' as string, at: 0 }
+  #lastRound = { admitted: 0, rejected: 0, fetched: 0, coarsePassed: 0, state: 'healthy' as string, at: 0 }
 
   constructor(pool: ExitPool, deps: RefillDeps, options: RefillOptions = {}) {
     this.#pool = pool
@@ -51,7 +55,7 @@ export class RefillScheduler {
     this.#maxPerRound = options.maxAdmissionsPerRound ?? 10
   }
 
-  get lastRound(): { admitted: number; rejected: number; fetched: number; state: string; at: number } {
+  get lastRound(): { admitted: number; rejected: number; fetched: number; coarsePassed: number; state: string; at: number } {
     return this.#lastRound
   }
 
@@ -132,11 +136,29 @@ export class RefillScheduler {
       }
     }
 
-    // Admission runs through the Prober queue (two-level scheduling, 4.1) —
-    // admission shares the global probe cap; the round ends when the batch
-    // of tasks resolves.
+    // Coarse screen (docs 4.5 分层修订): steps 1-2 touch only the wild
+    // candidates and a public IP service, so they fan out hot
+    // (admissionFanout, default 100) and die in minutes even against tens
+    // of thousands of candidates. Survivors (~1-3%) proceed to the
+    // anonymous-lane steps through the bounded Prober queue.
+    const relaxed = state === 'critical' || state === 'emergency'
+    const facts = await coarseScreenBatch(
+      this.#deps,
+      candidates,
+      { fanout: this.#deps.admissionFanout ?? 100, relaxed, timeoutMs: 5000 },
+    )
+    // coarse rejections count toward the round's rejected total: a candidate
+    // dying at the echo step is as rejected as one failing the smoke.
+    rejected += candidates.length - facts.size
+    this.#lastRound = { admitted, rejected, fetched, state, at: Date.now(), coarsePassed: facts.size }
+
+    // Fine screen (steps 3-4, anonymous-lane quota): through the Prober
+    // queue with the two-level scheduling (serial per exit, bounded
+    // global workers, 4.1).
     const tasks: ProbeTask[] = []
     for (const candidate of candidates) {
+      const echoFacts = facts.get(candidate.address)
+      if (!echoFacts) continue
       if (admitted >= quota) break
       tasks.push({
         exitId: candidate.address,
@@ -146,7 +168,7 @@ export class RefillScheduler {
             address: candidate.address,
             protocol: candidate.protocol,
             source: 'free',
-          }, { relaxed: state === 'critical' || state === 'emergency' })
+          }, { relaxed, echoFacts })
           if (verdict.admitted && verdict.node) {
             // Replace flow when full (3.5): evict the worst free node to room.
             if (this.#pool.isFreeFull()) this.#pool.evictWorstFree()
@@ -160,7 +182,6 @@ export class RefillScheduler {
         },
       })
     }
-    this.#lastRound = { admitted, rejected, fetched, state, at: Date.now() }
     if (tasks.length > 0) {
       await this.#deps.prober.enqueueAll(tasks)
       this.#lastRound = { ...this.#lastRound, admitted, rejected, at: Date.now() }
