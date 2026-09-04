@@ -138,14 +138,14 @@ export class RefillScheduler {
 
     // Coarse screen (docs 4.5 分层修订): steps 1-2 touch only the wild
     // candidates and a public IP service, so they fan out hot
-    // (admissionFanout, default 100) and die in minutes even against tens
+    // (admissionFanout, default 300 — GoProxy ValidateConcurrency parity)
     // of thousands of candidates. Survivors (~1-3%) proceed to the
     // anonymous-lane steps through the bounded Prober queue.
     const relaxed = state === 'critical' || state === 'emergency'
     const facts = await coarseScreenBatch(
       this.#deps,
       candidates,
-      { fanout: this.#deps.admissionFanout ?? 100, relaxed, timeoutMs: 5000 },
+      { fanout: this.#deps.admissionFanout ?? 300, relaxed, timeoutMs: 5000 },
     )
     // coarse rejections count toward the round's rejected total: a candidate
     // dying at the echo step is as rejected as one failing the smoke.

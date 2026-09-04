@@ -434,7 +434,7 @@ POST {zen}/v1/chat/completions
 
 **并发边界按「打的是谁」分层（2026-09-05 修订，修正此前一刀切）**：并发约束的存在理由是**保护要保护的目标**，而不是保护候选本身——
 
-- **粗筛（步骤 1+2）：暴力高并发**。`admissionFanout`（默认 **100**）并行扫候选。理由：野生免费代理没有账号体系、没有封号风险、发布即被全世界爬虫扫描，它们本来就是拿来消耗的一次性资源（GoProxy 同判：ValidateConcurrency 300）；ip-api 的请求经各候选各自的出口 IP 发出，不共享我们的本机限流。
+- **粗筛（步骤 1+2）：暴力高并发**。`admissionFanout`（默认 **300**，与 GoProxy ValidateConcurrency 对齐）并行扫候选。理由：野生免费代理没有账号体系、没有封号风险、发布即被全世界爬虫扫描，它们本来就是拿来消耗的一次性资源；ip-api 的请求经各候选各自的出口 IP 发出，不共享我们的本机限流。
 - **细筛（步骤 3+4）：维持克制**。只有粗筛幸存者（实测 ~1-3%）才走到碰 Zen 的步骤，且走 Prober 两级调度（同出口串行 + 全局 `maxConcurrentProbes` 上限）——这两步烧的是匿名通道配额，我们的核心资产。
 - **订阅/机场节点永远不暴力**：它们是用户付费的账号资源，有封号风险；粗筛并发只作用于 free 来源候选（trusted 来源跳过粗筛直接细筛，见下）。
 
@@ -450,7 +450,7 @@ POST {zen}/v1/chat/completions
 | --- | --- | --- |
 | probeModels | `[S3 首个]`（当前 `['big-pickle']`） | 探活模型集合；可加主用模型，同出口内多模型仍串行 |
 | maxConcurrentProbes | **3** | 细筛/探活全局并发上限（碰 Zen 的请求，§4.1） |
-| admissionFanout | **100** | 粗筛暴力并发（只打野生候选+IP 服务，不碰 Zen，§4.5） |
+| admissionFanout | **300** | 粗筛暴力并发（只打野生候选+IP 服务，不碰 Zen，§4.5；GoProxy ValidateConcurrency 同值） |
 | probeTimeoutMs | 8000 | 单探测超时 |
 | maxResponseMs | 3000 | 准入延迟门槛（critical 态放宽 6000） |
 | probeIntervalMs | 10min | 周期探活 + refill 状态检查节拍（上一轮未跑完则顺延） |

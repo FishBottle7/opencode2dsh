@@ -110,7 +110,7 @@ export async function coarseScreenBatch(
   candidates: Array<{ address: string; protocol: 'http' | 'socks5' }>,
   options: { fanout?: number; relaxed?: boolean; timeoutMs?: number } = {},
 ): Promise<Map<string, EchoFacts>> {
-  const fanout = Math.max(1, options.fanout ?? 100)
+  const fanout = Math.max(1, options.fanout ?? 300)
   const results = new Map<string, EchoFacts>()
   const queue = [...candidates]
   const worker = async (): Promise<void> => {
