@@ -156,10 +156,14 @@ export class RefillScheduler {
     // queue with the two-level scheduling (serial per exit, bounded
     // global workers, 4.1).
     const tasks: ProbeTask[] = []
+    let admittedLimited = 0
     for (const candidate of candidates) {
       const echoFacts = facts.get(candidate.address)
       if (!echoFacts) continue
-      if (admitted >= quota) break
+      // Quota counts usable seats: 429-cooling admits occupy a pool seat but
+      // do not satisfy the availability quota (the state machine stays hungry
+      // until they recover or get replaced), so the gate counts both.
+      if (admitted + admittedLimited >= quota) break
       tasks.push({
         exitId: candidate.address,
         kind: 'admission',
@@ -173,8 +177,15 @@ export class RefillScheduler {
             // Replace flow when full (3.5): evict the worst free node to room.
             if (this.#pool.isFreeFull()) this.#pool.evictWorstFree()
             if (this.#pool.add(verdict.node)) {
-              this.#pool.markOk(verdict.node.id)
-              admitted += 1
+              if (verdict.limited) {
+                // 429 at smoke (4.5): good exit, quota consumed elsewhere —
+                // admit cooling; the periodic probe retries when it expires.
+                this.#pool.markLimited(verdict.node.id)
+                admittedLimited += 1
+              } else {
+                this.#pool.markOk(verdict.node.id)
+                admitted += 1
+              }
             }
           } else {
             rejected += 1
@@ -184,7 +195,7 @@ export class RefillScheduler {
     }
     if (tasks.length > 0) {
       await this.#deps.prober.enqueueAll(tasks)
-      this.#lastRound = { ...this.#lastRound, admitted, rejected, at: Date.now() }
+      this.#lastRound = { ...this.#lastRound, admitted: admitted + admittedLimited, rejected, at: Date.now() }
     }
   }
 

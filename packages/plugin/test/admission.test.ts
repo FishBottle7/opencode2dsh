@@ -102,11 +102,19 @@ test('admission: fail-fast at each step (echo/geo/latency/models/smoke)', async 
   assert.ok(!result.admitted)
   assert.match(result.reason!, /zen models HTTP 403/)
 
-  // step 4: anonymous-lane smoke rejected
+  // step 4: anonymous-lane smoke 429 -> admitted with `limited` (good exit,
+  // quota consumed elsewhere; the caller cools it, docs 4.5)
   transport = fakeTransport({ ...okScript(), [CHAT_URL]: { status: 429, body: '' } })
   result = await admitCandidate(deps(transport), { address: 'h:1', protocol: 'http', source: 'free' }, { timeoutMs: 1000 })
+  assert.ok(result.admitted, result.reason)
+  assert.ok(result.limited)
+  assert.equal(result.node?.exitIP, '5.5.5.5')
+
+  // step 4: any other smoke failure still rejects outright
+  transport = fakeTransport({ ...okScript(), [CHAT_URL]: { status: 403, body: '' } })
+  result = await admitCandidate(deps(transport), { address: 'h:1', protocol: 'http', source: 'free' }, { timeoutMs: 1000 })
   assert.ok(!result.admitted)
-  assert.match(result.reason!, /zen smoke HTTP 429/)
+  assert.match(result.reason!, /zen smoke HTTP 403/)
 
   // transport errors surface as reasons (timeout / reset)
   transport = fakeTransport({ '*': new Error('connect ECONNREFUSED') })

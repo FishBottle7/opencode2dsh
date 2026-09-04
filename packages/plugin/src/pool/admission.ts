@@ -160,6 +160,14 @@ export interface AdmissionResult {
   node?: ExitNode
   /** Step that rejected the candidate, with the reason (diagnostics). */
   reason?: string
+  /**
+   * The candidate passed every step except quota: alive proxy, working Zen
+   * tunnel, 429 at smoke (2026-09-05 decision: these are good exits whose
+   * quota is consumed elsewhere — free proxies are shared worldwide). The
+   * caller admits them and immediately cools them (markLimited), so the
+   * periodic probe retries when the cooldown expires.
+   */
+  limited?: boolean
 }
 
 export async function admitCandidate(
@@ -226,6 +234,28 @@ export async function admitCandidate(
       body: JSON.stringify({ model: smokeModel, messages: [{ role: 'user', content: 'ping' }], max_tokens: 1 }),
     })
     if (smoke.statusCode !== 200) {
+      // 429 = the exit is good (alive + tunnel verified) but its anonymous
+      // quota is currently consumed. Admit with limited: the caller cools it
+      // and the periodic probe retries later (measured 2026-09-05: 429 is
+      // the single largest smoke failure among tunnel-OK survivors).
+      if (smoke.statusCode === 429) {
+        return {
+          admitted: true,
+          limited: true,
+          reason: `zen smoke HTTP 429`,
+          node: {
+            id: candidate.address,
+            protocol: candidate.protocol,
+            source: candidate.source,
+            pinned: options.pinned ?? false,
+            exitIP: facts.exitIP,
+            exitLocation: facts.exitLocation,
+            latencyMs: facts.latencyMs,
+            quality: gradeOf(facts.latencyMs),
+            addedAt: Date.now(),
+          },
+        }
+      }
       return { admitted: false, reason: `zen smoke HTTP ${smoke.statusCode}` }
     }
 

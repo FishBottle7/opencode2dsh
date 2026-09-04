@@ -45,6 +45,8 @@ function makeStack(options: {
   lists: Record<string, string[]>
   /** which admission candidates pass (by address) */
   admitOk: (address: string) => boolean
+  /** smoke status per address (default 200; set 429 for the limited path) */
+  smokeStatus?: (address: string) => number
   pool?: ExitPool
 }) {
   const pool = options.pool ?? new ExitPool({ targetSize: 4 })
@@ -75,6 +77,10 @@ function makeStack(options: {
           statusCode: 200,
           body: { text: async () => JSON.stringify({ status: 'success', query: ip, countryCode: 'US', city: 'c', country: 'c' }) },
         }
+      }
+      if (url.includes('chat/completions')) {
+        const status = options.smokeStatus?.(address) ?? 200
+        if (status !== 200) return { statusCode: status, body: { text: async () => '' } }
       }
       return { statusCode: 200, body: { text: async () => '{"ok":true}' } }
     }) as never,
@@ -232,6 +238,30 @@ test('refill: admission quota bounds the round; full pool evicts worst on replac
   await stack2.scheduler.tick()
   assert.equal(stack2.fetches.length, 0)
   assert.ok(!pool.has('good:2'))
+})
+
+test('refill: smoke-429 survivors are admitted cooling and do not satisfy the quota', async () => {
+  // Live-observed semantics (docs 4.5, 2026-09-05): a candidate whose proxy
+  // is alive and whose Zen tunnel works but hits 429 at smoke is a good exit
+  // with its quota consumed elsewhere — admit it cooling, keep the state
+  // machine hungry for truly-usable nodes, and let the periodic probe retry
+  // when the cooldown expires.
+  const stack = makeStack({
+    lists: { 'https://raw.githubusercontent.com/ProxyScraper/ProxyScraper/main/http.txt': ['hot:1', 'good:1'] },
+    admitOk: () => true,
+    smokeStatus: (address) => (address === 'hot:1' ? 429 : 200),
+  })
+  await stack.scheduler.tick()
+  // both admitted: hot:1 cooling, good:1 ok
+  assert.ok(stack.pool.has('hot:1'))
+  assert.ok(stack.pool.has('good:1'))
+  assert.equal(stack.pool.freeCount(), 2)
+  // the 429 node is unusable right now (cooling), the ok one is usable
+  assert.ok(!stack.pool.isUsable('hot:1', 'big-pickle'))
+  assert.ok(stack.pool.isUsable('good:1', 'big-pickle'))
+  // availability quota counts only the usable one -> state stays below healthy
+  assert.equal(stack.pool.availableFreeCount(), 1)
+  assert.notEqual(stack.pool.state(), 'healthy')
 })
 
 test('refill: start/stop lifecycle drives one immediate round and the interval', async () => {
