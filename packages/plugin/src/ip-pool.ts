@@ -12,6 +12,9 @@ import type { Opencode2dshConfig } from './config.ts'
 
 import { ExitPool, gradeOf, type ExitNode } from './pool/pool.ts'
 import type { UndiciSeam } from './pool/dispatcher.ts'
+import type { AdmissionDeps } from './pool/admission.ts'
+import { Prober } from './pool/prober.ts'
+import { RefillScheduler } from './pool/refill.ts'
 
 /** Parse one manual proxy string into an exit id + protocol, or null. */
 export function parseManualProxy(
@@ -83,6 +86,8 @@ export interface IpPoolRuntime {
     dispose(): void
     readonly enabled: boolean
   }
+  /** Shared probe scheduler (admission + periodic probes + UI-triggered). */
+  prober: Prober
   dispose(): Promise<void>
 }
 
@@ -119,10 +124,26 @@ export async function startIpPool(
   })
   installer.install()
 
+  // Free-source refill loop (docs/ip-pool.md 3.5/4.5, IP-2): periodic state
+  // check -> tiered fetch -> admission probes through the Prober queue.
+  let refill: RefillScheduler | null = null
+  const admissionDeps: AdmissionDeps = {
+    pool,
+    undici: undici as unknown as AdmissionDeps['undici'],
+    logger,
+  }
+  const prober = new Prober({ pool })
+  if (ipPool.free?.enabled ?? true) {
+    refill = new RefillScheduler(pool, { ...admissionDeps, prober })
+    refill.start()
+  }
+
   return {
     pool,
     installer,
+    prober,
     async dispose() {
+      refill?.stop()
       installer.dispose()
     },
   }

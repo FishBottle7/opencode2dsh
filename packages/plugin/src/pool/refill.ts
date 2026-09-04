@@ -1,0 +1,155 @@
+/**
+ * Refill scheduler — drives the free pool from the four-state machine
+ * (docs/ip-pool.md 3.5): on each tick, compute the pool state, select source
+ * tiers (fast / all / none), fetch lists through the source breaker, and
+ * feed candidates to admission through the Prober queue (bounded admission
+ * by the quota; emergency ignores the breaker).
+ *
+ * The loop is timer-driven and fully injectable: fetch, admission and the
+ * clock are seams so the whole state machine is unit-testable offline.
+ */
+
+import type { Dispatcher } from 'undici'
+
+import { ExitPool } from './pool.ts'
+import { Prober, type ProbeTask } from './prober.ts'
+import { SourceBreaker, dedupeAddresses, fetchSource, selectSources, type FetchResult, type FreeSource } from './sources.ts'
+import { admitCandidate, type AdmissionDeps } from './admission.ts'
+
+export interface RefillDeps extends AdmissionDeps {
+  prober: Prober
+  /** Source tier fetch (injectable). */
+  fetchImpl?: typeof fetch
+  fetchSourceImpl?: (source: FreeSource, fetchImpl: typeof fetch) => Promise<FetchResult>
+}
+
+export interface RefillOptions {
+  /** Tick interval for the refill check (default 10min, docs 4.6). */
+  intervalMs?: number
+  /** Admission batch cap per refill round (defensive; quota already bounds). */
+  maxAdmissionsPerRound?: number
+  now?: () => number
+}
+
+export class RefillScheduler {
+  readonly #pool: ExitPool
+  readonly #deps: RefillDeps
+  readonly #breaker = new SourceBreaker()
+  #intervalMs: number
+  #maxPerRound: number
+  #timer: NodeJS.Timeout | null = null
+  #running = false
+  #stopped = false
+  #lastRound = { admitted: 0, rejected: 0, fetched: 0, state: 'healthy' as string, at: 0 }
+
+  constructor(pool: ExitPool, deps: RefillDeps, options: RefillOptions = {}) {
+    this.#pool = pool
+    this.#deps = deps
+    this.#intervalMs = options.intervalMs ?? 10 * 60_000
+    this.#maxPerRound = options.maxAdmissionsPerRound ?? 50
+  }
+
+  get lastRound(): { admitted: number; rejected: number; fetched: number; state: string; at: number } {
+    return this.#lastRound
+  }
+
+  /** Start the periodic refill check (one round immediately). */
+  start(): void {
+    if (this.#timer !== null || this.#stopped) return
+    void this.tick()
+    this.#timer = setInterval(() => void this.tick(), this.#intervalMs)
+    this.#timer.unref?.()
+  }
+
+  stop(): void {
+    this.#stopped = true
+    if (this.#timer !== null) {
+      clearInterval(this.#timer)
+      this.#timer = null
+    }
+  }
+
+  /** One refill round; skipped while a previous round is still draining. */
+  async tick(): Promise<void> {
+    if (this.#running) return
+    this.#running = true
+    try {
+      await this.#round()
+    } finally {
+      this.#running = false
+    }
+  }
+
+  async #round(): Promise<void> {
+    const state = this.#pool.state()
+    const quota = Math.min(this.#pool.admissionQuota(), this.#maxPerRound)
+    this.#lastRound = { ...this.#lastRound, state, at: Date.now() }
+    if (state === 'healthy' || quota <= 0) return
+
+    // emergency ignores the source breaker (docs 3.5); refill honors it.
+    const sources = selectSources(state).filter((source) => state === 'emergency' || this.#breaker.canUse(source.url))
+    let fetched = 0
+    let admitted = 0
+    let rejected = 0
+    const candidates: Array<{ address: string; host: string; port: number; protocol: 'http' | 'socks5' }> = []
+    const seen = new Set<string>(this.#poolAddresses())
+
+    for (const source of sources) {
+      if (candidates.length >= quota * 3) break // surplus headroom for rejects
+      try {
+        const result = this.#deps.fetchSourceImpl
+          ? await this.#deps.fetchSourceImpl(source, this.#deps.fetchImpl ?? fetch)
+          : await fetchSource(source, this.#deps.fetchImpl ?? fetch)
+        this.#breaker.recordSuccess(source.url)
+        fetched += result.addresses.length
+        for (const entry of result.addresses) {
+          if (seen.has(entry.address)) continue
+          seen.add(entry.address)
+          // Free pools are HTTP-only for MVP (socks5 candidates are backlog, 8).
+          if (source.protocol !== 'http') continue
+          candidates.push({ ...entry, protocol: 'http' })
+        }
+      } catch {
+        this.#breaker.recordFailure(source.url)
+      }
+    }
+
+    // Admission runs through the Prober queue (two-level scheduling, 4.1) —
+    // admission shares the global probe cap; the round ends when the batch
+    // of tasks resolves.
+    const tasks: ProbeTask[] = []
+    for (const candidate of candidates) {
+      if (admitted >= quota) break
+      tasks.push({
+        exitId: candidate.address,
+        kind: 'admission',
+        run: async () => {
+          const verdict = await admitCandidate(this.#deps, {
+            address: candidate.address,
+            protocol: candidate.protocol,
+            source: 'free',
+          }, { relaxed: state === 'critical' || state === 'emergency' })
+          if (verdict.admitted && verdict.node) {
+            // Replace flow when full (3.5): evict the worst free node to room.
+            if (this.#pool.isFreeFull()) this.#pool.evictWorstFree()
+            if (this.#pool.add(verdict.node)) {
+              this.#pool.markOk(verdict.node.id)
+              admitted += 1
+            }
+          } else {
+            rejected += 1
+          }
+        },
+      })
+    }
+    this.#lastRound = { admitted, rejected, fetched, state, at: Date.now() }
+    if (tasks.length > 0) {
+      await this.#deps.prober.enqueueAll(tasks)
+      this.#lastRound = { ...this.#lastRound, admitted, rejected, at: Date.now() }
+    }
+  }
+
+  #poolAddresses(): Set<string> {
+    return new Set(this.#pool.list().map((entry) => entry.id))
+  }
+}

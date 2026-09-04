@@ -51,6 +51,16 @@ export interface IpPoolConfig {
   pinnedStrict?: boolean
   /** Hosts whose traffic goes through the pool (default opencode.ai). */
   proxyHosts?: string[]
+  /** Free-source pool (docs/ip-pool.md 1.2 source 1, 3.5, 4.5). */
+  free?: {
+    enabled?: boolean
+    /** Target capacity for the free pool (docs 3.5). */
+    targetSize?: number
+    /** Admission geo blocklist (country codes). */
+    blockedCountries?: string[]
+  }
+  /** Admission smoke model (docs 4.1 probeModels[0]). */
+  probeModels?: string[]
 }
 
 export const defaults = {
