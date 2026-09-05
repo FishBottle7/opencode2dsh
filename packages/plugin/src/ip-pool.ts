@@ -266,7 +266,7 @@ export async function startIpPool(
               address: entry.id,
               protocol: entry.protocol,
               source: entry.source === 'manual' ? 'manual' : 'subscription',
-            }, { pinned: entry.pinned })
+            }, { pinned: entry.pinned, previous: { exitIP: entry.exitIP, exitLocation: entry.exitLocation, latencyMs: entry.latencyMs, quality: entry.quality } })
           if (verdict.admitted && verdict.node) {
             // Refresh the node's facts (admission re-measured them).
             pool.add({ ...entry, ...verdict.node, pinned: entry.pinned })
@@ -298,7 +298,7 @@ export async function startIpPool(
             address: entry.id,
             protocol: entry.protocol,
             source: entry.source === 'manual' ? 'manual' : 'subscription',
-          }, { pinned: entry.pinned })
+          }, { pinned: entry.pinned, previous: { exitIP: entry.exitIP, exitLocation: entry.exitLocation, latencyMs: entry.latencyMs, quality: entry.quality } })
         if (verdict.admitted && verdict.node) {
           pool.add({ ...entry, ...verdict.node, pinned: entry.pinned })
           if (verdict.limited) pool.markLimited(entry.id)

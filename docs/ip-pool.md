@@ -603,7 +603,29 @@ zen-adapter.ts 改动极小：`stream()` 里把 pi-ai 的 `maxRetries: 0` 保持
 
 依赖关系：IP-1（含 pinned）最简，先证明路由/换 IP/固定三条链；IP-2 免费池主战场；IP-3/IP-4 订阅两步走（解析先行，转换独立）；IP-5 独立于 IP-2-4 可并行。（原 IP-5 GoProxy 对接已于 2026-09-05 摘牌，见 §1.2 与 §8。）
 
-## 8. 明确不做（backlog）
+## 8. backlog 与后续计划
+
+### 8.1 已立项待做：IP-7 adapter 层调度（R1 冲突的根治，2026-09-05 立项）
+
+**背景**：R1 退避（dd8d0b1）只是让位——dsh-llm-proxy 占着全局 dispatcher 时，我们的多出口调度/pinned/被动信号三样停摆。真机用户同时装两个 dispatcher 插件是现实场景，根治 = 把调度从全局 dispatcher 上提到 adapter 层，全局槽位我们根本不去抢。
+
+**方案（§3.4 的原设计位置回归）**：
+
+1. `zen-adapter.stream()` 发请求前 `pool.pick()` 选定出口；请求经**每请求注入的独立 client**（per-request dispatcher）发出，不走全局槽位。
+2. 失败按 §3.4 规则表换出口重试（429→markLimited 换；401/403→markModelSignal 换；传输错→markDeadStrike 换；上限 maxRotateAttempts，池空→直连一次，pinnedStrict→透传不进循环）。
+3. per-exit ProxyAgent LRU 池从 dispatcher 搬进 adapter（`#agentFor` 照搬，连接保持热复用，延迟代价≈0）。
+4. 被动信号挂点随迁（handler 包装器挂在 adapter 持有的 agent 上，逻辑照搬）。
+5. 双路径自适应：检测到全局槽位被占 → adapter 调度路径；槽位空闲 → 维持 dispatcher 路径（单插件场景零改动）。两套挂点共享 pool/健康表核心。
+
+**风险与代价（已评估）**：
+- **唯一真不确定**：pi-ai 是否留有干净的 per-request client 注入点（当初选 dispatcher 入口就是因为 `new OpenAI({apiKey, baseURL})` 没暴露 fetch）。绕法两个：events 层自持客户端实例池（每出口一个 OpenAI client）、或 `#eventsFor` 层包 fetch。需要一次真机实验定案，是 IP-7 的第一个任务。
+- 双路径 = 两套挂点各测一遍，测试面翻倍（pool/健康核心共享，翻的只是挂点）。
+- 性能：ProxyAgent LRU 搬家后连接池照旧，预期额外延迟≈0；若注入点实验失败被迫每请求新建 client，则多 50-150ms 握手（不可接受，届时回退双路径维持退避现状）。
+- 边界小损失：非 LLM 的 opencode.ai 请求（若有）不再被我们直连兜底——实际该 host 只有本插件打，影响≈0，记录在案。
+
+**验收**：双插件 profile（dsh-llm-proxy + 本插件）下——它的 Clash 模型代理生效，我们的多出口调度/pinned/被动信号同时生效，互不感知；单插件 profile 行为与 IP-1..6 一致（回归）。
+
+### 8.2 明确不做
 
 - **不接 GoProxy 实例**（2026-09-05 摘牌，§1.2）：内建能力覆盖其全部角色后的决策。**触发重审条件**：真实用户反馈「已在跑 GoProxy 且不想装 sing-box」——届时补一个 30 行的 `/api/proxies` 只读 client 即可。
 - **不自写加密协议栈**（vmess/vless/trojan/ss/hysteria2/anytls 的拨号实现）：解析进插件（§1.2.1），拨号一律委托 sing-box standalone（§1.2.2）。npm 生态无可用的纯 Node 栈（sing-box 包为占位符、Xray binding 仅 React Native、shadowsocks-js 停更），自写 = 每协议数百行密码学 + 持续跟进演进，明确不做。

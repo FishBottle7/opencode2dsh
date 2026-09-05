@@ -281,17 +281,20 @@ export async function admitCandidate(
 }
 
 /** Admit a trusted-source candidate (manual/subscription/goproxy): smoke
- *  only; failure warns instead of rejecting for pinned (docs 4.5). */
+ *  only; failure warns instead of rejecting for pinned (docs 4.5). Existing
+ *  pool facts are PRESERVED on the failure fallback — a failed smoke wipes
+ *  neither a previously measured exitIP/latency nor the routing key. */
 export async function admitTrusted(
   deps: AdmissionDeps,
   candidate: { address: string; protocol: 'http' | 'socks5'; source: 'manual' | 'subscription' | 'goproxy' },
-  options: { pinned?: boolean } = {},
+  options: { pinned?: boolean; previous?: { exitIP: string; exitLocation: string; latencyMs: number; quality?: ExitNode['quality'] } } = {},
 ): Promise<AdmissionResult> {
   const result = await admitCandidate(deps, candidate, { pinned: options.pinned })
   if (result.admitted) return result
-  // Trusted candidates: keep the node with unknown exit facts (the address is
-  // the routing key fallback, 3.1), warn, and let periodic probing revisit.
-  deps.logger?.warn(`opencode2dsh: trusted exit ${candidate.address} failed admission (${result.reason}); admitted with unknown exit facts`)
+  // Trusted candidates: keep the node (the address is the routing key
+  // fallback, 3.1), warn, and let periodic probing revisit.
+  deps.logger?.warn(`opencode2dsh: trusted exit ${candidate.address} failed admission (${result.reason}); admitted with ${options.previous?.exitIP ? 'previous' : 'unknown'} exit facts`)
+  const previous = options.previous
   return {
     admitted: true,
     node: {
@@ -299,10 +302,10 @@ export async function admitTrusted(
       protocol: candidate.protocol,
       source: candidate.source,
       pinned: options.pinned ?? false,
-      exitIP: '',
-      exitLocation: '',
-      latencyMs: 0,
-      quality: gradeOf(0),
+      exitIP: previous?.exitIP ?? '',
+      exitLocation: previous?.exitLocation ?? '',
+      latencyMs: previous?.latencyMs ?? 0,
+      quality: previous?.quality ?? gradeOf(previous?.latencyMs ?? 0),
       addedAt: Date.now(),
     },
   }

@@ -54,8 +54,13 @@ export function apply(ctx: ClientContext): void {
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'opencode2dsh: copy dictionaries')
 
   const scope = ctx.settingsScope.bind({ namespace: SETTINGS_NAMESPACE }) as unknown as IpPoolCardInjected['scope']
-  const useSnapshot = (): ReturnType<typeof scope.getSnapshot> =>
-    useSyncExternalStore(scope.subscribe, scope.getSnapshot)
+  // The scope's methods are instance methods (this-bound to the controller);
+  // uSES receives them as bare functions, so bind explicitly — an unbound
+  // getSnapshot reads `this.store` of undefined and crashes the card.
+  const getSnapshot = scope.getSnapshot.bind(scope)
+  const subscribe = scope.subscribe.bind(scope)
+  const useSnapshot = (): ReturnType<typeof getSnapshot> =>
+    useSyncExternalStore(subscribe, getSnapshot)
   // Registration-time copy and the inject face share one bound translate;
   // copy freshness rides the locale revision.
   const t = ctx.locale.bind(NS) as IpPoolCardInjected['t']

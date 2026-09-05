@@ -94,28 +94,11 @@ export function applyIpPoolSettings(
     controller.runtime = await assemble(controller.asConfig(controller.settings()), logger)
   }
 
-  // Boot-time enable assembles right away (the existing index.ts contract);
-  // a later settings-page enable assembles inside the watcher.
-  if (controller.settings().enabled) {
-    void ensureRuntime().catch((err) => {
-      logger.warn(`opencode2dsh: ip pool start failed: ${err instanceof Error ? err.message : String(err)}`)
-    })
-  }
-
-  if (typeof ctx.settings?.register !== 'function') {
-    logger.warn('opencode2dsh: settings seam lacks register; ip-pool settings page disabled (patch config still works)')
-    return controller
-  }
-
-  const scope = ctx.settings.register(IP_POOL_NAMESPACE, IpPoolConfigSchema, {
-    base: controller.settings(),
-    applies: 'live',
-  })
-
-  // Re-resolve on every commit: the namespace value IS the truth (schema
-  // defaults -> base -> user layer), never the entry config.
-  const disposeWatch = scope.watch((next: unknown) => {
-    const value = withDefaults(next as Partial<IpPoolSettings>)
+  // Cold-start ordering (dsh-llm-proxy's applyCurrent pattern): the namespace
+  // resolves schema defaults -> base -> the PERSISTED user document, so a
+  // saved enabled:true must assemble the pool at boot — not only after the
+  // next settings-page write. The entry config alone cannot see it.
+  const applyCommitted = (value: IpPoolSettings): void => {
     // Mirror the live value onto the entry-config shape reconfigure consumes.
     config.ipPool = toIpPoolConfig(value)
     const rt = controller.runtime
@@ -132,6 +115,28 @@ export function applyIpPoolSettings(
         logger.warn(`opencode2dsh: ip pool live re-apply failed: ${err instanceof Error ? err.message : String(err)}`)
       })
     }
+  }
+
+  if (typeof ctx.settings?.register !== 'function') {
+    logger.warn('opencode2dsh: settings seam lacks register; ip-pool settings page disabled (patch config still works)')
+    if (controller.settings().enabled) {
+      void ensureRuntime().catch((err) => {
+        logger.warn(`opencode2dsh: ip pool start failed: ${err instanceof Error ? err.message : String(err)}`)
+      })
+    }
+    return controller
+  }
+
+  const scope = ctx.settings.register(IP_POOL_NAMESPACE, IpPoolConfigSchema, {
+    base: controller.settings(),
+    applies: 'live',
+  })
+
+  // Boot: apply the RESOLVED namespace value (the persisted document is part
+  // of it). Watch: apply every commit the same way — one path for both.
+  applyCommitted(withDefaults(scope.get() as Partial<IpPoolSettings> | undefined))
+  const disposeWatch = scope.watch((next: unknown) => {
+    applyCommitted(withDefaults(next as Partial<IpPoolSettings>))
   })
 
   // Bridge: mount once webServer is up. The handlers read the live runtime
