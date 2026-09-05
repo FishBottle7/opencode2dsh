@@ -55,6 +55,8 @@ export interface RefillView {
   coarsePassed: number
   state: string
   at: number
+  /** Live in-flight round progress (docs §5.3, 立即补充 feedback). */
+  progress: { running: boolean; stage: 'fetch' | 'coarse' | 'admit' | 'idle'; fetched: number; candidates: number; coarsePassed: number; coarseDone: number; admissions: number; admitted: number }
 }
 
 export interface SubscriptionView {
@@ -135,7 +137,7 @@ export function buildStatusView(
       ? runtime.prober.stats
       : { queued: 0, inFlight: 0, enqueued: 0, completed: 0 },
     refill: runtime?.refill
-      ? { ...runtime.refill.lastRound }
+      ? { ...runtime.refill.lastRound, progress: runtime.refill.progress }
       : null,
     subscription: runtime?.subscriptions
       ? {

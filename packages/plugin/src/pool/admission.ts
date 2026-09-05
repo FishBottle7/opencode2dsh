@@ -104,21 +104,26 @@ export async function coarseScreen(
   }
 }
 
-/** Bounded fan-out helper for the coarse screen (wild candidates only). */
+/** Bounded fan-out helper for the coarse screen (wild candidates only).
+ *  onProgress reports (screensCompleted, survivorsSoFar) as the fan-out runs
+ *  (settings-page refill progress, docs §5.3). */
 export async function coarseScreenBatch(
   deps: Parameters<typeof coarseScreen>[0],
   candidates: Array<{ address: string; protocol: 'http' | 'socks5' }>,
-  options: { fanout?: number; relaxed?: boolean; timeoutMs?: number } = {},
+  options: { fanout?: number; relaxed?: boolean; timeoutMs?: number; onProgress?: (done: number, passed: number) => void } = {},
 ): Promise<Map<string, EchoFacts>> {
   const fanout = Math.max(1, options.fanout ?? 300)
   const results = new Map<string, EchoFacts>()
   const queue = [...candidates]
+  let done = 0
   const worker = async (): Promise<void> => {
     for (;;) {
       const candidate = queue.shift()
       if (candidate === undefined) return
       const verdict = await coarseScreen(deps, candidate, options)
+      done += 1
       if ('exitIP' in verdict) results.set(candidate.address, verdict)
+      options.onProgress?.(done, results.size)
     }
   }
   await Promise.all(Array.from({ length: Math.min(fanout, candidates.length) }, () => worker()))

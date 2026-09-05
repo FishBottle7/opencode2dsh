@@ -278,3 +278,42 @@ test('refill: start/stop lifecycle drives one immediate round and the interval',
   assert.equal(stack.fetches.length, count)
   assert.equal(stack.pool.freeCount(), 2)
 })
+
+// -- live refill progress (docs §5.3 立即补充 feedback) --------------------------
+
+test('coarseScreenBatch onProgress fires per completed screen with live survivor count', async () => {
+  const stack = makeStack({ lists: {}, admitOk: (address) => address.startsWith('good:') })
+  const samples: Array<[number, number]> = []
+  const { coarseScreenBatch } = await import('../src/pool/admission.ts')
+  await coarseScreenBatch(
+    { undici: stack.transport as never, ipEchoUrl: 'http://ip-api.test/json', logger: { warn: () => {} } },
+    [{ address: 'good:1', protocol: 'http' }, { address: 'bad:2', protocol: 'http' }, { address: 'good:3', protocol: 'http' }],
+    { fanout: 2, onProgress: (done, passed) => samples.push([done, passed]) },
+  )
+  assert.equal(samples.length, 3, 'one callback per candidate')
+  const dones = samples.map((s) => s[0]).sort((a, b) => a - b)
+  assert.deepEqual(dones, [1, 2, 3], 'done counter monotonic')
+  const survivors = [...new Set(samples.map((s) => s[1]))].sort((a, b) => a - b)
+  assert.deepEqual(survivors, [0, 1, 2], 'survivor count grows with the passing candidates')
+})
+
+test('refill progress runs the fetch→coarse→admit stages and settles idle with counters', async () => {
+  const stack = makeStack({
+    lists: { 'https://raw.githubusercontent.com/ProxyScraper/ProxyScraper/main/http.txt': ['good:1', 'good:2', 'bad:3', 'good:4'] },
+    admitOk: (address) => address.startsWith('good:'),
+  })
+  const progress = () => stack.scheduler.progress
+  // before any round: idle
+  assert.equal(progress().running, false)
+  assert.equal(progress().stage, 'idle')
+  await stack.scheduler.tick()
+  const final = progress()
+  assert.equal(final.running, false, 'settled after the round')
+  assert.equal(final.stage, 'idle')
+  assert.ok(final.fetched > 0, 'fetched counter ran')
+  assert.ok(final.candidates > 0, 'candidate counter ran')
+  assert.ok(final.coarseDone > 0, 'coarse screens completed')
+  assert.equal(final.admissions > 0, true, 'fine-screen tasks completed')
+  assert.ok(final.admitted > 0, 'at least one good candidate admitted')
+  stack.scheduler.stop()
+})

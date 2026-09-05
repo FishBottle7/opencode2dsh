@@ -35,6 +35,25 @@ export interface RefillOptions {
   now?: () => number
 }
 
+/** Live progress of one in-flight refill round (docs §5.3 /status). */
+export interface RefillProgress {
+  running: boolean
+  /** Current phase: fetching sources / coarse screening / admitting / idle. */
+  stage: 'fetch' | 'coarse' | 'admit' | 'idle'
+  /** Raw rows pulled from the source lists so far this round. */
+  fetched: number
+  /** Candidates collected for screening (after per-source caps + dedupe). */
+  candidates: number
+  /** Coarse-screen survivors so far. */
+  coarsePassed: number
+  /** Coarse screens finished so far (denominator grows as it runs). */
+  coarseDone: number
+  /** Fine-screen (admission) tasks completed so far. */
+  admissions: number
+  /** Exits admitted so far this round. */
+  admitted: number
+}
+
 export class RefillScheduler {
   readonly #pool: ExitPool
   readonly #deps: RefillDeps
@@ -47,6 +66,10 @@ export class RefillScheduler {
   #running = false
   #stopped = false
   #lastRound = { admitted: 0, rejected: 0, fetched: 0, coarsePassed: 0, state: 'healthy' as string, at: 0 }
+  /** Live progress of the in-flight round (settings page 立即补充 feedback). */
+  #progress: { running: boolean; stage: 'fetch' | 'coarse' | 'admit' | 'idle'; fetched: number; candidates: number; coarsePassed: number; coarseDone: number; admissions: number; admitted: number } = {
+    running: false, stage: 'idle', fetched: 0, candidates: 0, coarsePassed: 0, coarseDone: 0, admissions: 0, admitted: 0,
+  }
 
   constructor(pool: ExitPool, deps: RefillDeps, options: RefillOptions = {}) {
     this.#pool = pool
@@ -57,6 +80,11 @@ export class RefillScheduler {
 
   get lastRound(): { admitted: number; rejected: number; fetched: number; coarsePassed: number; state: string; at: number } {
     return this.#lastRound
+  }
+
+  /** The in-flight round's live progress (status bridge, docs §5.3). */
+  get progress(): RefillProgress {
+    return { ...this.#progress }
   }
 
   /** Start the periodic refill check (one round immediately). */
@@ -90,8 +118,13 @@ export class RefillScheduler {
     const state = this.#pool.state()
     const quota = Math.min(this.#pool.admissionQuota(), this.#maxPerRound)
     this.#lastRound = { ...this.#lastRound, state, at: Date.now() }
-    if (state === 'healthy' || quota <= 0) return
+    if (state === 'healthy' || quota <= 0) {
+      this.#progress = { running: false, stage: 'idle', fetched: 0, candidates: 0, coarsePassed: 0, coarseDone: 0, admissions: 0, admitted: 0 }
+      return
+    }
 
+    // live progress: fetch stage begins
+    this.#progress = { running: true, stage: 'fetch', fetched: 0, candidates: 0, coarsePassed: 0, coarseDone: 0, admissions: 0, admitted: 0 }
     // emergency ignores the source breaker (docs 3.5); refill honors it.
     const sources = selectSources(state).filter((source) => state === 'emergency' || this.#breaker.canUse(source.url))
     let fetched = 0
@@ -113,6 +146,8 @@ export class RefillScheduler {
           : await fetchSource(source, this.#deps.fetchImpl ?? fetch)
         this.#breaker.recordSuccess(source.url)
         fetched += result.addresses.length
+        this.#progress.fetched = fetched
+        this.#progress.candidates = candidates.length
         // shuffle before capping: free lists are not uniformly distributed
         // (freshness/quality vary), a random sample beats the head of the list
         const rows = result.addresses.slice()
@@ -131,6 +166,7 @@ export class RefillScheduler {
           candidates.push({ ...entry, protocol: 'http' })
           fromThisSource += 1
         }
+        this.#progress.candidates = candidates.length
       } catch {
         this.#breaker.recordFailure(source.url)
       }
@@ -141,15 +177,25 @@ export class RefillScheduler {
     // (admissionFanout, default 300 — GoProxy ValidateConcurrency parity)
     // of thousands of candidates. Survivors (~1-3%) proceed to the
     // anonymous-lane steps through the bounded Prober queue.
+    this.#progress.stage = 'coarse'
     const relaxed = state === 'critical' || state === 'emergency'
     const facts = await coarseScreenBatch(
       this.#deps,
       candidates,
-      { fanout: this.#deps.admissionFanout ?? 300, relaxed, timeoutMs: 5000 },
+      {
+        fanout: this.#deps.admissionFanout ?? 300,
+        relaxed,
+        timeoutMs: 5000,
+        onProgress: (done, passed) => {
+          this.#progress.coarseDone = done
+          this.#progress.coarsePassed = passed
+        },
+      },
     )
     // coarse rejections count toward the round's rejected total: a candidate
     // dying at the echo step is as rejected as one failing the smoke.
     rejected += candidates.length - facts.size
+    this.#progress.stage = 'admit'
     this.#lastRound = { admitted, rejected, fetched, state, at: Date.now(), coarsePassed: facts.size }
 
     // Fine screen (steps 3-4, anonymous-lane quota): through the Prober
@@ -168,27 +214,32 @@ export class RefillScheduler {
         exitId: candidate.address,
         kind: 'admission',
         run: async () => {
-          const verdict = await admitCandidate(this.#deps, {
-            address: candidate.address,
-            protocol: candidate.protocol,
-            source: 'free',
-          }, { relaxed, echoFacts })
-          if (verdict.admitted && verdict.node) {
-            // Replace flow when full (3.5): evict the worst free node to room.
-            if (this.#pool.isFreeFull()) this.#pool.evictWorstFree()
-            if (this.#pool.add(verdict.node)) {
-              if (verdict.limited) {
-                // 429 at smoke (4.5): good exit, quota consumed elsewhere —
-                // admit cooling; the periodic probe retries when it expires.
-                this.#pool.markLimited(verdict.node.id)
-                admittedLimited += 1
-              } else {
-                this.#pool.markOk(verdict.node.id)
-                admitted += 1
+          try {
+            const verdict = await admitCandidate(this.#deps, {
+              address: candidate.address,
+              protocol: candidate.protocol,
+              source: 'free',
+            }, { relaxed, echoFacts })
+            if (verdict.admitted && verdict.node) {
+              // Replace flow when full (3.5): evict the worst free node to room.
+              if (this.#pool.isFreeFull()) this.#pool.evictWorstFree()
+              if (this.#pool.add(verdict.node)) {
+                if (verdict.limited) {
+                  // 429 at smoke (4.5): good exit, quota consumed elsewhere —
+                  // admit cooling; the periodic probe retries when it expires.
+                  this.#pool.markLimited(verdict.node.id)
+                  admittedLimited += 1
+                } else {
+                  this.#pool.markOk(verdict.node.id)
+                  admitted += 1
+                }
+                this.#progress.admitted = admitted + admittedLimited
               }
+            } else {
+              rejected += 1
             }
-          } else {
-            rejected += 1
+          } finally {
+            this.#progress.admissions += 1
           }
         },
       })
@@ -197,6 +248,10 @@ export class RefillScheduler {
       await this.#deps.prober.enqueueAll(tasks)
       this.#lastRound = { ...this.#lastRound, admitted: admitted + admittedLimited, rejected, at: Date.now() }
     }
+    // settle: stop running, keep the round's counters for the "last round"
+    // summary the settings card renders (stage idles, numbers persist).
+    this.#progress.running = false
+    this.#progress.stage = 'idle'
   }
 
   #poolAddresses(): Set<string> {

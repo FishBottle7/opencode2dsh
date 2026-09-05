@@ -74,7 +74,10 @@ export interface PoolStatusView {
     passive: { ok: number; limited: number; refused: number; dead: number; transport: number }
   }>
   prober: { queued: number; inFlight: number; enqueued: number; completed: number }
-  refill: { admitted: number; rejected: number; fetched: number; coarsePassed: number; state: string; at: number } | null
+  refill: {
+    admitted: number; rejected: number; fetched: number; coarsePassed: number; state: string; at: number
+    progress: { running: boolean; stage: 'fetch' | 'coarse' | 'admit' | 'idle'; fetched: number; candidates: number; coarsePassed: number; coarseDone: number; admissions: number; admitted: number }
+  } | null
   subscription: { urlCount: number; pendingConversion: number; convertedAdmitted: number; plaintextAdmitted: number; lastFetch: number; lastError: string } | null
   at: number
 }
@@ -186,6 +189,28 @@ function diffWrites(form: FormState, snapshot: SettingsScopeSnapshot<IpPoolSetti
 
 function splitCsv(line: string): string[] {
   return line.split(',').map((part) => part.trim().toUpperCase()).filter((part) => part.length > 0)
+}
+
+/** One-line live refill progress: stage + counters (docs §5.3). */
+function refillProgressLine(
+  progress: NonNullable<PoolStatusView['refill']>['progress'],
+  t: IpPoolCardInjected['t'],
+): string {
+  const stageText: Record<typeof progress.stage, string> = {
+    fetch: t('refillStageFetch'),
+    coarse: t('refillStageCoarse'),
+    admit: t('refillStageAdmit'),
+    idle: t('refillStageIdle'),
+  }
+  const parts = [stageText[progress.stage]]
+  if (progress.stage === 'fetch') parts.push(t('refillCountFetched').replace('{n}', String(progress.fetched)))
+  if (progress.stage === 'coarse') {
+    parts.push(t('refillCountCoarse').replace('{done}', String(progress.coarseDone)).replace('{total}', String(progress.candidates)).replace('{passed}', String(progress.coarsePassed)))
+  }
+  if (progress.stage === 'admit') {
+    parts.push(t('refillCountAdmit').replace('{done}', String(progress.admissions)).replace('{admitted}', String(progress.admitted)))
+  }
+  return parts.join(' · ')
 }
 
 /** One labeled input. */
@@ -426,8 +451,9 @@ function CardBody(props: Required<IpPoolCardInjected>): ReactNode {
     }
   }, [snapshot.status, snapshot.value])
 
-  // Poll the bridge /status: 1s while probing, 3s otherwise (docs §5.3).
+  // Poll the bridge /status: 1s while probing or refilling, 3s otherwise (docs §5.3).
   const probing = status !== null && status.prober.queued + status.prober.inFlight > 0
+  const refilling = status?.refill?.progress.running === true
   const refreshStatus = useCallback(async (): Promise<void> => {
     try {
       const response = await fetch(`${BRIDGE_PREFIX}/status`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
@@ -445,9 +471,9 @@ function CardBody(props: Required<IpPoolCardInjected>): ReactNode {
   useEffect(() => {
     if (snapshot.status !== 'ready' || !hydratedRef.current || !form.enabled) return
     void refreshStatus()
-    const interval = setInterval(() => void refreshStatus(), probing ? 1_000 : 3_000)
+    const interval = setInterval(() => void refreshStatus(), probing || refilling ? 1_000 : 3_000)
     return () => clearInterval(interval)
-  }, [snapshot.status, form.enabled, probing, refreshStatus, hydratedRef.current]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [snapshot.status, form.enabled, probing, refilling, refreshStatus, hydratedRef.current]) // eslint-disable-line react-hooks/exhaustive-deps
 
   if (snapshot.status === 'loading') {
     return <p className={styles.status}>{t('statusLoading')}</p>
@@ -615,11 +641,23 @@ function CardBody(props: Required<IpPoolCardInjected>): ReactNode {
           type="button"
           className={styles.ghostButton}
           data-testid="refill-now"
-          disabled={actionBusy || !form.enabled}
+          disabled={actionBusy || !form.enabled || refilling}
           onClick={() => { void bridgeAction({ scope: 'refill' }) }}
         >
-          {actionBusy ? t('refillRunning') : t('refillNow')}
+          {refilling ? t('refillRunning') : t('refillNow')}
         </button>
+        {refilling && status?.refill?.progress !== undefined && (
+          <span className={styles.status} data-testid="refill-progress">
+            {refillProgressLine(status.refill.progress, t)}
+          </span>
+        )}
+        {!refilling && status?.refill?.progress.stage === 'idle' && (status.refill.progress.admitted > 0 || status.refill.progress.admissions > 0) && (
+          <span className={styles.status}>
+            {t('refillSummary')
+              .replace('{admitted}', String(status.refill.progress.admitted))
+              .replace('{fetched}', String(status.refill.progress.candidates))}
+          </span>
+        )}
       </div>
 
       <div className={styles.section}>
