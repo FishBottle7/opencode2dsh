@@ -114,6 +114,19 @@ export class PoolRoutingDispatcher implements RoutingDispatcherSurface {
     this.#direct = new options.undici.Agent()
   }
 
+  /** Live re-apply of the proxied-host list (settings page, docs §5.1). */
+  setProxyHosts(hosts: string[] | undefined): void {
+    const next = hosts && hosts.length > 0
+      ? new Set(hosts.map((host) => normalizeHost(host)))
+      : new Set(DEFAULT_PROXY_HOSTS.map((host) => normalizeHost(host)))
+    this.#proxyHosts = next
+  }
+
+  /** The proxied-host set as configured (diagnostics / status bridge). */
+  get proxyHosts(): readonly string[] {
+    return [...this.#proxyHosts]
+  }
+
   /** The agent for one exit, LRU-capped (docs/ip-pool.md 2). */
   #agentFor(exitId: string): Dispatcher | null {
     const cached = this.#agents.get(exitId)

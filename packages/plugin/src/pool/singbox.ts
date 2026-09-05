@@ -295,6 +295,12 @@ export class SingBoxSupervisor {
     this.#configPath = join(options.dataDir, 'singbox-config.json')
   }
 
+  /** Live re-apply of the binary path (settings page, docs §5.1). The next
+   *  reload() resolves through it; a running child keeps serving until then. */
+  setBinPath(path: string): void {
+    this.#options.binPath = path
+  }
+
   get running(): boolean {
     return this.#running
   }

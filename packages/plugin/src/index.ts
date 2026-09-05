@@ -7,7 +7,7 @@ import { ModelCatalog, defaultCachePath, type CatalogSnapshot } from './adapter/
 import { ZenAdapter, PROVIDER_ID } from './adapter/zen-adapter.ts'
 import { AgentProcess, type ReadyInfo } from './agent-process.js'
 import { configPaths, ensureToken, resolveConfig, writeAgentConfig, type Opencode2dshConfig } from './config.js'
-import { startIpPool, type IpPoolRuntime } from './ip-pool.ts'
+import { applyIpPoolSettings } from './ip-pool-settings/apply.ts'
 import { fetchHealth, fetchModels, registerProvider, removeProviderRoute } from './provider.js'
 
 /**
@@ -27,15 +27,27 @@ import { fetchHealth, fetchModels, registerProvider, removeProviderRoute } from 
 
 // Minimal structural typing against the host ctx; keeps the plugin independent
 // of the exact @deepseek-ai/cordis version DSH ships.
-interface PluginContext {
+export interface PluginContext {
   logger: { info(...args: unknown[]): void; warn(...args: unknown[]): void; error(...args: unknown[]): void }
   llm?: { registerAdapter(providers: string[], adapter: unknown): unknown }
   credentials?: { set(ref: string, value: string): Promise<void> }
   settings?: {
     get(ns: string): unknown
     mutate(ns: string, ops: Array<{ op: 'set' | 'unset'; path: Array<string | number>; value?: unknown }>): Promise<void>
+    /** Full seam (rc.2): namespace registration + owner scope (docs §5.1). */
+    register?(ns: unknown, schema: unknown, options?: { base?: unknown; applies?: 'live' | 'restart' }): {
+      get(): unknown
+      watch(callback: (next: unknown, prev: unknown) => void | Promise<void>): () => void
+    }
   }
+  /** Web route registration (dsh-host-webserver service, docs §5.3). */
+  webServer?: {
+    register(route: { kind: 'exact' | 'prefix'; path: string; handler: (req: unknown, res: unknown) => void | Promise<void> }): () => void
+  }
+  /** cordis fiber injection: run the callback once every listed service is up. */
+  inject?(services: string[], callback: (ctx: PluginContext) => void | Promise<void>): unknown
   effect?(fn: () => () => void): unknown
+  on?(event: string, listener: (...args: never[]) => unknown): () => void
 }
 
 export const name = 'opencode2dsh'
@@ -60,14 +72,13 @@ function applyAdapter(ctx: PluginContext, config: Opencode2dshConfig): { ready: 
     return { ready }
   }
 
-  // IP-pool exit routing (docs/ip-pool.md IP-1: manual proxies + pinned).
-  // Opt-in; disabled keeps the process byte-for-byte on the direct path.
-  const ipPoolRuntimePromise: Promise<IpPoolRuntime | null> = cfg.ipPool?.enabled
-    ? startIpPool(cfg, logger).catch((err) => {
-        logger.warn(`opencode2dsh: ip pool start failed: ${err instanceof Error ? err.message : String(err)}`)
-        return null
-      })
-    : Promise.resolve(null)
+  // IP-pool exit routing (docs/ip-pool.md IP-1..IP-5): manual proxies,
+  // pinned, free sources, subscriptions, and (IP-5) the settings namespace
+  // with live apply + the /status /probe bridge. Opt-in via settings page or
+  // cordis.patch.yml; disabled keeps the process byte-for-byte on direct.
+  // Lifecycle (assembly on first enable, live reconfigure, dispose) is owned
+  // by applyIpPoolSettings through the plugin fiber.
+  applyIpPoolSettings(ctx, config, logger)
 
   const dataDir = join(homedir(), '.opencode2dsh')
   const statusPath = join(dataDir, 'adapter-status.json')
@@ -115,7 +126,6 @@ function applyAdapter(ctx: PluginContext, config: Opencode2dshConfig): { ready: 
   if (typeof maybeEffect === 'function') {
     maybeEffect.call(ctx, () => () => {
       catalog.stop()
-      void ipPoolRuntimePromise.then((runtime) => runtime?.dispose())
     })
   }
   return { ready }

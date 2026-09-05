@@ -76,9 +76,29 @@ export class SubscriptionFetcher {
     return { ...this.#state, pendingConversion: [...this.#state.pendingConversion] }
   }
 
+  /** Configured URL count (status bridge; the URLs themselves never ride out). */
+  get urlCount(): number {
+    return this.#urls.length
+  }
+
   /** Update the subscription URL list (settings change); refresh follows. */
   setUrls(urls: string[]): void {
     this.#urls = urls.filter((url) => url.trim().length > 0)
+  }
+
+  /** Live re-apply of the refresh interval (settings page, docs §5.1). */
+  setIntervalMs(ms: number): void {
+    this.#intervalMs = Math.max(60_000, ms)
+    if (this.#timer !== null) {
+      clearInterval(this.#timer)
+      this.#timer = setInterval(() => void this.refresh(), this.#intervalMs)
+      this.#timer.unref?.()
+    }
+  }
+
+  /** Manual refresh trigger (settings page 立即刷新, docs §5.3 /probe scope: 'refill' parity). */
+  async refreshNow(): Promise<SubscriptionState> {
+    return this.refresh()
   }
 
   start(): void {

@@ -43,6 +43,12 @@ export class RoutingInstaller {
     return this.#enabled
   }
 
+  /** Live re-apply of the proxied-host list (forwards to the running router). */
+  setProxyHosts(hosts?: string[]): void {
+    this.#deps.proxyHosts = hosts
+    this.#current?.setProxyHosts(hosts)
+  }
+
   /** Install (or keep installed) the routing dispatcher. */
   install(): void {
     if (this.#enabled) return

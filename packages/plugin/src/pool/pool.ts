@@ -101,6 +101,16 @@ export class ExitPool {
     this.#now = options.now ?? Date.now
   }
 
+  /** Live re-apply of the free-pool target capacity (settings page, §5.1). */
+  setTargetSize(value: number): void {
+    this.#targetSize = Math.max(1, value)
+  }
+
+  /** The effective target capacity (diagnostics / status bridge). */
+  get targetSize(): number {
+    return this.#targetSize
+  }
+
   // -- table management ------------------------------------------------------
 
   /** Upsert a node (admission wrote its details); returns false on duplicate
