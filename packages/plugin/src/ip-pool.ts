@@ -10,12 +10,21 @@
 
 import type { Opencode2dshConfig } from './config.ts'
 
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+
 import { ExitPool, gradeOf, type ExitNode } from './pool/pool.ts'
 import type { UndiciSeam } from './pool/dispatcher.ts'
 import type { AdmissionDeps } from './pool/admission.ts'
 import { Prober } from './pool/prober.ts'
 import { RefillScheduler } from './pool/refill.ts'
 import { SubscriptionFetcher } from './pool/subscription-fetcher.ts'
+import { SingBoxSupervisor } from './pool/singbox.ts'
+
+/** Data dir shared with the catalog cache (config.ts convention). */
+function dataDir(): string {
+  return join(homedir(), '.opencode2dsh')
+}
 
 /** Parse one manual proxy string into an exit id + protocol, or null. */
 export function parseManualProxy(
@@ -141,13 +150,22 @@ export async function startIpPool(
     refill.start()
   }
 
-  // Subscriptions (docs 1.2 source 3, IP-3): pull + parse + trusted smoke;
-  // encrypted nodes park as pending-conversion until the sing-box layer (IP-4).
+  // Subscriptions (docs 1.2 source 3, IP-3/IP-4): pull + parse + trusted
+  // smoke; encrypted nodes convert via sing-box when a binary is configured.
   let subscriptions: SubscriptionFetcher | null = null
   const urls = ipPool.subscriptions ?? []
   if (urls.length > 0) {
+    let supervisor: SingBoxSupervisor | undefined
+    const singboxPath = ipPool.singbox?.path
+    if (typeof singboxPath === 'string' && singboxPath.length > 0) {
+      supervisor = new SingBoxSupervisor({
+        binPath: singboxPath,
+        dataDir: join(dataDir(), 'singbox'),
+        logger,
+      })
+    }
     subscriptions = new SubscriptionFetcher(
-      { ...admissionDeps, prober },
+      { ...admissionDeps, prober, supervisor },
       { logger },
     )
     subscriptions.setUrls(urls)

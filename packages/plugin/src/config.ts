@@ -61,6 +61,12 @@ export interface IpPoolConfig {
   }
   /** Airport/Clash subscriptions (docs 1.2 source 3, IP-3). */
   subscriptions?: string[]
+  /** sing-box conversion core for encrypted nodes (docs 1.2.2, IP-4). */
+  singbox?: {
+    /** sing-box binary: PATH name or absolute path; unset parks encrypted
+     *  nodes as pending-conversion. */
+    path?: string
+  }
   /** Admission smoke model (docs 4.1 probeModels[0]). */
   probeModels?: string[]
 }

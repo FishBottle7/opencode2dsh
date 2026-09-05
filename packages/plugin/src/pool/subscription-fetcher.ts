@@ -16,17 +16,26 @@ import { ExitPool, type ExitNode } from './pool.ts'
 import { Prober, type ProbeTask } from './prober.ts'
 import { admitCandidate, admitTrusted, type AdmissionDeps } from './admission.ts'
 import { parseSubscription, type ParsedNode } from './subscription.ts'
+import { SingBoxSupervisor, type ConvertedExit } from './singbox.ts'
 
 export interface SubscriptionDeps extends AdmissionDeps {
   pool: ExitPool
   prober: Prober
   fetchImpl?: typeof fetch
+  /** sing-box supervisor for encrypted-node conversion; when null the
+   *  encrypted nodes simply park as pending (no binary configured). */
+  supervisor?: {
+    reload(nodes: ParsedNode[]): Promise<ConvertedExit[]>
+    stop(): Promise<void>
+    readonly running: boolean
+  }
 }
 
 export interface SubscriptionState {
-  /** Parsed nodes needing an external core (IP-4); surfaced to the settings
-   *  page as greyed-out "pending conversion" rows. */
+  /** Parsed nodes needing an external core; empty once conversion ran. */
   pendingConversion: ParsedNode[]
+  /** Converted local exits admitted into the pool this round. */
+  convertedAdmitted: number
   lastFetch: number
   lastError: string
   plaintextAdmitted: number
@@ -44,6 +53,7 @@ export class SubscriptionFetcher {
   #urls: string[] = []
   #state: SubscriptionState = {
     pendingConversion: [],
+    convertedAdmitted: 0,
     lastFetch: 0,
     lastError: '',
     plaintextAdmitted: 0,
@@ -84,6 +94,7 @@ export class SubscriptionFetcher {
       clearInterval(this.#timer)
       this.#timer = null
     }
+    void this.#deps.supervisor?.stop().catch(() => {})
   }
 
   /** One refresh round over every URL; never overlaps itself. */
@@ -116,9 +127,46 @@ export class SubscriptionFetcher {
       }
       this.#state = {
         pendingConversion: pending,
+        convertedAdmitted: 0,
         lastFetch: Date.now(),
         lastError,
         plaintextAdmitted: 0,
+      }
+      // Encrypted nodes -> sing-box conversion -> local SOCKS5 exits (IP-4).
+      // Without a supervisor configured they stay parked as pending.
+      if (pending.length > 0 && this.#deps.supervisor) {
+        try {
+          const exits = await this.#deps.supervisor.reload(pending)
+          const tasks: ProbeTask[] = exits
+            .filter((exit) => !this.#deps.pool.has(exit.address))
+            .map((exit): ProbeTask => ({
+              exitId: exit.address,
+              kind: 'subscription-smoke',
+              run: async () => {
+                const verdict = await admitTrusted(this.#deps, {
+                  address: exit.address,
+                  protocol: exit.protocol,
+                  source: 'subscription',
+                })
+                if (verdict.admitted && verdict.node) {
+                  if (this.#deps.pool.add(verdict.node)) {
+                    this.#deps.pool.markOk(verdict.node.id)
+                    this.#state.convertedAdmitted += 1
+                    const served = exit.node
+                    this.#state.pendingConversion = this.#state.pendingConversion.filter(
+                      (node) => node !== served,
+                    )
+                  }
+                }
+              },
+            }))
+          if (tasks.length > 0) await this.#deps.prober.enqueueAll(tasks)
+          this.#logger?.info(`opencode2dsh: sing-box converted ${exits.length} encrypted node(s); ${this.#state.convertedAdmitted} admitted`)
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err)
+          this.#state.lastError = message
+          this.#logger?.warn(`opencode2dsh: sing-box conversion failed: ${message}`)
+        }
       }
       // Plaintext nodes go through the trusted admission smoke (never the
       // hot coarse screen: subscription nodes are paid resources, docs 4.1).
