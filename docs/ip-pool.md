@@ -71,7 +71,7 @@ design.md §9.2 曾把「多出口」定为灰色能力并默认关闭（当时�
 
 | 来源 | 直接拿来的 | 形态 |
 | --- | --- | --- |
-| dsh-llm-proxy | `RoutingDispatcher` 骨架（150 行，改选择逻辑）、ProxyAgent keep-alive 坑的修法（`clientFactory + pipelining: 0`）、installer 的装卸/热更（makeInstaller）、settings bridge 全套（loopback guard + 官方信封 + revision fencing）、`settings-scope.ts` 的官方 scope + bridge 兜底、tsdown 客户端构建配置、CSS Modules 内联方案 | **抄代码**：同宿主同机制，MIT，全部在真实 DSH 上验证过 |
+| dsh-llm-proxy | `RoutingDispatcher` 骨架（150 行，改选择逻辑）、ProxyAgent keep-alive 坑的修法（`clientFactory + pipelining: 0`）、installer 的装卸/热更（makeInstaller）、settings bridge 护栏（loopback guard + `{ok, code, message}` 信封）、tsdown 客户端构建配置、CSS Modules 内联方案 | **抄代码**：同宿主同机制，MIT，全部在真实 DSH 上验证过 |
 | GoProxy | 源清单（fast/slow 两档 ~26 个免费源 URL）、验证链（连通→出口 IP/地理→延迟→HTTPS CONNECT 隧道）、池状态机（healthy/warning/critical/emergency 四态 + 按态选抓取模式）、断路器（源级连续失败熔断 + 冷却恢复）、准入-替换-健康检查-优化轮换的控制循环 | **抄设计**：TS 重写进插件本体（免费源全是 HTTP 文本清单，Node 拉取解析毫无障碍；Go 代码不直接移植） |
 | GoProxy（运行实例，可选） | `GET /api/proxies`（readOnly 免登录，含 exit_ip） | **抄协议**：作为可选出口来源之一（§1.2），不作为必选依赖 |
 
@@ -470,17 +470,21 @@ POST {zen}/v1/chat/completions
 
 ## 5. 设置页（DSH 设置 → 插件 → 可配置插件）
 
-直接复刻 dsh-llm-proxy 验证过的三层结构（该项目的 client 构建链我们照抄）：
+复刻 dsh-llm-proxy 验证过的三层结构，但按本机宿主实测裁剪（2026-09-05，`@deepseek-ai/dsh@0.1.1-rc.2`）：
+
+- **settings 读写走官方通道，不建兜底**：rc.2 的 host-apiproxy `settings.describe/mutate` 对**所有已注册 namespace** 服务（源码核实无 allowlist；rc.6 才有硬编码清单），所以 dsh-llm-proxy 那套「官方 scope 不可用时切自建 bridge」的 compat 层我们**不做**——客户端直接 `ctx.settingsScope.bind({namespace: 'ip-pool'})`，写路径 `scope.set/unset`（字段级 path op，revision fencing 由 SettingsScopeController 负责）。
+- **bridge 只补官方通道做不到的两件事**：池运行时没有 settings 对应物的读（`/status`：四态、出口表、封禁表、Prober 进度 x/y）与动作（`/probe`：批量探活/单出口探活/手动 refill 入队）。**探测与状态必须宿主侧跑**：要走真实 undici/凭据路径。
+- 平台 seeds 实测（web-frontend dist 内核表）：`react`、`react/jsx-runtime`、`react-dom`、`react-dom/client`、`@deepseek-ai/cordis`、`@deepseek-ai/dsh-client-ui-slots`、`@deepseek-ai/dsh-client-ui-primitives`；`@deepseek-ai/dsh-client-runtime/client` 是 preload 图行（非 seed，但同样可 external）。
 
 ```
-浏览器侧 React 卡片（settings.plugin.item slot，lib/client.js 经 __ModuleLoader__ 注入）
-   │ same-origin fetch
+浏览器侧 React 卡片（settings.plugin.item slot，keyed by 'ip-pool'，lib/client.js 经 __ModuleLoader__ 注入）
+   │ 配置读写：官方 settingsScope（apiproxy settings.describe/mutate RPC）
+   │ 状态/动作：same-origin fetch
    ▼
-宿主侧 bridge（webServer.register，/api/opencode2dsh/ip-pool/{describe,mutate,models,probe,status}）
-   │ 官方 settings seam（schemastery 校验、revision、持久化、事件）
+宿主侧 bridge（webServer.register，/api/opencode2dsh/ip-pool/{status,probe}，loopback-only）
+   │ 读 ExitPool/Prober/SubscriptionFetcher 活对象；动作入 Prober 两级调度队列
    ▼
-settings namespace `ip-pool`（applies: live，保存即热更新 dispatcher）
-```
+settings namespace `ip-pool`（applies: live，保存即热更新：换 pinned/改订阅列表/改并发上限均不重启）
 
 ### 5.1 配置 schema（schemastery）
 
@@ -509,7 +513,7 @@ Config = Schema.object({
 })
 ```
 
-订阅 URL 在 bridge 的 describe 回显中脱敏（只显示尾段），明文只存 settings 文档不进卡片。
+订阅 URL 的脱敏边界（2026-09-05 定稿，§4.1 纪律延伸）：官方 `settings.describe` 必须回显完整值——表单要能编辑它，redact 会把字段变成只写。所以**脱敏发生在卡片渲染层**（显示 `前12字…后6字`），宿主 bridge 的 `/status` 不回显订阅 URL，日志沿用 `#redact`。明文只存 settings 文档（本机文件，用户自己的磁盘）。
 
 ### 5.2 卡片内容（React + CSS Modules）
 
@@ -525,52 +529,60 @@ Config = Schema.object({
 | 探活参数 | §4.6 表格的可调项 |
 | 文案 | 「匿名配额受上游限流；多出口不绕过配额，只在出口间调度。固定/订阅节点优先；公共免费代理有安全与合规风险。」 |
 
-### 5.3 bridge 扩展（相比 dsh-llm-proxy 的差异）
+### 5.3 bridge（相比 dsh-llm-proxy 的裁剪）
 
-`/models`、`/test` 换成：
+dsh-llm-proxy 的 bridge 有四个面（describe/mutate/models/test），前两个是 rc.6 allowlist 逼出来的 settings 兜底。rc.2 宿主无 allowlist，我们只保留后两类面的思路：
 
-- `POST /probe`：`{scope: 'all'|'exit'|'refill', exitId?}` → 入 Prober 两级调度队列；`scope: 'all'` 返回队列长度，前端轮询 `/status` 看进度；`scope: 'refill'` 触发一次状态机 refill（免费源抓取+准入）。探测**必须在宿主侧**跑：要走全局 dispatcher 与真实凭据路径。
-- `POST /status`：池状态机快照（四态 + 可用/容量 + 来源计数）+ 两级健康（出口表 + 封禁表）+ Prober 队列状态（批量进度 x/y、在飞出口数）。
-- describe/mutate 照抄 dsh-llm-proxy settings.js 的官方信封结构（ok/code/message、revision fencing、SettingsConflictError 映射）。
+- `POST /status`：池状态机快照——四态徽章 + 可用/容量 + 来源计数（free/manual/subscription）+ 两级健康（出口表：地址/来源/位置/延迟/质量/出口 IP/状态/冷却到期时刻 + 封禁表：(出口, 模型, bannedAt)）+ Prober 队列进度（enqueued/completed/inFlight/queued）+ refill 上轮摘要 + 订阅层状态（pendingConversion 数、convertedAdmitted、lastFetch、lastError——**不含 URL 明文**）。返回结构化 JSON，卡片 3s 轮询（探活进行中 1s）。
+- `POST /probe`：`{scope: 'all'|'exit'|'refill', exitId?}`。`all`：全池出口 × probeModels 的周期探测一次（入 Prober 队列，返回队列长度，前端看 /status 进度）；`exit`：单出口插队探测；`refill`：手动触发一次状态机 refill 轮（免费源抓取+准入）。探测在宿主侧跑：走 Prober 两级调度（同出口串行 + 全局上限），不碰浏览器。
+- 路由护栏照抄 dsh-llm-proxy settings.js：loopback socket + 规范 Host + same-origin 三重校验、JSON body 上限、`{ok, code, message}` 信封。**不做 settings 代理面**（官方通道在）。
+- 卡片注册进 `settings.plugin.item`（keyed slot，`key: 'ip-pool'`——即 namespace 名）；`configurable` tab 按 namespace 取交集分派，卡片在官方 settingsScope ready 后渲染。
 
 ### 5.4 客户端构建
 
-照搬 dsh-llm-proxy 的 tsdown 配置（tsdown.config.ts 全文可抄）：`format: 'cjs'`、`platform: 'browser'`、`window.__ModuleLoader__.load({id, factory})` banner/footer、`@deepseek-ai/*` 平台模块 external + 纯度门插件、lightningcss 内联 CSS Modules。包的 `dsh` 字段加：
+照搬 dsh-llm-proxy 的 tsdown 配置（tsdown.config.ts 全文可抄，但平台 externals 按本机 rc.2 seeds 核实）：`format: 'cjs'`、`platform: 'browser'`、`window.__ModuleLoader__.load({id, factory})` banner/footer、纯度门插件（非 seed 的 `@deepseek-ai/*` 值导入报错）、lightningcss 内联 CSS Modules。externals = 平台 seeds + `@deepseek-ai/dsh-client-runtime/client`（preload 图行，合法 external）。包的 `dsh` 字段加：
 
 ```json
 "dsh": {
   "bundle": { "patch": "./cordis.patch.yml" },
-  "client": { "inject": ["slots", "locale", "settingsScope", "remote"], "platform": "web" }
+  "client": { "inject": ["slots", "locale", "settingsScope"], "platform": "web" }
 }
 ```
+
+（`remote` 不需要：没有跨 fiber 的 settings/document-updated 监听需求，官方 mirror 自己处理失效。）
+
+构建链随版本走：tsdown 0.15（仓库现有 devDep）+ lightningcss 1.32（dsh-llm-proxy 同版）+ `@deepseek-ai/dsh-client-{runtime,locale,ui-slots,ui-primitives,ui-settings-plugins}@0.1.1-rc.2` 仅 devDependencies（类型与构建期 externals 对齐宿主；运行时由宿主 seeds 提供，不进生产依赖）。`build:client` 独立 script，`build`（宿主半）+ `build:client` 都进 `prepack`。
 
 ## 6. 文件落点（增量，不动现有结构）
 
 ```
 packages/plugin/
 ├── src/
-│   ├── routing/                        # 新增子目录
+│   ├── pool/                          # 已交付（IP-0..4）
 │   │   ├── dispatcher.ts              # PoolRoutingDispatcher（undici Dispatcher 子集）
 │   │   ├── installer.ts               # setGlobalDispatcher 装卸/热更新（仿 makeInstaller）
-│   │   ├── pool.ts                     # ExitPool（出口表+两层健康+四态状态机+refill 调度+pinned）
-│   │   ├── prober.ts                   # 探活引擎（两级调度）+ 准入探测（§4.5）
+│   │   ├── pool.ts                     # ExitPool（出口表+两层健康+四态状态机+pinned）
+│   │   ├── prober.ts                   # 探活引擎（两级调度）
+│   │   ├── admission.ts                # 准入探测（§4.5 粗筛+细筛）
+│   │   ├── refill.ts                   # 状态机 refill 调度
 │   │   ├── sources.ts                 # 免费源清单（26 URL）+ 拉取 + 解析 + 源断路器
 │   │   ├── subscription.ts             # 订阅解析（Clash/链接/Base64 三格式，抄 GoProxy parser §1.2.1）
-│   │   ├── singbox.ts                 # sing-box 子进程托管（配置生成/端口映射/重载，§1.2.2）
-│   ├── settings/
-│   │   ├── namespace.ts               # schemastery Config + register（applies: live）
-│   │   └── bridge.ts                  # webServer 路由（describe/mutate/probe/status）
-│   └── client/                        # 浏览器半边（新）
-│       ├── index.ts                   # slots.inject('settings.plugin.item') + binder
+│   │   ├── subscription-fetcher.ts     # 订阅拉取+节点分路+受控探活
+│   │   └── singbox.ts                 # sing-box 子进程托管（配置生成/端口映射/重载，§1.2.2）
+│   ├── ip-pool-settings/              # IP-5 宿主半
+│   │   ├── namespace.ts               # schemastery Config + ctx.settings.register('ip-pool') + watch 热更新
+│   │   └── bridge.ts                  # webServer 路由（/status /probe，loopback-only）
+│   └── client/                        # IP-5 浏览器半边（新）
+│       ├── index.ts                   # slots.inject('settings.plugin.item', key: 'ip-pool') + scope 绑定
 │       ├── IpPoolCard.tsx
-│       ├── settings-scope.ts          # 官方 scope + bridge 兜底（可抄改 dsh-llm-proxy）
-│       └── locales.ts                 # zh/en
+│       ├── locales.ts                 # zh/en
+│       ├── ip-pool.module.css
+│       └── css-modules.d.ts           # 类型 shim
 ├── test/
-│   ├── routing.test.ts                # dispatcher 分流/换出口/冷却/pinned 优先（undici mock）
-│   ├── pool.test.ts                   # 状态机
-│   ├── prober.test.ts                 # 探活判定
-│   ├── subscription.test.ts           # 三格式解析（用 GoProxy 仓库里那份真实 Clash 订阅做夹具）
-└── tsdown.client.config.ts            # 从 dsh-llm-proxy 抄改
+│   ├── …（已交付 16 个套件）
+│   ├── ip-pool-settings.test.ts       # namespace 注册/热更新/bridge 信封与护栏
+│   └── client-build.test.ts           # lib/client.js 构建产物形态
+└── tsdown.client.config.ts            # 从 dsh-llm-proxy 抄改（rc.2 seeds 对齐）
 ```
 
 zen-adapter.ts 改动极小：`stream()` 里把 pi-ai 的 `maxRetries: 0` 保持，失败语义交给 dispatcher 层；可选地把「当前请求命中哪个出口」通过事件暴露给设置页运行统计（`probe` 之外的被动数据）。
