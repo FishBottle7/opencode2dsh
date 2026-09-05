@@ -10,7 +10,7 @@
 
 opencode Zen 匿名通道按**出口 IP** 限流（design.md §3）。当前 adapter 版单出口直连，一个 IP 的匿名配额用尽（401/403/429）就整卡不可用，只能干等窗口恢复。
 
-用户诉求：**IP 池（免费源抓取 + 手填节点 + 机场订阅 + 可选 GoProxy 对接，四来源同池）→ 批量探活（哪个 IP 对哪个模型可用）→ 自动路由（这个 IP 打到限额/被地区拦 → 自动换下一个可用的 IP；有专线则固定主力、其余作备胎）→ 设置页管理**。
+用户诉求：**IP 池（免费源抓取 + 手填节点 + 机场订阅，三来源同池）→ 批量探活（哪个 IP 对哪个模型可用）→ 自动路由（这个 IP 打到限额/被地区拦 → 自动换下一个可用的 IP；有专线则固定主力、其余作备胎）→ 设置页管理**。
 
 「自动路由」的用户语义（验收口径）：一次对话请求选中模型 M 后——
 1. 出口 E₁ 发出，上游 429（配额到顶）→ **自动换** E₂ 重发（E₁ 进入冷却）；
@@ -46,14 +46,14 @@ design.md §9.2 曾把「多出口」定为灰色能力并默认关闭（当时�
 │                        │ pick/write                    │ probe             │
 │              ┌─────────▼─────────────────────┐  ┌──────▼─────────────┐    │
 │              │ ExitPool（出口池 + 状态机 §3.5） │  │ Prober（探活引擎）   │    │
-│              │ · 出口表（free/manual/goproxy） │  │ · 准入探测（§4.5）  │    │
+│              │ · 出口表（free/manual/sub） │  │ · 准入探测（§4.5）  │    │
 │              │ · 两层健康（§3.2）              │◄─│ · 周期/按需探测     │    │
 │              │ · per-IP 冷却·模型封禁           │  │ · 两级调度（§4.1）  │    │
 │              │ · 四态 refill 调度               │  └────────────────────┘    │
 │              └───┬───────────────┬────────────┘                             │
 │                  │ 拉取免费源清单   │ 枚举（可选）                            │
 │       ┌──────────▼─────────┐  ┌───▼──────────────────────────┐              │
-│       │ 免费源（26 个公开清单）│  │ GoProxy 实例（用户自部署，可选） │              │
+│       │ 免费源（26 个公开清单）│  │ 机场订阅（URL 拉取+解析）   │              │
 │       │ raw.githubusercontent │  │ GET /api/proxies（readOnly） │              │
 │       │ /jsdelivr 文本清单     │  │ 订阅/sing-box 在它那边        │              │
 │       └────────────────────┘  └──────────────────────────────┘              │
@@ -63,7 +63,7 @@ design.md §9.2 曾把「多出口」定为灰色能力并默认关闭（当时�
 
 要点：
 
-- **零新进程、零新二进制**：池子（抓取/验证/状态机/探活）全部跑在插件本体内。GoProxy 从「必选依赖」降为**可选出口来源**（§1.2）——只有加密协议订阅节点需要它的 sing-box，那是用户已有部署的价值延伸。
+- **零外部服务**：池子（抓取/验证/状态机/探活/订阅解析）全部跑在插件本体内。唯一按需外挂的是 sing-box 单文件（加密订阅节点的转换核心，§1.2.2）——spawn 用户自装的二进制 ≠ 分发二进制。
 - **注入点唯一且被验证过**：pi-ai 的 wire 层是 `new OpenAI({apiKey, baseURL, defaultHeaders})`（已实读 pi-ai 0.82.1 `dist/api/openai-completions.js:505`），不暴露 fetch/dispatcher 注入点；Node 内置 fetch 走全局 undici dispatcher。dsh-llm-proxy 已在同一宿主上验证 `setGlobalDispatcher` 对 LLM 流量生效（其 README 明言「位于 LLM 适配器之下、供应商之上」）。我们复用同一手法。
 - **命名空间**：设置命名空间 `ip-pool`（kebab-case，跟随 dsh-llm-proxy 的 `llm-proxy` 惯例）。
 
@@ -75,16 +75,17 @@ design.md §9.2 曾把「多出口」定为灰色能力并默认关闭（当时�
 | GoProxy | 源清单（fast/slow 两档 ~26 个免费源 URL）、验证链（连通→出口 IP/地理→延迟→HTTPS CONNECT 隧道）、池状态机（healthy/warning/critical/emergency 四态 + 按态选抓取模式）、断路器（源级连续失败熔断 + 冷却恢复）、准入-替换-健康检查-优化轮换的控制循环 | **抄设计**：TS 重写进插件本体（免费源全是 HTTP 文本清单，Node 拉取解析毫无障碍；Go 代码不直接移植） |
 | GoProxy（运行实例，可选） | `GET /api/proxies`（readOnly 免登录，含 exit_ip） | **抄协议**：作为可选出口来源之一（§1.2），不作为必选依赖 |
 
-### 1.2 架构定案：池子内建，GoProxy 可选
+### 1.2 架构定案：池子内建，GoProxy 不接（2026-09-05 摘牌）
 
-**池子（抓取/验证/状态机）跑在插件本体里**（TS，进程内），出口来源有四类：
+**池子（抓取/验证/状态机）跑在插件本体里**（TS，进程内），出口来源有三类：
 
 1. **免费源抓取**（内建）：用户开启即用，不依赖任何外部服务。免费代理质量烂，所以配套内建验证与准入（§4.5）。
-2. **手动添加的明文 HTTP/SOCKS5 代理**（内建，设置页手填）：几个自备节点直填，undici 原生就拨。其中可标记 **pinned 固定出口**（专线场景，§3.6）。
+2. **手动添加的明文 HTTP/SOCKS5 代理**（内建，设置页手填）：几个自备节点直填，undici 原生就拨。其中可标记 **pinned 固定出口**（专线/本机 Clash 场景，§3.6）。
 3. **订阅**（内建，机场/自建 Clash·V2ray 订阅，设置页填 URL）：解析层纯 TS 内建（§1.2.1）；拨号按协议分层——明文节点（http/socks5）直拨，加密节点（vmess/vless/trojan/ss/hysteria2/anytls）需要外部核心转换（§1.2.2）。
-4. **GoProxy 实例**（可选对接）：用户如果已经跑着 GoProxy（含 sing-box），插件读 `/api/proxies` 把它的池子并进我们的出口表——对已有部署的用户这是「加密订阅零额外配置」的最短路径。**GoProxy 从「必选依赖」降级为「出口来源之一」**。
 
-四类来源在出口表里统一为 `source: 'free' | 'manual' | 'subscription' | 'goproxy'`，下游（健康、选择、路由）不区分来源（pinned 标记除外，§3.6）。
+**GoProxy 实例对接（原第 4 来源，2026-09-05 摘牌）**：设计之初它是「必选依赖」→ IP-2/3 内建了免费源抓取与订阅解析后降为「四来源之一」→ **IP-3 交付后其残余价值归零**：三个用户画像里（已有 Clash → pinned 覆盖；已有 GoProxy → 这类用户装 sing-box 单文件零负担，IP-4 覆盖；全新用户 → 它的安装门槛 Go1.25+CGO/Docker 比 sing-box 还高）没有一个需要它。维护成本（API 变动跟随、它与我们不一致的出口质量标准、多一个来源的文档面）> 残余价值。**IP-5 从分期删除**；触发条件记录进 §8 backlog（真实用户反馈「已在跑 GoProxy 且不想装 sing-box」时再补，那是一个 30 行的 API client）。
+
+三类来源在出口表里统一为 `source: 'free' | 'manual' | 'subscription'`，下游（健康、选择、路由）不区分来源（pinned 标记除外，§3.6）。
 
 #### 1.2.1 订阅解析层：纯 TS 内建（抄 GoProxy parser）
 
@@ -108,7 +109,7 @@ design.md §9.2 曾把「多出口」定为灰色能力并默认关闭（当时�
 所以加密节点走「外部核心转换成本地 SOCKS5，再按明文处理」的路线，与 GoProxy 的 sing-box 用法完全同构。转换核心二选一，设置页自动探测（有哪个用哪个，都无则明文照常、加密节点标「待转换」灰显）：
 
 1. **sing-box standalone**（官方二进制，用户自装，`sing-box` 在 PATH）：我们生成最小 config（每节点一个本地 SOCKS5 入站，端口 30000+ 递增——GoProxy singbox.go 同构），spawn 为子进程，按需重载。**这是本插件唯一会 spawn 的外部进程**：用户显式配置订阅加密节点才拉起；「spawn 外部已有二进制」与「打包原生二进制进 npm 包」是两回事，后者才是被淘汰的分发问题（§1.4）。
-2. **GoProxy 实例**（若用户已部署）：直接读它的 `/api/proxies` 拿已转换节点（§1.2 第 4 条），我们不重复转换。
+2. ~~**GoProxy 实例**~~（原选项 2，2026-09-05 摘牌）：内建能力覆盖后残余价值归零（§1.2）；外部核心只剩 sing-box standalone 一条路。
 
 **「我们历史上外挂过 Go（legacy/ sidecar），是不是自己写个 Go 端更好做？」——不。要外挂的是 sing-box 这个进程，不是「我们的 Go」**
 
@@ -137,15 +138,15 @@ design.md §9.2 曾把「多出口」定为灰色能力并默认关闭（当时�
 
 借道 Clash API（external-controller 换 select 组节点）同样否决：换组节点会**影响用户经 Clash 的全部流量**（侵入用户的 Clash 全局状态），且无法按请求粒度指定。mihomo 的 `listeners` 配置理论上支持「每个 inbound 绑定一个节点」，但要求用户手改自己的 Clash 配置、且订阅刷新后节点改名全部失效——不产品化，仅作脚注。
 
-结论：**Clash 端口的唯一正确位置是 pinned（§3.6，把节点选择权整体委托给 Clash）；一旦要「轮换机场 IP」，必须走自托管 sing-box（本节）或 GoProxy 对接（§1.2 来源 4）**。三条路线按需分流，互不替代。
+结论：**Clash 端口的唯一正确位置是 pinned（§3.6，把节点选择权整体委托给 Clash）；一旦要「轮换机场 IP」，必须走自托管 sing-box（本节）**。两条路线按需分流，互不替代。
 
 订阅 URL 与解析出的节点清单持久化在 settings（脱敏：URL 不回显明文）；转换映射（节点→本地端口）内存态，重启重建。
 
-### 1.3 GoProxy 有我们用不着的东西吗？——对接模式下有；但内建池需要抄它的「设计」
+### 1.3 从 GoProxy 吸取什么：抄「设计」，不接「实例」（对接已于 2026-09-05 摘牌）
 
 两问分开答：
 
-**对接模式（读 /api/proxies）下用不着的**：WebUI、SQLite、订阅管理 API、它的池状态机与抓取触发（我们读清单时它已经跑完了）、SOCKS5 对外端口（走 HTTP 端口即可）、代理认证（本机 loopback 用不上）。管理动作全不碰——用户去它的面板管它的池子，我们设置页只放「打开 GoProxy 面板」链接。
+**（对接已于 2026-09-05 摘牌——见 §1.2；下表是当初的吸取审计，仍然成立）**
 
 **内建免费池与订阅需要从它吸取的**（免费源部分此前已定为「抄设计」，订阅部分本轮修订新增）：
 
@@ -159,7 +160,7 @@ design.md §9.2 曾把「多出口」定为灰色能力并默认关闭（当时�
 | `custom/singbox.go` 外部核心托管 | `src/pool/singbox.ts`（§1.2.2） | 「每节点一个本地 SOCKS5 入站、端口递增、按需重载」的托管模式照抄；子进程健康检查与软删除同构 |
 | `storage/` SQLite | 不抄 | 内存态（§3.2）；重启重抓可接受（免费源分钟级更新；订阅清单持久化在 settings） |
 
-**明确不抄的**：它的 WebUI/管理面与 SQLite。加密协议**栈本身**（vmess 密码学、TLS 指纹等）不自写——由外部核心（sing-box standalone 或 GoProxy 实例）承担（§1.2.2）。
+**明确不抄的**：它的 WebUI/管理面与 SQLite。加密协议**栈本身**（vmess 密码学、TLS 指纹等）不自写——由 sing-box standalone 承担（§1.2.2）。
 
 ### 1.4 「要代理池就得挂个 Go 端吗？」——分层答案：核心纯 TS，加密订阅按需外挂
 
@@ -171,13 +172,12 @@ design.md §9.2 曾把「多出口」定为灰色能力并默认关闭（当时�
 | 手填明文代理 / **pinned Clash 端口** | undici 原生 HTTP 代理支持 | ✅ 进程内闭环（Clash 用户注意：Clash 本身就是你已有的「端」，我们只连它的 7897 端口，不感知它的存在形态——本质与手填专线无异） |
 | 订阅解析（三格式）+ 订阅里的明文节点 | 纯文本解析（§1.2.1） | ✅ 进程内闭环 |
 | 探活 / 两层健康 / 自动路由 / 设置页 | 全部本设计的新增层 | ✅ 进程内闭环 |
-| **订阅里的加密节点**（vmess/vless/trojan/hysteria2/anytls） | 协议拨号栈，Node 生态没有（§1.2.2 实测） | ❌ 唯一例外，三条外部路径按需选一 |
+| **订阅里的加密节点**（vmess/vless/trojan/hysteria2/anytls） | 协议拨号栈，Node 生态没有（§1.2.2 实测） | ❌ 唯一例外，两条外部路径按需选一 |
 
-加密节点的三条外部路径（按用户画像自然分流，谁都不用强求）：
+加密节点的两条外部路径（按用户画像自然分流）：
 
 1. **本机已有 Clash/mihomo 等代理客户端**（国内用户最常见）：直接填它的混合端口做 pinned（§3.6）或订阅在 Clash 里导入——加密协议由它拨，我们只见本地明文端口。**对这类用户，答案就是「纯 TS，什么都不用装」**。
 2. **装一个 sing-box standalone**（官方单文件下载，无编译无 Docker）：仅当用户想把机场订阅喂给我们的池子做轮换时需要；我们生成配置、spawn 子进程托管（这是**插件唯一会拉起的子进程**，且只在订阅含加密节点时）。注意「spawn 用户自装的二进制」≠「npm 包分发原生二进制」——后者才是当年淘汰 Go sidecar 的分发问题，前者与 DSH spawn 它自己的子进程无异。
-3. **已有 GoProxy 实例**：读它的 `/api/proxies` 拿已转换节点，零额外配置。
 
 为什么加密协议不自写（即使理论上 vmess/trojan 的密码学原语 Node 都有）：每个协议数百行传输+密码学实现 × 六种协议 × 持续跟进上游协议演进（vless reality、anytls 都是近两年新出的），这是一个专职开源项目（sing-box/Xray）的维护量级，塞进插件等于养第二个代理核心。边界清晰：**协议拨号外包，调度与智能全归我们**。
 
@@ -198,9 +198,9 @@ design.md §9.2 曾把「多出口」定为灰色能力并默认关闭（当时�
 | WebUI / SQLite 持久化 / 对外 4 端口 / 代理认证 / 优化器 | **不做** | 0 行 |
 | 探活·健康·路由·设置页（真正的增量） | ~2000 行（两边都一样） | ~2000 行（一样跑不掉） |
 
-内建池 = 抄它约 **1200 行**，换「免费源 + 订阅明文节点零部署；加密节点装一个单文件 sing-box 或复用已有 GoProxy」；其余功能一律通过「对接运行实例」获得，两套逻辑零重叠（内建池不做 WebUI、不重复转换 GoProxy 已转换的节点——它不是 GoProxy 的复制品）。
+内建池 = 抄它约 **1200 行**，换「免费源 + 订阅明文节点零部署；加密节点装一个单文件 sing-box」——三个角色全部内建后，GoProxy 实例对接已无残余价值（摘牌记录见 §1.2），它不再是「功能的获取方式」而是纯粹的参考实现。
 
-**事实三：部署门槛恰恰挡住目标用户。** GoProxy 本地运行要 Go 1.25 + CGO（go-sqlite3 编译）或 Docker（其 README 明示；无预编译 Windows 二进制）。Windows 无 Docker 的用户基本装不动。而「免费模型可用性」主张吸引的恰恰是**不想折腾服务的普通用户**；已有 GoProxy/订阅的极客由对接路线覆盖。
+**事实三：部署门槛恰恰挡住目标用户。** GoProxy 本地运行要 Go 1.25 + CGO（go-sqlite3 编译）或 Docker（其 README 明示；无预编译 Windows 二进制）。Windows 无 Docker 的用户基本装不动。而「免费模型可用性」主张吸引的恰恰是**不想折腾服务的普通用户**；重度的极客用户由 sing-box 单文件路线覆盖（GoProxy 对接已摘牌）。
 
 **结论**：直接用（必选）省 1200 行代码，代价是把全部用户挡在部署门槛外，且核心层一行都省不下。当前定案（内建免费源 + 订阅 + GoProxy 可选对接）是「大众零门槛、极客全功能」的分层覆盖。**反向决策路径也记录在案**：若产品定位收窄为「面向已有代理池/订阅的极客」，砍掉内建池、GoProxy 升为必选，可省 ~30% 工作量——这是定位决策而非技术决策，届时由 README 的目标用户画像触发重审。
 
@@ -237,7 +237,7 @@ undici `ProxyAgent` 只说 HTTP(S) 代理。GoProxy 的 SOCKS5 端口（7780/777
 ### 3.1 数据模型
 
 ```ts
-type ExitSource = 'free' | 'manual' | 'subscription' | 'goproxy'
+type ExitSource = 'free' | 'manual' | 'subscription'  // goproxy 类型保留仅为兼容既有 ExitSource 联合（来源已摘牌，§1.2），新代码不再产生
 
 interface ExitNode {          // 出口表条目；来源决定怎么进来（§1.2），下游一律同质
   id: string                  // address（host:port，池内唯一）
@@ -337,7 +337,7 @@ healthy ──可用数<95%──► warning ──可用数<30%──► critic
 - **目标容量**（poolTargetSize，默认 20）：免费池不求大，够路由轮换即可——节点越多探测与巡检成本越高（R5 的消耗公式）。
 - **准入-替换**（抄 GoProxy TryAddProxy/tryReplace）：新验证节点优于池内最差节点（C 级/最老）则替换；满员时拒绝准入（emergency 除外）。
 - **淘汰**：dead 连续 N 次（§4.6 deadRetryMs 周期复核不过）直接出池；被封禁到「无任何可用模型」的节点同判。**只有 free 来源节点即删**（GoProxy removeOrDisable 对 free 同义），其余来源只禁用不删（见下条）。
-- **manual/subscription/goproxy 来源特殊对待**：手填、订阅与 GoProxy 节点**不参与淘汰替换**、不占目标容量配额（用户的东西不动）、dead 只禁用不删除（下次探测成功自动回池——GoProxy 订阅节点软删除同义）。pinned 节点叠加同款豁免（§3.6）。
+- **manual/subscription 来源特殊对待**：手填与订阅节点**不参与淘汰替换**、不占目标容量配额（用户的东西不动）、dead 只禁用不删除（下次探测成功自动回池）。pinned 节点叠加同款豁免（§3.6）。
 - 触发时机：refill 检查挂在周期探活同一节拍上（探活发现的死亡/冷却会即时改变「可用数」，两个循环共享一次状态计算，不打两份）。
 
 免费源抓取本身（`src/pool/sources.ts`）只是状态机的执行器：按状态选源档（fast/slow/all）→ 拉文本清单 → 解析 host:port → 交给 §4.5 准入探测。**源断路器**照抄 GoProxy SourceManager（连续 3 次失败禁源 + 10min 冷却自动恢复，SQLite 换内存 Map）；emergency 态无视断路器强抓。
@@ -441,7 +441,7 @@ POST {zen}/v1/chat/completions
 这个分层让「一轮 48k 候选」从不可能变成可行：粗筛 100 并发 × 3s 超时几分钟扫完一轮全量，幸存的几十个再花细筛的几十次配额请求。免费代理约 98%+ 死在步骤 1（TCP 不可达），烧配额的步骤只碰幸存者。
 
 - **细筛并发**：与周期探活共享 `maxConcurrentProbes` 工位与两级调度（§4.1；同一候选地址在飞 ≤ 1）。状态机（§3.5）按「目标容量 - 现可用数」计算本轮准入额度，够了就提前终止。
-- **manual/subscription/goproxy 来源**：跳过粗筛与步骤 3（清单已含节点详情/已验证），只跑第 4 步冒烟；失败不禁用（可能是暂时的），只标 suspect。**pinned 节点例外**：准入失败也收（exitIP 留空、路由键退化为 address，§3.1），只在冒烟失败时警告——专线场景用户判断优先。
+- **manual/subscription 来源**：跳过粗筛与步骤 3（清单已含节点详情），只跑第 4 步冒烟；失败不禁用（可能是暂时的），只标 suspect。**pinned 节点例外**：准入失败也收（exitIP 留空、路由键退化为 address，§3.1），只在冒烟失败时警告——专线场景用户判断优先。
 - **429 入池即冷却（2026-09-05 实测定案）**：冒烟 429 的候选是「好代理、Zen 隧道已验证、只是匿名配额此刻被别处消耗」（免费代理是全球共享出口，实测隧道通过者的一半以上死于 429）。这类候选**入池并立即 markLimited**：占池位但不计入可用配额（状态机保持饥饿，继续补真正可用的）、冷却到期由周期探活重试——别人的配额消耗是波动的，冷却后大概率恢复。产出效果：可用出口产量约翻倍。
 - 准入通过的节点写 ExitNode + ExitHealth.ok，立即可被 pick。
 
@@ -462,7 +462,7 @@ POST {zen}/v1/chat/completions
 | maxRotateAttempts | 3 | 单请求换出口上限（§3.4） |
 | poolTargetSize | 20 | 免费池目标容量（§3.5） |
 | blockedCountries | `['CN']` | 准入地理黑名单（国家代码） |
-| freeSourceEnabled | true | 免费源抓取总开关（关掉 = 只用 manual/subscription/goproxy 来源） |
+| freeSourceEnabled | true | 免费源抓取总开关（关掉 = 只用 manual/subscription 来源） |
 | subscriptionRefreshMs | 30min | 订阅刷新间隔（拉 URL 重跑解析，断路器同免费源） |
 | pinnedStrict | false | 绝对固定模式（§3.6）：true 时 pinned 失败透传、不换出口不直连 |
 
@@ -499,25 +499,24 @@ Config = Schema.object({
     urls: Schema.array(Schema.string()).default([]),   // 订阅 URL（回显脱敏）
     refreshMs: Schema.number().default(30 * 60 * 1000),
   }),
+  singbox: Schema.object({                        // 加密节点转换核心（§1.2.2）
+    path: Schema.string().default('sing-box'),    // sing-box 二进制路径（PATH 或绝对路径）
+  }),
   pinnedExitId: Schema.string().default(''),       // 固定主力出口（§3.6；出口列表行内设置或此处直填地址）
   pinnedStrict: Schema.boolean().default(false), // true = 绝对固定：失败也不换出口、不直连（§3.6 行为契约）
-  goproxy: Schema.object({                        // 可选对接（§1.2 来源 4）
-    enabled: Schema.boolean().default(false),
-    webuiURL: Schema.string().default('http://127.0.0.1:7778'),
-  }),
   cooldown: Schema.object({ /* §4.6 参数 */ }),
   maxRotateAttempts: Schema.number().default(3),
 })
 ```
 
-注意：schema 里**不放 GoProxy 管理密码**。GoProxy 的 `/api/proxies` 是 readOnlyMiddleware **无需登录**即可读（webui/server.go:85 `readOnlyMiddleware` 只调 next），只有管理动作（如 `/api/proxy/refresh`）才需要 cookie。我们只读不管理，不碰登录态。订阅 URL 在 bridge 的 describe 回显中脱敏（只显示尾段），明文只存 settings 文档不进卡片。
+订阅 URL 在 bridge 的 describe 回显中脱敏（只显示尾段），明文只存 settings 文档不进卡片。
 
 ### 5.2 卡片内容（React + CSS Modules）
 
 | 区块 | 内容 |
 | --- | --- |
-| 总开关 | enabled 开关；「池状态」概览条（四态徽章 + 可用/容量 + 来源计数 free/manual/subscription/goproxy + pinned 主力徽章） |
-| 出口来源 | 四个来源子区块：免费源（开关 + 目标容量 + 地理黑名单 + 「立即补充」）；手填代理（textarea，增删）；订阅（URL 列表脱敏回显 + 刷新间隔 + 「立即刷新」+ 转换核心状态：sing-box 检测结果/待转换节点数）；GoProxy（开关 + webuiURL + 「测试连接」） |
+| 总开关 | enabled 开关；「池状态」概览条（四态徽章 + 可用/容量 + 来源计数 free/manual/subscription + pinned 主力徽章） |
+| 出口来源 | 三个来源子区块：免费源（开关 + 目标容量 + 地理黑名单 + 「立即补充」）；手填代理（textarea，增删）；订阅（URL 列表脱敏回显 + 刷新间隔 + 「立即刷新」+ 转换核心状态：sing-box 检测结果/待转换节点数） |
 | 固定主力出口 | 直填地址框（placeholder：`http://127.0.0.1:7897`（Clash 混合端口）/ `http://专线:端口`，即填即 pin 为 manual 来源节点）+ 当前 pinned 展示（地址/出口 IP/状态）+ strict 单选（「主力+备胎（429/断线自动切换，恢复回归）」/「绝对固定（失败也不换出口、不直连）」）+ 解除固定按钮 |
 | 探活模型 | 多选：当前免费目录（catalog.list()）+ S3 清单，默认选 S3 首个；说明文案「探测结论按出口计，建议加主用模型；同一出口内多模型串行探测」 |
 | 并发上限 | maxConcurrentProbes 数字框（1-8，默认 3）+ 说明「不同出口并发，同一出口串行」 |
@@ -558,7 +557,6 @@ packages/plugin/
 │   │   ├── sources.ts                 # 免费源清单（26 URL）+ 拉取 + 解析 + 源断路器
 │   │   ├── subscription.ts             # 订阅解析（Clash/链接/Base64 三格式，抄 GoProxy parser §1.2.1）
 │   │   ├── singbox.ts                 # sing-box 子进程托管（配置生成/端口映射/重载，§1.2.2）
-│   │   └── goproxy.ts                 # GoProxy API client（可选来源，fetch /api/proxies）
 │   ├── settings/
 │   │   ├── namespace.ts               # schemastery Config + register（applies: live）
 │   │   └── bridge.ts                  # webServer 路由（describe/mutate/probe/status）
@@ -572,7 +570,6 @@ packages/plugin/
 │   ├── pool.test.ts                   # 状态机
 │   ├── prober.test.ts                 # 探活判定
 │   ├── subscription.test.ts           # 三格式解析（用 GoProxy 仓库里那份真实 Clash 订阅做夹具）
-│   └── goproxy.test.ts
 └── tsdown.client.config.ts            # 从 dsh-llm-proxy 抄改
 ```
 
@@ -589,18 +586,17 @@ zen-adapter.ts 改动极小：`stream()` 里把 pi-ai 的 `maxRetries: 0` 保持
 | IP-2 | 免费源抓取 + 准入探测 + 池状态机接入真实网络 | 开启免费源后池子自动填充到目标容量；批量探活两级调度正确；kill 一个代理节点，巡检后出池、refill 自动补位 |
 | IP-3 | 订阅：解析层 + 明文节点直拨 | 填一个机场订阅 URL，明文节点入池可用，加密节点正确灰显「待转换」 |
 | IP-4 | 订阅：sing-box 托管（加密节点转换） | 装了 sing-box 的机器上，加密节点自动转本地 SOCKS5 入池；kill sing-box 子进程自动重启、节点恢复 |
-| IP-5 | GoProxy 对接（可选来源） | 读 /api/proxies 并池；GoProxy 停机时该来源静默消失不报错 |
-| IP-6 | settings namespace + bridge + React 卡片（四来源管理 + pinned + 出口列表 + 探活进度 + 封禁列表） | 设置页改任何项保存即生效无需重启 |
-| IP-7 | 运行统计（被动信号展示）+ README「IP 池」章节 + 合规文案 | 文档过目 |
+| IP-5 | settings namespace + bridge + React 卡片（三来源管理 + pinned + 出口列表 + 探活进度 + 封禁列表） | 设置页改任何项保存即生效无需重启 |
+| IP-6 | 运行统计（被动信号展示）+ README「IP 池」章节 + 合规文案 | 文档过目 |
 
-依赖关系：IP-1（含 pinned）最简，先证明路由/换 IP/固定三条链；IP-2 免费池主战场；IP-3/IP-4 订阅两步走（解析先行，转换独立）；IP-5 独立适配器；IP-6 独立于 IP-2-5 可并行。
+依赖关系：IP-1（含 pinned）最简，先证明路由/换 IP/固定三条链；IP-2 免费池主战场；IP-3/IP-4 订阅两步走（解析先行，转换独立）；IP-5 独立于 IP-2-4 可并行。（原 IP-5 GoProxy 对接已于 2026-09-05 摘牌，见 §1.2 与 §8。）
 
 ## 8. 明确不做（backlog）
 
-- **不自写加密协议栈**（vmess/vless/trojan/ss/hysteria2/anytls 的拨号实现）：解析进插件（§1.2.1），拨号一律委托外部核心（sing-box standalone 或 GoProxy，§1.2.2）。npm 生态无可用的纯 Node 栈（sing-box 包为占位符、Xray binding 仅 React Native、shadowsocks-js 停更），自写 = 每协议数百行密码学 + 持续跟进演进，明确不做。
+- **不接 GoProxy 实例**（2026-09-05 摘牌，§1.2）：内建能力覆盖其全部角色后的决策。**触发重审条件**：真实用户反馈「已在跑 GoProxy 且不想装 sing-box」——届时补一个 30 行的 `/api/proxies` 只读 client 即可。
+- **不自写加密协议栈**（vmess/vless/trojan/ss/hysteria2/anytls 的拨号实现）：解析进插件（§1.2.1），拨号一律委托 sing-box standalone（§1.2.2）。npm 生态无可用的纯 Node 栈（sing-box 包为占位符、Xray binding 仅 React Native、shadowsocks-js 停更），自写 = 每协议数百行密码学 + 持续跟进演进，明确不做。
 - **不做多 pinned 策略**（轮询/按模型/按延迟选主力）：MVP 只 pin 一个（§3.6）；真实需求出现时作为 §3.3 排序键扩展。
-- **不做「GoProxy 管理」**（传订阅/删节点/改它的配置）：它有完整 WebUI，我们不做第二管理面。MVP 只读它的 `/api/proxies`；设置页只放「打开 GoProxy 面板」链接。
-- **不做 SOCKS5 出口直连**（MVP）：免费源里的 socks5 候选暂不收（准入只走 http 候选）；订阅/GoProxy 的 socks5 节点经本地转换端口后实际是 http 可拨的本地地址，不受影响。undici SOCKS5 dispatcher 列 backlog。
+- **不做 SOCKS5 出口直连**（MVP）：免费源里的 socks5 候选暂不收（准入只走 http 候选）；订阅的 socks5 节点经本地转换端口后实际是 http 可拨的本地地址，不受影响。undici SOCKS5 dispatcher 列 backlog。
 - **不做两级健康持久化**：内存态，重启重建（免费源分钟级更新；手填/订阅清单本来就在 settings 里持久化）。
 - **不做全模型 × 全出口矩阵扫描**：probeModels 是小集合（定案 §4.1）。仅当实测确认需要更细粒度的模型级配额地图才重新评估。
 - **不做流中断重放/断点续传**：匿名通道无幂等性。
@@ -614,7 +610,7 @@ zen-adapter.ts 改动极小：`stream()` 里把 pi-ai 的 `maxRetries: 0` 保持
 | R1 | 全局 dispatcher 与 dsh-llm-proxy（或其它装 dispatcher 的插件）共存 | **谁后装谁生效**对两者都是灾难（对方把我们的路由层整个短路）。缓解：installer 记录 previous 并在 dispose 恢复（dsh-llm-proxy 同款）；文档标注冲突可能；长期靠 DSH 官方提供 per-request dispatcher 注入点。**同装两个此类插件属不支持配置**，README 写明。 |
 | R2 | 免费公共代理的安全风险（中间人、注入） | 上游是 HTTPS，出口代理只能看到 CONNECT 隧道目标域名，不能读内容；准入地理黑名单 + 设置页文案明示风险；freeSourceEnabled 可关。 |
 | R3 | 上游把「多 IP + 同 session id」识别为滥用 | 会话粘性（§3.3）+ 探活低频 + 诚实文案；若被封禁，退路是关掉本功能（enabled off 回直连）。 |
-| R4 | GoProxy API 变动（/api/proxies 结构） | client 侧字段宽松解析；README 标注已验证版本（当前 main @ 2026-09）。我们只依赖一个只读端点，且它是可选来源——挂了只损失一个来源，不影响免费源/手填路线。 |
+| R4 | ~~GoProxy API 变动~~（来源已摘牌，风险随之下线；重审时再评估） | — |
 | R5 | 探活消耗配额反噬正常使用 | 同出口串行（同一配额桶不自己挤兑自己）；跨出口并发默认仅 3 且可调回 1（准入共享该上限）；被动信号优先；probeModels 小集合 + 池目标容量 20 封顶巡检面；冷却期不重探。稳态单轮消耗 ≈ 池容量 × probeModels 数 × 1 token。 |
 | R6 | undici 8.x ProxyAgent keep-alive 坑 | 已由 dsh-llm-proxy 踩平并给出修法（clientFactory + pipelining:0），照抄。 |
 | R7 | 免费源 URL 腐烂（GitHub raw 限流/仓库跑路） | 26 源分散在 fast/slow 两档 + 源断路器自动跳死源；清单做成常量表随版本更新（抄 GoProxy 的清单维护方式）；全部源挂掉时状态机 emergency 暴力重试有上限，最终回直连不挂死。 |
