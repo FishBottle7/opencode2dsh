@@ -236,3 +236,98 @@ test('end-to-end: builtin fetch routes through a real local proxy via the instal
   assert.ok(directHits >= 1)
   await new Promise<void>((resolve) => server.close(() => resolve()))
 })
+
+// -- passive signals (docs §4.2/4.3; IP-6): the handler wrapper observes the
+// real request's outcome and writes the two-tier health -------------------------
+
+/** Fake seam whose agents synchronously answer with a scripted status code. */
+function respondingSeam(statusOf: (tag: string) => number) {
+  const hops: string[] = []
+  const answer = (tag: string, handler: { onResponseStart?: (c: unknown, s: number, h: never, m?: string) => void }) => {
+    const code = statusOf(tag)
+    handler.onResponseStart?.({} as never, code, {} as never)
+  }
+  const direct = { dispatch(_o: unknown, h: unknown): boolean { answer('direct', h as never); return true }, close: () => Promise.resolve(), destroy: () => Promise.resolve() }
+  const agents = new Map<string, typeof direct>()
+  const proxy = (uri: string) => {
+    const found = agents.get(uri)
+    if (found) return found
+    const agent = { dispatch(_o: unknown, h: unknown): boolean { const tag = `proxy:${uri}`; hops.push(tag); answer(tag, h as never); return true }, close: () => Promise.resolve(), destroy: () => Promise.resolve() }
+    agents.set(uri, agent)
+    return agent
+  }
+  return {
+    hops,
+    seam: {
+      Agent: class { constructor() { return direct } },
+      ProxyAgent: class { constructor(options: { uri: string }) { return proxy(options.uri) } },
+      setGlobalDispatcher: () => undefined,
+      getGlobalDispatcher: () => direct,
+    },
+  }
+}
+
+test('dispatcher passive signal: 2xx marks the exit ok; 429 cools it and reroutes the session', () => {
+  const pool = new ExitPool()
+  pool.add(node({ id: 'a:1', exitIP: '1.1.1.1', latencyMs: 10 }))
+  pool.markOk('a:1')
+  const { seam } = respondingSeam(() => 200)
+  const router = new PoolRoutingDispatcher({ pool, undici: seam as never, proxyHosts: ['opencode.ai'] })
+  routingContext.run({ model: 'm', session: 's' }, () => {
+    router.dispatch({ origin: 'https://opencode.ai/x' } as never, {} as never)
+  })
+  assert.equal(pool.isUsable('a:1', 'm'), true)
+  assert.deepEqual(pool.passiveStats('a:1'), { ok: 1, limited: 0, refused: 0, dead: 0, transport: 0 })
+
+  // now the exit answers 429: cooldown lands and the sticky session is dropped
+  const hot = respondingSeam(() => 429)
+  const router2 = new PoolRoutingDispatcher({ pool, undici: hot.seam as never, proxyHosts: ['opencode.ai'] })
+  routingContext.run({ model: 'm', session: 's' }, () => {
+    router2.dispatch({ origin: 'https://opencode.ai/x' } as never, {} as never)
+  })
+  assert.equal(pool.isUsable('a:1', 'm'), false, '429 cools the exit')
+  assert.equal(pool.passiveStats('a:1').limited, 1)
+})
+
+test('dispatcher passive signal: 403 marks the model, transport errors strike dead', () => {
+  const pool = new ExitPool()
+  pool.add(node({ id: 'a:1', exitIP: '1.1.1.1', latencyMs: 10 }))
+  pool.markOk('a:1')
+  const refused = respondingSeam(() => 403)
+  const router = new PoolRoutingDispatcher({ pool, undici: refused.seam as never, proxyHosts: ['opencode.ai'] })
+  routingContext.run({ model: 'muse', session: 's' }, () => {
+    router.dispatch({ origin: 'https://opencode.ai/x' } as never, {} as never)
+  })
+  routingContext.run({ model: 'muse', session: 's' }, () => {
+    router.dispatch({ origin: 'https://opencode.ai/x' } as never, {} as never)
+  })
+  assert.equal(pool.isUsable('a:1', 'muse'), false, 'two 403s ban the model')
+  assert.equal(pool.isUsable('a:1', 'other'), true, 'the exit still serves other models')
+  assert.equal(pool.passiveStats('a:1').refused, 2)
+
+  // transport-grade failure: the handler errors without a response start
+  const dead = {
+    Agent: class { constructor() { return { dispatch: () => true, close: () => Promise.resolve(), destroy: () => Promise.resolve() } } },
+    ProxyAgent: class {
+      constructor() {
+        return {
+          dispatch(_o: unknown, handler: { onResponseError?: (c: unknown, e: Error) => void }): boolean {
+            handler.onResponseError?.({} as never, new Error('connect ECONNREFUSED'))
+            return true
+          },
+          close: () => Promise.resolve(),
+          destroy: () => Promise.resolve(),
+        }
+      }
+    },
+    setGlobalDispatcher: () => undefined,
+    getGlobalDispatcher: () => ({ dispatch: () => true }),
+  }
+  pool.markOk('a:1')
+  const router2 = new PoolRoutingDispatcher({ pool, undici: dead as never, proxyHosts: ['opencode.ai'] })
+  routingContext.run({ model: 'm', session: 's' }, () => {
+    router2.dispatch({ origin: 'https://opencode.ai/x' } as never, {} as never)
+  })
+  assert.equal(pool.passiveStats('a:1').transport, 1)
+  assert.equal(pool.isUsable('a:1', 'other'), false, 'transport failure strikes the exit dead')
+})

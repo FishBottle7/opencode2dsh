@@ -85,6 +85,8 @@ export class ExitPool {
   readonly #health = new Map<string, ExitHealth>()
   readonly #bans = new Map<string, ModelBan>()
   readonly #sessionExit = new Map<string, string>()
+  /** Passive-signal counters per exit (docs/ip-pool.md §4.3 被动 + IP-6 stats). */
+  readonly #passive = new Map<string, { ok: number; limited: number; refused: number; dead: number; transport: number }>()
   #targetSize: number
   #cooldownBase: number
   #cooldownMax: number
@@ -151,6 +153,7 @@ export class ExitPool {
   remove(id: string): void {
     this.#nodes.delete(id)
     this.#health.delete(id)
+    this.#passive.delete(id)
     for (const key of this.#bans.keys()) {
       if (key.startsWith(`${id}\u0000`)) this.#bans.delete(key)
     }
@@ -263,8 +266,68 @@ export class ExitPool {
 
   /** Death from a mid-flight stream (no retry path): same strike accounting. */
   markStreamFailure(id: string, kind: '429' | 'model', model?: string): void {
-    if (kind === '429') this.markLimited(id)
-    else if (model !== undefined) this.markModelSignal(id, model)
+    if (kind === '429') {
+      this.markLimited(id)
+      this.#countPassive(id, 'limited')
+    } else if (model !== undefined) {
+      this.markModelSignal(id, model)
+      this.#countPassive(id, 'refused')
+    }
+  }
+
+  /**
+   * Passive signal from a REAL request outcome (docs/ip-pool.md §4.2 rule
+   * table, §4.3 被动 row): one response header read at the routing layer,
+   * applied to the two-tier health exactly like a probe would. Returns the
+   * classification for diagnostics.
+   */
+  recordPassive(id: string, statusCode: number, model: string): 'ok' | 'limited' | 'refused' | 'dead' {
+    if (!this.#nodes.has(id)) return 'ok'
+    if (statusCode >= 200 && statusCode < 300) {
+      this.markOk(id, model)
+      this.#countPassive(id, 'ok')
+      return 'ok'
+    }
+    if (statusCode === 429) {
+      this.markLimited(id)
+      this.#countPassive(id, 'limited')
+      return 'limited'
+    }
+    if (statusCode === 401 || statusCode === 403) {
+      this.markModelSignal(id, model)
+      this.#countPassive(id, 'refused')
+      return 'refused'
+    }
+    this.markDeadStrike(id)
+    this.#countPassive(id, 'dead')
+    return 'dead'
+  }
+
+  /** Transport-level failure of a real request (connection died mid-flight). */
+  recordPassiveTransport(id: string): void {
+    if (!this.#nodes.has(id)) return
+    this.markDeadStrike(id)
+    this.#countPassive(id, 'transport')
+  }
+
+  /** Drop the session's sticky exit when its exit degraded (§3.3). */
+  rerouteSession(session: string): void {
+    this.#sessionExit.delete(session)
+  }
+
+  #countPassive(id: string, kind: 'ok' | 'limited' | 'refused' | 'dead' | 'transport'): void {
+    const bucket = this.#passive.get(id) ?? { ok: 0, limited: 0, refused: 0, dead: 0, transport: 0 }
+    if (kind === 'limited') bucket.limited += 1
+    else if (kind === 'refused') bucket.refused += 1
+    else if (kind === 'dead') bucket.dead += 1
+    else if (kind === 'transport') bucket.transport += 1
+    else bucket.ok += 1
+    this.#passive.set(id, bucket)
+  }
+
+  /** Passive-signal counters for one exit (status bridge, IP-6). */
+  passiveStats(id: string): { ok: number; limited: number; refused: number; dead: number; transport: number } {
+    return { ...(this.#passive.get(id) ?? { ok: 0, limited: 0, refused: 0, dead: 0, transport: 0 }) }
   }
 
   // -- selection (3.3) ---------------------------------------------------------

@@ -241,3 +241,58 @@ test('unpinning/removing the pinned node clears the pointer', () => {
   assert.equal(p.pinnedId, '')
   assert.equal(p.pick('ses', 'm'), null)
 })
+
+// -- passive signals (docs §4.2 rule table, §4.3 被动; IP-6) --------------------
+
+test('recordPassive classifies by the rule table and writes two-tier health', () => {
+  const p = pool()
+  p.add(node({ id: 'e:1', source: 'free', exitIP: '9.9.9.9' }))
+  // 2xx -> ok + model ok + counter
+  assert.equal(p.recordPassive('e:1', 200, 'big-pickle'), 'ok')
+  assert.equal(p.isUsable('e:1', 'big-pickle'), true)
+  assert.deepEqual(p.passiveStats('e:1'), { ok: 1, limited: 0, refused: 0, dead: 0, transport: 0 })
+  // 429 -> exit-level cooldown (the whole exit cools, 4.2: quota is per IP)
+  assert.equal(p.recordPassive('e:1', 429, 'big-pickle'), 'limited')
+  assert.equal(p.isUsable('e:1', 'other-model'), false)
+  assert.equal(p.passiveStats('e:1').limited, 1)
+  // cooldown cleared -> usable again
+  p.markOk('e:1')
+  // 401/403 twice -> model banned, exit still serves other models
+  assert.equal(p.recordPassive('e:1', 403, 'muse'), 'refused')
+  assert.equal(p.recordPassive('e:1', 403, 'muse'), 'refused')
+  assert.equal(p.isUsable('e:1', 'muse'), false)
+  assert.equal(p.isUsable('e:1', 'other'), true)
+  assert.equal(p.passiveStats('e:1').refused, 2)
+  // 5xx -> dead (whole exit, transport-grade failure)
+  assert.equal(p.recordPassive('e:1', 503, 'big-pickle'), 'dead')
+  assert.equal(p.isUsable('e:1', 'other'), false)
+  assert.equal(p.passiveStats('e:1').dead, 1)
+})
+
+test('recordPassive transport failures strike dead and free nodes get evicted', () => {
+  const p = pool()
+  p.add(node({ id: 'e:1', source: 'free', exitIP: '9.9.9.9' }))
+  p.recordPassiveTransport('e:1')
+  p.recordPassiveTransport('e:1') // second consecutive strike -> eviction (deadEvictions = 2)
+  assert.equal(p.has('e:1'), false)
+})
+
+test('rerouteSession drops the sticky exit (degraded exit loses the session)', () => {
+  const p = pool()
+  p.add(node({ id: 'a:1', source: 'free', exitIP: '1.1.1.1' }))
+  const first = p.pick('ses', 'm')
+  assert.equal(first, 'a:1')
+  p.recordPassive('a:1', 429, 'm')
+  p.rerouteSession('ses')
+  // the cooling exit is filtered and the sticky pointer is gone
+  assert.notEqual(p.pick('ses', 'm'), 'a:1' === first ? first : first)
+})
+
+test('markStreamFailure counts passive buckets (mid-flight §3.4)', () => {
+  const p = pool()
+  p.add(node({ id: 'e:1', source: 'manual', exitIP: '9.9.9.9' }))
+  p.markStreamFailure('e:1', '429')
+  p.markStreamFailure('e:1', 'model', 'muse')
+  assert.equal(p.passiveStats('e:1').limited, 1)
+  assert.equal(p.passiveStats('e:1').refused, 1)
+})

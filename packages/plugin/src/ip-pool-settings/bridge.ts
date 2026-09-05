@@ -37,6 +37,8 @@ export interface ExitRowView {
   cooldownUntil: number
   consecutiveLimited: number
   bannedModels: Array<{ model: string; state: 'suspect' | 'banned'; bannedAt: number }>
+  /** Passive-signal counters from real requests (docs §4.3, IP-6). */
+  passive: { ok: number; limited: number; refused: number; dead: number; transport: number }
 }
 
 export interface ProberView {
@@ -108,6 +110,7 @@ export function buildStatusView(
       bannedModels: entry.bans
         .filter((b) => b.ban.state !== 'ok')
         .map((b) => ({ model: b.model, state: b.ban.state as 'suspect' | 'banned', bannedAt: b.ban.bannedAt })),
+      passive: runtime.pool.passiveStats(entry.id),
     }))
     : []
   return {

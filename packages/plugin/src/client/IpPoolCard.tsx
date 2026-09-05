@@ -70,6 +70,7 @@ export interface PoolStatusView {
     cooldownUntil: number
     consecutiveLimited: number
     bannedModels: Array<{ model: string; state: 'suspect' | 'banned'; bannedAt: number }>
+    passive: { ok: number; limited: number; refused: number; dead: number; transport: number }
   }>
   prober: { queued: number; inFlight: number; enqueued: number; completed: number }
   refill: { admitted: number; rejected: number; fetched: number; coarsePassed: number; state: string; at: number } | null
@@ -335,6 +336,7 @@ function ExitTable(props: { status: PoolStatusView | null; t: IpPoolCardInjected
               <th>{t('exitQuality')}</th>
               <th>{t('exitIp')}</th>
               <th>{t('exitState')}</th>
+              <th>{t('exitPassive')}</th>
               <th />
             </tr>
           </thead>
@@ -348,6 +350,11 @@ function ExitTable(props: { status: PoolStatusView | null; t: IpPoolCardInjected
                 <td>{exit.latencyMs > 0 ? exit.quality : '—'}</td>
                 <td className={styles.mono}>{exit.exitIP || '—'}</td>
                 <td>{stateCell(exit)}</td>
+                <td className={styles.mono}>
+                  {exit.passive.ok > 0 || exit.passive.limited > 0 || exit.passive.refused > 0 || exit.passive.dead > 0 || exit.passive.transport > 0
+                    ? `✓${exit.passive.ok} 429:${exit.passive.limited} 401/403:${exit.passive.refused} ✗:${exit.passive.dead + exit.passive.transport}`
+                    : '—'}
+                </td>
                 <td>
                   <button type="button" className={styles.rowRemove} disabled={busy} onClick={() => onProbe(exit.id)}>{t('exitProbe')}</button>
                   {!exit.pinned && (
@@ -357,7 +364,7 @@ function ExitTable(props: { status: PoolStatusView | null; t: IpPoolCardInjected
               </tr>
             ))}
             {status.exits.length === 0 && (
-              <tr><td colSpan={8} className={styles.status}>{t('statusUnavailable')}</td></tr>
+              <tr><td colSpan={9} className={styles.status}>{t('statusUnavailable')}</td></tr>
             )}
           </tbody>
         </table>

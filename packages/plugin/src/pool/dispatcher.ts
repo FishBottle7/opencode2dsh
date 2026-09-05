@@ -172,23 +172,73 @@ export class PoolRoutingDispatcher implements RoutingDispatcherSurface {
     }
     const origin = String(options.origin ?? '')
     const host = normalizeHost(origin)
-    let next: Dispatcher
     if (isLoopback(host) || !this.#proxyHosts.has(host)) {
-      next = this.#direct
-    } else {
-      const context = routingContext.getStore() ?? {}
-      const model = context.model ?? 'default'
-      const session = context.session ?? 'default'
-      const exitId = this.#pool.pick(session, model)
-      if (exitId === null) {
-        // Pool unusable (empty / all cooling): direct, never fail closed (3.3).
-        next = this.#direct
-      } else {
-        const agent = this.#agentFor(exitId)
-        next = agent ?? this.#direct
-      }
+      return this.#direct.dispatch(options, handler)
     }
-    return next.dispatch(options, handler)
+    const context = routingContext.getStore() ?? {}
+    const model = context.model ?? 'default'
+    const session = context.session ?? 'default'
+    const exitId = this.#pool.pick(session, model)
+    if (exitId === null) {
+      // Pool unusable (empty / all cooling): direct, never fail closed (3.3).
+      return this.#direct.dispatch(options, handler)
+    }
+    const agent = this.#agentFor(exitId)
+    if (!agent) {
+      return this.#direct.dispatch(options, handler)
+    }
+    return agent.dispatch(options, this.#observe(exitId, model, session, handler))
+  }
+
+  /**
+   * Wrap the downstream handler with the passive-signal observer
+   * (docs/ip-pool.md §4.2 rule table, §4.3 被动): the real request's own
+   * outcome feeds the two-tier health — free liveness data no probe spends
+   * quota on. Body bytes stream through untouched; only the response start
+   * line and terminal transport errors are read.
+   *
+   * Forwarding discipline (measured against undici 8.10 on this host): the
+   * fetch handler's methods live on a prototype with private state, so a
+   * spread would strip them and Object.create delegation would re-enter
+   * them with the wrong `this`. The wrapper is a fresh plain object that
+   * forwards every DispatchHandler callback to the original with the
+   * original as `this` — the same shape undici's own wrappers use.
+   */
+  #observe(exitId: string, model: string, session: string, handler: Dispatcher.DispatchHandler): Dispatcher.DispatchHandler {
+    const pool = this.#pool
+    const forward = (method: keyof Dispatcher.DispatchHandler, args: unknown[]): void => {
+      const fn = handler[method]
+      if (typeof fn === 'function') (fn as (...a: unknown[]) => void).apply(handler, args)
+    }
+    let classified = false
+    const classify = (statusCode: number): void => {
+      if (classified) return
+      classified = true
+      const verdict = pool.recordPassive(exitId, statusCode, model)
+      // A degraded sticky exit must not keep the session pinned to it.
+      if (verdict !== 'ok') pool.rerouteSession(session)
+    }
+    return {
+      onRequestStart: (controller, context) => forward('onRequestStart', [controller, context]),
+      onRequestUpgrade: (controller, statusCode, headers, socket) => forward('onRequestUpgrade', [controller, statusCode, headers, socket]),
+      onResponseStart: (controller, statusCode, headers, statusMessage) => {
+        classify(statusCode)
+        forward('onResponseStart', [controller, statusCode, headers, statusMessage])
+      },
+      onResponseData: (controller, chunk) => forward('onResponseData', [controller, chunk]),
+      onResponseEnd: (controller, trailers) => forward('onResponseEnd', [controller, trailers]),
+      onResponseError: (controller, error) => {
+        if (!classified) {
+          classified = true
+          pool.recordPassiveTransport(exitId)
+          pool.rerouteSession(session)
+        }
+        forward('onResponseError', [controller, error])
+      },
+      onResponseStarted: () => forward('onResponseStarted', []),
+      onBodySent: (chunk) => forward('onBodySent', [chunk]),
+      onRequestSent: () => forward('onRequestSent', []),
+    }
   }
 
   close(): Promise<void> {

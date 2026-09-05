@@ -80,6 +80,8 @@ function fakeRuntime(overrides: Record<string, unknown> = {}): unknown {
       },
     ],
     has: (id: string) => id === 'http://10.0.0.1:3128',
+    passiveStats: () => ({ ok: 12, limited: 2, refused: 0, dead: 1, transport: 0 }),
+    rerouteSession: () => {},
   }
   return {
     pool,
@@ -112,6 +114,7 @@ test('status view projects the four-state machine, exits, bans and prober progre
   const cooling = view.exits.find((e) => e.id === '1.2.3.4:8080')
   assert.equal(cooling?.cooling, true)
   assert.deepEqual(cooling?.bannedModels, [{ model: 'muse-spark-1.2-contributor-free', state: 'banned', bannedAt: 123 }])
+  assert.deepEqual(cooling?.passive, { ok: 12, limited: 2, refused: 0, dead: 1, transport: 0 })
   assert.deepEqual(view.prober, { queued: 0, inFlight: 1, enqueued: 5, completed: 4 })
   assert.equal(view.refill?.admitted, 2)
   // URL count only — subscription URLs never ride the bridge.
