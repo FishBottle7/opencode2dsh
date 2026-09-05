@@ -57,7 +57,8 @@
   "license": "MIT",
   "dependencies": {
     "@earendil-works/pi-ai": "^0.82.1",
-    "undici": "^8.10.1"
+    "undici": "^8.10.1",
+    "yaml": "^2.9.0"
   },
   "pnpm": {
     "ignoredBuiltDependencies": [

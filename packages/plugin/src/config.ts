@@ -59,6 +59,8 @@ export interface IpPoolConfig {
     /** Admission geo blocklist (country codes). */
     blockedCountries?: string[]
   }
+  /** Airport/Clash subscriptions (docs 1.2 source 3, IP-3). */
+  subscriptions?: string[]
   /** Admission smoke model (docs 4.1 probeModels[0]). */
   probeModels?: string[]
 }

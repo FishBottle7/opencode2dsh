@@ -15,6 +15,7 @@ import type { UndiciSeam } from './pool/dispatcher.ts'
 import type { AdmissionDeps } from './pool/admission.ts'
 import { Prober } from './pool/prober.ts'
 import { RefillScheduler } from './pool/refill.ts'
+import { SubscriptionFetcher } from './pool/subscription-fetcher.ts'
 
 /** Parse one manual proxy string into an exit id + protocol, or null. */
 export function parseManualProxy(
@@ -88,6 +89,8 @@ export interface IpPoolRuntime {
   }
   /** Shared probe scheduler (admission + periodic probes + UI-triggered). */
   prober: Prober
+  /** Subscription layer (null when no URLs configured). */
+  subscriptions: SubscriptionFetcher | null
   dispose(): Promise<void>
 }
 
@@ -138,11 +141,26 @@ export async function startIpPool(
     refill.start()
   }
 
+  // Subscriptions (docs 1.2 source 3, IP-3): pull + parse + trusted smoke;
+  // encrypted nodes park as pending-conversion until the sing-box layer (IP-4).
+  let subscriptions: SubscriptionFetcher | null = null
+  const urls = ipPool.subscriptions ?? []
+  if (urls.length > 0) {
+    subscriptions = new SubscriptionFetcher(
+      { ...admissionDeps, prober },
+      { logger },
+    )
+    subscriptions.setUrls(urls)
+    subscriptions.start()
+  }
+
   return {
     pool,
     installer,
     prober,
+    subscriptions,
     async dispose() {
+      subscriptions?.stop()
       refill?.stop()
       installer.dispose()
     },
