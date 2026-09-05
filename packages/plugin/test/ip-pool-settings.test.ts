@@ -85,7 +85,7 @@ function fakeRuntime(overrides: Record<string, unknown> = {}): unknown {
   }
   return {
     pool,
-    installer: { enabled: true, install() {}, disable() {}, dispose() {} },
+    installer: { enabled: true, deferredReason: null, install() {}, disable() {}, dispose() {} },
     prober: { stats: { queued: 0, inFlight: 1, enqueued: 5, completed: 4 } },
     refill: { lastRound: { admitted: 2, rejected: 30, fetched: 1600, coarsePassed: 8, state: 'warning', at: 456 } },
     subscriptions: {
@@ -121,6 +121,18 @@ test('status view projects the four-state machine, exits, bans and prober progre
   assert.equal(view.subscription?.urlCount, 2)
   assert.equal(view.subscription?.pendingConversion, 2)
   assert.equal('urls' in (view.subscription ?? {}), false)
+})
+
+test('status view reports the R1 deferral when routing is deferred', () => {
+  const rt = fakeRuntime() as never
+  ;(rt as { installer: { enabled: boolean; deferredReason: string | null; install(): void; disable(): void; dispose(): void } }).installer = {
+    enabled: false,
+    deferredReason: 'deferred: global dispatcher is owned by "RetryAgent" — install dsh-llm-proxy or the IP pool in one profile only, not both (R1)',
+    install() {}, disable() {}, dispose() {},
+  }
+  const view = buildStatusView(rt, false, [])
+  assert.equal(view.enabled, false)
+  assert.match(view.deferredReason, /RetryAgent/)
 })
 
 test('status view degrades to a disabled stub without a runtime', () => {

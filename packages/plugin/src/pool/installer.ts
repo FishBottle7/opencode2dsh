@@ -29,11 +29,19 @@ export interface InstallerDeps {
   logger?: { info(message: string): void; warn(message: string): void }
 }
 
+/**
+ * Why the routing layer is not active (docs/ip-pool.md R1, coexistence
+ * policy): another dispatcher-level plugin owns the global dispatcher, so we
+ * deferred instead of short-circuiting it. Null = routing is active.
+ */
+export type DeferredReason = string | null
+
 export class RoutingInstaller {
   #deps: InstallerDeps
   #previous: Dispatcher | null = null
   #current: PoolRoutingDispatcher | null = null
   #enabled = false
+  #deferredReason: DeferredReason = null
 
   constructor(deps: InstallerDeps) {
     this.#deps = deps
@@ -43,15 +51,53 @@ export class RoutingInstaller {
     return this.#enabled
   }
 
+  /** The deferral reason exposed to the status bridge / settings card. */
+  get deferredReason(): DeferredReason {
+    return this.#deferredReason
+  }
+
   /** Live re-apply of the proxied-host list (forwards to the running router). */
   setProxyHosts(hosts?: string[]): void {
     this.#deps.proxyHosts = hosts
     this.#current?.setProxyHosts(hosts)
   }
 
+  /**
+   * Decide whether installing is safe (docs/ip-pool.md R1 coexistence policy).
+   * The global dispatcher slot is single-owner: if another dispatcher-level
+   * plugin (dsh-llm-proxy etc.) already installed its own layer, installing
+   * ours would short-circuit theirs silently. We defer instead — routing
+   * stays off, the pool keeps assembling (exits/probes/settings all live),
+   * and the reason surfaces on the settings card. Default Agent instances
+   * (undici's own) are not treated as a foreign owner.
+   */
+  #detectForeignDispatcher(): DeferredReason | null {
+    let current: unknown
+    try {
+      current = this.#deps.undici.getGlobalDispatcher()
+    } catch {
+      return null
+    }
+    if (current === null || current === undefined) return null
+    const foreign = current as { constructor?: { name?: string } }
+    const name = foreign.constructor?.name ?? ''
+    // undici's own defaults, plain-object stand-ins (tests, hosts that never
+    // installed anything), and anything unnamed are not a foreign plugin.
+    if (name === '' || name === 'Object' || name === 'Agent' || name === 'Dispatcher') return null
+    if (current instanceof (this.#deps.undici.Agent as unknown as { new (): unknown })) return null
+    return `deferred: global dispatcher is owned by "${name}" — install dsh-llm-proxy or the IP pool in one profile only, not both (R1)`
+  }
+
   /** Install (or keep installed) the routing dispatcher. */
   install(): void {
     if (this.#enabled) return
+    const foreign = this.#detectForeignDispatcher()
+    if (foreign !== null) {
+      this.#deferredReason = foreign
+      this.#deps.logger?.warn(`opencode2dsh: exit routing ${foreign}`)
+      return
+    }
+    this.#deferredReason = null
     const router = new PoolRoutingDispatcher({
       pool: this.#deps.pool,
       undici: this.#deps.undici,

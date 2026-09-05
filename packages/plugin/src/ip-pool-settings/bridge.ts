@@ -69,6 +69,9 @@ export interface SubscriptionView {
 
 export interface PoolStatusView {
   enabled: boolean
+  /** Non-empty when the pool runs but the routing layer deferred to another
+   *  dispatcher-level plugin (R1 coexistence policy). */
+  deferredReason: string
   state: PoolState
   total: number
   bySource: Record<ExitSource, number>
@@ -115,6 +118,9 @@ export function buildStatusView(
     : []
   return {
     enabled: runtime !== null && runtime.installer.enabled,
+    deferredReason: runtime !== null && !runtime.installer.enabled
+      ? (runtime.installer as unknown as { deferredReason?: string }).deferredReason ?? ''
+      : '',
     state: snapshot.state,
     total: snapshot.total,
     bySource: snapshot.bySource,

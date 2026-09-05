@@ -49,6 +49,7 @@ export interface IpPoolSettingsValue {
 /** Bridge /status view (mirrors src/ip-pool-settings/bridge.ts). */
 export interface PoolStatusView {
   enabled: boolean
+  deferredReason: string
   state: 'healthy' | 'warning' | 'critical' | 'emergency'
   total: number
   bySource: Record<'free' | 'manual' | 'subscription' | 'goproxy', number>
@@ -293,6 +294,11 @@ function OverviewBar(props: { status: PoolStatusView | null; t: IpPoolCardInject
   return (
     <div className={styles.overviewBar} data-testid="ip-pool-overview">
       <span className={`${styles.badge} ${stateClass[status.state]}`}>{stateLabel[status.state]}</span>
+      {status.deferredReason !== '' && (
+        <span className={`${styles.badge} ${styles.badgeCritical}`}>
+          {t('deferredNotice').replace('{reason}', status.deferredReason)}
+        </span>
+      )}
       <span>{t('poolAvailable').replace('{available}', String(status.availableFree)).replace('{capacity}', String(status.targetSize))}</span>
       <span>
         {t('poolSources')

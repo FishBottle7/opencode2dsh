@@ -99,6 +99,8 @@ export interface IpPoolRuntime {
     disable(): void
     dispose(): void
     readonly enabled: boolean
+    /** R1 coexistence: why the routing layer deferred (null when active). */
+    readonly deferredReason: string | null
   }
   /** Shared probe scheduler (admission + periodic probes + UI-triggered). */
   prober: Prober
@@ -330,9 +332,15 @@ export async function startIpPool(
       probeModels.push(...(next.ipPool?.probeModels ?? []))
       const enable = next.ipPool?.enabled !== false
       applyConfig()
-      // Dispatcher install state follows enabled + pool occupancy.
+      // Dispatcher install state follows enabled + pool occupancy. Every
+      // enable flip re-attempts install: when another dispatcher-level plugin
+      // owned the slot (R1 deferral), its unload is picked up here without a
+      // restart.
       if (enable && !installer.enabled && pool.snapshot().total > 0) {
         installer.install()
+        if (installer.enabled) {
+          logger.info('opencode2dsh: exit routing recovered — global dispatcher is free again (R1)')
+        }
       } else if (!enable && installer.enabled) {
         installer.disable()
       }

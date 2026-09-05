@@ -331,3 +331,35 @@ test('dispatcher passive signal: 403 marks the model, transport errors strike de
   assert.equal(pool.passiveStats('a:1').transport, 1)
   assert.equal(pool.isUsable('a:1', 'other'), false, 'transport failure strikes the exit dead')
 })
+
+// -- R1 coexistence: defer when a foreign dispatcher owns the global slot ------
+
+test('installer defers to a foreign dispatcher and recovers when the slot frees', () => {
+  const pool = new ExitPool()
+  pool.add(node({ id: 'a:1', exitIP: '1.1.1.1' }))
+  pool.markOk('a:1')
+  const warned: string[] = []
+  const logger = { info: () => {}, warn: (m: string) => warned.push(m) }
+  let currentGlobal: unknown = { dispatch: () => true } // a foreign layer
+  const seam = {
+    Agent: realUndici.Agent,
+    ProxyAgent: realUndici.ProxyAgent,
+    setGlobalDispatcher: () => undefined,
+    getGlobalDispatcher: () => currentGlobal,
+  }
+  const installer = new RoutingInstaller({ pool, undici: seam as never, logger })
+
+  // foreign owner: named class -> defer
+  ;(currentGlobal as { constructor: { name: string } }).constructor = class ForeignLayer {}
+  installer.install()
+  assert.equal(installer.enabled, false, 'deferred instead of installing')
+  assert.match(installer.deferredReason ?? '', /ForeignLayer/)
+  assert.ok(warned.some((m) => m.includes('deferred')), 'warn surfaced')
+
+  // slot freed (undici default Agent): install proceeds
+  currentGlobal = new realUndici.Agent()
+  installer.install()
+  assert.equal(installer.enabled, true, 'recovers once the slot is free')
+  assert.equal(installer.deferredReason, null)
+  installer.disable()
+})
