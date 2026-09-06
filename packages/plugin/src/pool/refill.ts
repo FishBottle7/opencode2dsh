@@ -134,11 +134,14 @@ export class RefillScheduler {
     let fetched = 0
     let admitted = 0
     let rejected = 0
-    // Candidate cap: a single source can list thousands of rows, and every
-    // candidate costs up to four admission requests (docs 4.5 — admission
-    // shares the bounded probe concurrency). Shuffle then cap per round.
-    const candidateCap = quota * 3 // surplus headroom for rejects
-    const perSourceCap = 30
+    // Full-scan policy (docs §4.5: "一轮 48k 候选…300 并发几分钟扫完全量"):
+    // the coarse screen is brute-force by design — wild candidates are free,
+    // have no account system, and 98%+ die at the TCP step, so skipping rows
+    // only loses exits. The caps below are defensive against pathological
+    // lists, not a sampling knob; the QUOTA-spending steps (fine screen) stay
+    // bounded by admissionQuota per round.
+    const candidateCap = 20_000
+    const perSourceCap = 5_000
     const candidates: Array<{ address: string; host: string; port: number; protocol: 'http' | 'socks5' }> = []
     const seen = new Set<string>(this.#poolAddresses())
 
@@ -153,8 +156,9 @@ export class RefillScheduler {
         this.#progress.fetched = fetched
         this.#progress.sourcesDone += 1
         this.#progress.candidates = candidates.length
-        // shuffle before capping: free lists are not uniformly distributed
-        // (freshness/quality vary), a random sample beats the head of the list
+        // shuffle before scanning: free lists are not uniformly distributed
+        // (freshness/quality vary) and a later source should not be crowded
+        // out by an earlier one's 5k rows
         const rows = result.addresses.slice()
         for (let i = rows.length - 1; i > 0; i -= 1) {
           const j = Math.floor(Math.random() * (i + 1))
@@ -206,10 +210,14 @@ export class RefillScheduler {
 
     // Fine screen (steps 3-4, anonymous-lane quota): through the Prober
     // queue with the two-level scheduling (serial per exit, bounded
-    // global workers, 4.1).
+    // global workers, 4.1). Survivors are latency-ranked first so the scarce
+    // quota goes to the best exits a full scan surfaced.
     const tasks: ProbeTask[] = []
     let admittedLimited = 0
-    for (const candidate of candidates) {
+    const survivors = candidates
+      .filter((candidate) => facts.has(candidate.address))
+      .sort((left, right) => (facts.get(left.address)?.latencyMs ?? 0) - (facts.get(right.address)?.latencyMs ?? 0))
+    for (const candidate of survivors) {
       const echoFacts = facts.get(candidate.address)
       if (!echoFacts) continue
       // Quota counts usable seats: 429-cooling admits occupy a pool seat but
