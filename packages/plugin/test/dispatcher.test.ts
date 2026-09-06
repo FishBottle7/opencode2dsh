@@ -363,3 +363,53 @@ test('installer defers to a foreign dispatcher and recovers when the slot frees'
   assert.equal(installer.deferredReason, null)
   installer.disable()
 })
+
+// -- response-silence sentinel (docs §4.3; the muse "Connection error" case):
+// undici fires NO handler callback when a proxy CONNECT dies at the
+// connection stage, so the passive signal was blind exactly where a dead
+// exit needed eviction. The sentinel records a transport strike when a
+// dispatched request stays totally mute past its deadline. --------------------
+
+test('dispatcher sentinel: a mute connection records transport and reroutes the session', async () => {
+  const pool = new ExitPool()
+  pool.add(node({ id: 'dead:1', exitIP: '1.1.1.1' }))
+  pool.markOk('dead:1')
+  const mute = {
+    Agent: class { constructor() { return { dispatch: () => true, close: () => Promise.resolve(), destroy: () => Promise.resolve() } } },
+    ProxyAgent: class {
+      constructor() {
+        return {
+          // the blackhole: accepts the dispatch, then fires NOTHING
+          dispatch: (): boolean => true,
+          close: () => Promise.resolve(),
+          destroy: () => Promise.resolve(),
+        }
+      }
+    },
+    setGlobalDispatcher: () => undefined,
+    getGlobalDispatcher: () => ({ dispatch: () => true }),
+  }
+  const router = new PoolRoutingDispatcher({ pool, undici: mute as never, proxyHosts: ['opencode.ai'], sentinelMs: 60 })
+  routingContext.run({ model: 'm', session: 's' }, () => {
+    router.dispatch({ origin: 'https://opencode.ai/x' } as never, {} as never)
+  })
+  // immediately after: no verdict yet, exit still usable
+  assert.equal(pool.isUsable('dead:1', 'm'), true, 'before the deadline nothing is recorded')
+  await new Promise((r) => setTimeout(r, 140))
+  assert.deepEqual(pool.passiveStats('dead:1'), { ok: 0, limited: 0, refused: 0, dead: 0, transport: 1 }, 'mute dispatch recorded as transport')
+  assert.equal(pool.isUsable('dead:1', 'm'), false, 'dead strike landed')
+})
+
+test('dispatcher sentinel: any handler callback disarms it (a live exit is never falsely struck)', async () => {
+  const pool = new ExitPool()
+  pool.add(node({ id: 'live:1', exitIP: '1.1.1.1' }))
+  pool.markOk('live:1')
+  const answering = respondingSeam(() => 200)
+  const router = new PoolRoutingDispatcher({ pool, undici: answering.seam as never, proxyHosts: ['opencode.ai'], sentinelMs: 60 })
+  routingContext.run({ model: 'm', session: 's' }, () => {
+    router.dispatch({ origin: 'https://opencode.ai/x' } as never, {} as never)
+  })
+  await new Promise((r) => setTimeout(r, 140))
+  assert.deepEqual(pool.passiveStats('live:1'), { ok: 1, limited: 0, refused: 0, dead: 0, transport: 0 }, 'answered request classified ok, sentinel disarmed')
+  assert.equal(pool.isUsable('live:1', 'm'), true)
+})

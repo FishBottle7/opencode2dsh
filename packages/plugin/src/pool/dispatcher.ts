@@ -47,6 +47,8 @@ export interface PoolRoutingOptions {
   proxyHosts?: string[]
   /** Per-exit ProxyAgent cache LRU cap (connection setup is lazy). */
   agentLruCap?: number
+  /** Response-silence sentinel (docs §4.3; default 12s, test-injectable). */
+  sentinelMs?: number
   /** Log sink for routing decisions (diagnostics). */
   logger?: { warn(message: string): void }
 }
@@ -95,6 +97,7 @@ export class PoolRoutingDispatcher implements RoutingDispatcherSurface {
   #undici: UndiciSeam
   #proxyHosts: Set<string>
   #agentLruCap: number
+  #sentinelMs: number
   #logger?: { warn(message: string): void }
   /** Direct path for non-pool hosts and loopback. */
   #direct: Dispatcher
@@ -110,6 +113,7 @@ export class PoolRoutingDispatcher implements RoutingDispatcherSurface {
       (options.proxyHosts ?? DEFAULT_PROXY_HOSTS).map((host) => normalizeHost(host)),
     )
     this.#agentLruCap = options.agentLruCap ?? 16
+    this.#sentinelMs = options.sentinelMs ?? 12_000
     this.#logger = options.logger
     this.#direct = new options.undici.Agent()
   }
@@ -203,6 +207,17 @@ export class PoolRoutingDispatcher implements RoutingDispatcherSurface {
    * them with the wrong `this`. The wrapper is a fresh plain object that
    * forwards every DispatchHandler callback to the original with the
    * original as `this` — the same shape undici's own wrappers use.
+   *
+   * Response-silence sentinel: undici's Pool fires NONE of the handler
+   * callbacks (not even onResponseError) when a proxy CONNECT fails at the
+   * connection stage — the failure surfaces only as a fetch rejection (and
+   * an APIConnectionError/"Connection error." upstream). Without a fallback
+   * the passive signal is blind exactly when a dead exit needs to be evicted
+   * (live repro: 10.255.255.1:9999 blackhole, seen:[] callbacks). So the
+   * wrapper arms a timer at dispatch time; any handler callback disarms it,
+   * and silence past the deadline counts as a transport failure (dead strike
+   * + session reroute). The sentinel never aborts the request itself — fetch
+   * and pi-ai own their own timeouts.
    */
   #observe(exitId: string, model: string, session: string, handler: Dispatcher.DispatchHandler): Dispatcher.DispatchHandler {
     const pool = this.#pool
@@ -218,24 +233,49 @@ export class PoolRoutingDispatcher implements RoutingDispatcherSurface {
       // A degraded sticky exit must not keep the session pinned to it.
       if (verdict !== 'ok') pool.rerouteSession(session)
     }
+    const classifyTransport = (): void => {
+      if (classified) return
+      classified = true
+      pool.recordPassiveTransport(exitId)
+      pool.rerouteSession(session)
+    }
+    // Silence deadline: no handler callback within this window = the exit's
+    // connection stage failed (dead proxy). Measured against undici 8.10: a
+    // dead CONNECT fires NO handler callback at all (onRequestStart maps to
+    // the established-connection event, so a live-but-slow LLM response NEVER
+    // trips this — the sentinel disarms the moment the tunnel stands), and
+    // undici's own connect timeout is 10s; 12s lets the genuine failure land
+    // first and only a totally mute connection gets recorded.
+    const sentinel = setTimeout(classifyTransport, this.#sentinelMs)
+    sentinel.unref?.()
+    const disarm = (): void => {
+      clearTimeout(sentinel)
+    }
     return {
-      onRequestStart: (controller, context) => forward('onRequestStart', [controller, context]),
-      onRequestUpgrade: (controller, statusCode, headers, socket) => forward('onRequestUpgrade', [controller, statusCode, headers, socket]),
+      onRequestStart: (controller, context) => {
+        disarm()
+        forward('onRequestStart', [controller, context])
+      },
+      onRequestUpgrade: (controller, statusCode, headers, socket) => {
+        disarm()
+        forward('onRequestUpgrade', [controller, statusCode, headers, socket])
+      },
       onResponseStart: (controller, statusCode, headers, statusMessage) => {
+        disarm()
         classify(statusCode)
         forward('onResponseStart', [controller, statusCode, headers, statusMessage])
       },
       onResponseData: (controller, chunk) => forward('onResponseData', [controller, chunk]),
       onResponseEnd: (controller, trailers) => forward('onResponseEnd', [controller, trailers]),
       onResponseError: (controller, error) => {
-        if (!classified) {
-          classified = true
-          pool.recordPassiveTransport(exitId)
-          pool.rerouteSession(session)
-        }
+        disarm()
+        classifyTransport()
         forward('onResponseError', [controller, error])
       },
-      onResponseStarted: () => forward('onResponseStarted', []),
+      onResponseStarted: () => {
+        disarm()
+        forward('onResponseStarted', [])
+      },
       onBodySent: (chunk) => forward('onBodySent', [chunk]),
       onRequestSent: () => forward('onRequestSent', []),
     }
