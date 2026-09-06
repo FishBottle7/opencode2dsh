@@ -79,7 +79,7 @@ export function applyIpPoolSettings(
   ctx: PluginContext,
   config: Opencode2dshConfig,
   logger: PluginContext['logger'],
-  deps: { assemble?: AssembleIpPool } = {},
+  deps: { assemble?: AssembleIpPool; listLiveModels?: () => string[] } = {},
 ): IpPoolController {
   const assemble = deps.assemble ?? defaultAssemble
   const controller: IpPoolController = {
@@ -152,6 +152,11 @@ export function applyIpPoolSettings(
             ? controller.settings().proxyHosts
             : ['opencode.ai'],
         }),
+        {
+          // Probe-model dropdown rows: the plugin's live Zen catalog when one
+          // is running (adapter mode), static S3 list only otherwise.
+          listLiveModels: deps.listLiveModels,
+        },
       )
       const disposers: Array<() => void> = []
       for (const route of makeBridgeRoutes(handlers)) {

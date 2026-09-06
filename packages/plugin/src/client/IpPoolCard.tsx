@@ -304,6 +304,69 @@ function StringList(props: {
   )
 }
 
+/**
+ * Probe-model multi-select over the bridge /models rows: selected models as
+ * removable chips above a dropdown of S3-verified + live-catalog options
+ * (docs §5.2 探活模型). Empty selection = the S3-first default (big-pickle).
+ */
+function ModelPicker(props: {
+  value: string[]
+  hint: string
+  models: Array<{ id: string; verified: boolean }>
+  loading: boolean
+  t: IpPoolCardInjected['t']
+  onChange: (next: string[]) => void
+}): ReactNode {
+  const { value, hint, models, loading, t, onChange } = props
+  const toggle = (id: string): void => {
+    onChange(value.includes(id) ? value.filter((entry) => entry !== id) : [...value, id])
+  }
+  const options = models.filter((row) => !value.includes(row.id))
+  return (
+    <div className={styles.field} data-testid="field-probeModels">
+      <span className={styles.fieldLabel}>{t('probeModels')}</span>
+      <span className={styles.fieldHint}>{hint}</span>
+      {value.length > 0 && (
+        <ul className={styles.rowList}>
+          {value.map((id) => {
+            const row = models.find((m) => m.id === id)
+            return (
+              <li key={id} className={styles.row}>
+                <span className={styles.rowLabel}>
+                  {id}{row?.verified === false ? ` · ${t('probeModelUnverified')}` : ''}
+                </span>
+                <button type="button" className={styles.rowRemove} aria-label="remove" onClick={() => toggle(id)}>✕</button>
+              </li>
+            )
+          })}
+        </ul>
+      )}
+      <div className={styles.row}>
+        <select
+          className={styles.select}
+          data-testid="probe-model-select"
+          value=""
+          disabled={options.length === 0}
+          onChange={(event) => {
+            const id = event.target.value
+            if (id !== '') toggle(id)
+            // native select re-shows the list while focused; value stays ''
+            // so the placeholder keeps prompting for the next pick
+          }}
+        >
+          <option value="">{loading ? t('statusLoading') : options.length === 0 ? '—' : t('probeModelPick')}</option>
+          {options.map((row) => (
+            <option key={row.id} value={row.id}>{row.id}{row.verified === false ? ` · ${t('probeModelUnverified')}` : ''}</option>
+          ))}
+        </select>
+      </div>
+      {value.length === 0 && (
+        <span className={styles.fieldHint}>{t('probeModelsDefault')}</span>
+      )}
+    </div>
+  )
+}
+
 /** Pool overview strip: four-state badge + counts + pinned badge. */
 function OverviewBar(props: { status: PoolStatusView | null; t: IpPoolCardInjected['t'] }): ReactNode {
   const { status, t } = props
@@ -442,6 +505,8 @@ function CardBody(props: Required<IpPoolCardInjected>): ReactNode {
   const [error, setError] = useState<string | null>(null)
   const [status, setStatus] = useState<PoolStatusView | null>(null)
   const [statusError, setStatusError] = useState<string | null>(null)
+  const [probeModelRows, setProbeModelRows] = useState<Array<{ id: string; verified: boolean }>>([])
+  const [probeModelsLoading, setProbeModelsLoading] = useState(false)
   const [actionBusy, setActionBusy] = useState(false)
   const hydratedRef = useRef(false)
   const formRef = useRef(form)
@@ -454,6 +519,21 @@ function CardBody(props: Required<IpPoolCardInjected>): ReactNode {
       setForm(formFromValue(snapshot.value))
     }
   }, [snapshot.status, snapshot.value])
+
+  // Fetch the probe-model options from the bridge once the body shows
+  // (static S3 list first; live catalog rows merge in as they warm up).
+  useEffect(() => {
+    let cancelled = false
+    setProbeModelsLoading(true)
+    fetch(`${BRIDGE_PREFIX}/models`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
+      .then((response) => response.json() as Promise<{ ok: boolean; value?: { models: Array<{ id: string; verified: boolean }> } }>)
+      .then((body) => {
+        if (!cancelled && body.ok && body.value) setProbeModelRows(body.value.models)
+      })
+      .catch(() => {})
+      .finally(() => { if (!cancelled) setProbeModelsLoading(false) })
+    return () => { cancelled = true }
+  }, [])
 
   // Poll the bridge /status: 1s while probing or refilling, 3s otherwise (docs §5.3).
   const probing = status !== null && status.prober.queued + status.prober.inFlight > 0
@@ -772,12 +852,12 @@ function CardBody(props: Required<IpPoolCardInjected>): ReactNode {
 
       <div className={styles.section}>
         <span className={styles.sectionTitle}>{t('sectionProbe')}</span>
-        <StringList
-          label={t('probeModels')}
+        <ModelPicker
+          value={form.probeModels}
           hint={t('probeModelsHint')}
-          values={form.probeModels}
-          placeholder="big-pickle"
-          testId="field-probeModels"
+          models={probeModelRows}
+          loading={probeModelsLoading}
+          t={t}
           onChange={(next) => { setSaved(false); setForm({ ...form, probeModels: next }) }}
         />
         <TextField

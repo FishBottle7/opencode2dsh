@@ -200,7 +200,7 @@ test('routes carry the exact paths and POST-only method guard', async () => {
   const routes = makeBridgeRoutes(handlers, { guard: () => true }) as unknown as Array<{ kind: string; path: string; handler: (req: unknown, res: unknown) => Promise<void> }>
   assert.deepEqual(
     routes.map((r) => r.path),
-    [`${IP_POOL_BRIDGE_PREFIX}/status`, `${IP_POOL_BRIDGE_PREFIX}/probe`],
+    [`${IP_POOL_BRIDGE_PREFIX}/status`, `${IP_POOL_BRIDGE_PREFIX}/models`, `${IP_POOL_BRIDGE_PREFIX}/probe`],
   )
   assert.ok(routes.every((r) => r.kind === 'exact'))
 
@@ -220,10 +220,44 @@ test('routes carry the exact paths and POST-only method guard', async () => {
   assert.equal((written.body as { ok: boolean }).ok, true)
 
   // probe with unreadable body -> 400 envelope, never a thrown route
+  // (routes[2]: pick by path — the route order is part of what this test pins,
+  //  but the probe handler itself must be found by name)
+  const probeRoute = routes.find((r) => r.path === `${IP_POOL_BRIDGE_PREFIX}/probe`)!
   written = {}
-  await routes[1]!.handler({ method: 'POST', headers: { host: '127.0.0.1:3928' } }, res)
+  await probeRoute.handler({ method: 'POST', headers: { host: '127.0.0.1:3928' } }, res)
   assert.equal(written.status, 400)
   assert.equal((written.body as { code: string }).code, 'settings-rejected')
+})
+
+test('models handler lists S3 static rows plus live catalog through the seam', async () => {
+  const handlers = makeBridgeHandlers(() => null, () => ({ pinnedStrict: false, proxyHosts: [] }), {
+    listLiveModels: () => ['muse-spark-1.3-contributor-free', 'big-pickle', 'brand-new-model'],
+  })
+  const result = await handlers.models()
+  assert.equal(result.ok, true)
+  const value = (result as { value: { models: Array<{ id: string; verified: boolean }> } }).value
+  // S3 static list first, all marked verified
+  assert.deepEqual(value.models.slice(0, 6).map((row) => row.verified), [true, true, true, true, true, true])
+  // big-pickle deduped (already static), live-only rows appended unverified
+  const ids = value.models.map((row) => row.id)
+  assert.equal(ids.indexOf('muse-spark-1.3-contributor-free') > 5, true, 'live-only row appended after statics')
+  assert.equal(ids.lastIndexOf('big-pickle'), ids.indexOf('big-pickle'), 'no duplicate big-pickle')
+  assert.equal(value.models.find((row) => row.id === 'brand-new-model')?.verified, false)
+})
+
+test('models handler falls back to the static list without a live seam', async () => {
+  const handlers = makeBridgeHandlers(() => null, () => ({ pinnedStrict: false, proxyHosts: [] }))
+  const result = await handlers.models()
+  assert.equal(result.ok, true)
+  const value = (result as { value: { models: Array<{ id: string; verified: boolean }> } }).value
+  assert.ok(value.models.length >= 6)
+  assert.equal(value.models[0]!.id, 'big-pickle')
+})
+
+test('bridge routes include /models', () => {
+  const handlers = makeBridgeHandlers(() => null, () => ({ pinnedStrict: false, proxyHosts: [] }))
+  const routes = makeBridgeRoutes(handlers, { guard: () => true }) as Array<{ path: string }>
+  assert.ok(routes.some((r) => r.path === `${IP_POOL_BRIDGE_PREFIX}/models`))
 })
 
 test('guard-rejected requests get 403 and never reach the handler', async () => {

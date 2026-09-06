@@ -248,12 +248,20 @@ export type BridgeResult = { ok: true; value: unknown } | { ok: false; code: str
 export interface BridgeHandlers {
   status(): Promise<BridgeResult>
   probe(body: { scope?: unknown; exitId?: unknown }): Promise<BridgeResult>
+  /** Selectable probe models (docs §5.2 探活模型 dropdown): S3 static list
+   *  first, then the live Zen catalog entries the runtime resolved. */
+  models(): Promise<BridgeResult>
 }
+
+/** Live-catalog seam for the models() dropdown rows (index.ts injects the
+ *  plugin's ModelCatalog when one is running; undefined = static list only). */
+export type ListLiveModels = () => string[]
 
 /** Build the bridge handlers over the runtime + current settings. */
 export function makeBridgeHandlers(
   runtime: () => IpPoolRuntime | null,
   settings: () => { pinnedStrict: boolean; proxyHosts: string[] },
+  deps: { listLiveModels?: ListLiveModels } = {},
 ): BridgeHandlers {
   return {
     async status() {
@@ -281,6 +289,17 @@ export function makeBridgeHandlers(
         return { ok: true, value: { queued: count } }
       }
       return { ok: false, code: 'settings-rejected', message: "probe scope must be 'all', 'exit' or 'refill'" }
+    },
+    async models() {
+      const { staticFreeModels } = await import('../adapter/catalog.ts')
+      const rows: Array<{ id: string; verified: boolean }> = staticFreeModels.map((id) => ({ id, verified: true }))
+      const seen = new Set(staticFreeModels)
+      for (const id of deps.listLiveModels?.() ?? []) {
+        if (typeof id !== 'string' || id === '' || seen.has(id)) continue
+        seen.add(id)
+        rows.push({ id, verified: false })
+      }
+      return { ok: true, value: { models: rows } }
     },
   }
 }
@@ -320,6 +339,15 @@ export function makeBridgeRoutes(
       handler: async (req, res) => {
         if (!check(req as never, res as never)) return
         const result = await handlers.status()
+        writeJson(res as never, 200, result)
+      },
+    },
+    {
+      kind: 'exact',
+      path: `${IP_POOL_BRIDGE_PREFIX}/models`,
+      handler: async (req, res) => {
+        if (!check(req as never, res as never)) return
+        const result = await handlers.models()
         writeJson(res as never, 200, result)
       },
     },

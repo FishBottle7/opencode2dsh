@@ -78,8 +78,6 @@ function applyAdapter(ctx: PluginContext, config: Opencode2dshConfig): { ready: 
   // cordis.patch.yml; disabled keeps the process byte-for-byte on direct.
   // Lifecycle (assembly on first enable, live reconfigure, dispose) is owned
   // by applyIpPoolSettings through the plugin fiber.
-  applyIpPoolSettings(ctx, config, logger)
-
   const dataDir = join(homedir(), '.opencode2dsh')
   const statusPath = join(dataDir, 'adapter-status.json')
   const writeStatus = (status: CatalogSnapshot, lastError: string): void => {
@@ -99,6 +97,16 @@ function applyAdapter(ctx: PluginContext, config: Opencode2dshConfig): { ready: 
     },
   })
   const adapter = new ZenAdapter(catalog)
+
+  // IP-pool exit routing (docs/ip-pool.md IP-1..IP-5): manual proxies,
+  // pinned, free sources, subscriptions, and (IP-5) the settings namespace
+  // with live apply + the /status /models /probe bridge. Opt-in via settings
+  // page or cordis.patch.yml; disabled keeps the process byte-for-byte on
+  // direct. Lifecycle (assembly on first enable, live reconfigure, dispose) is
+  // owned by applyIpPoolSettings through the plugin fiber. The probe-model
+  // dropdown rows include the live catalog, so this must run after the
+  // catalog instance exists.
+  applyIpPoolSettings(ctx, config, logger, { listLiveModels: () => catalog.list() })
 
   // Register immediately: the provider must appear in the selector right
   // away, even while the catalog is still warming up (listModels is read
