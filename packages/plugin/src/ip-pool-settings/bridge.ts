@@ -56,7 +56,7 @@ export interface RefillView {
   state: string
   at: number
   /** Live in-flight round progress (docs §5.3, 立即补充 feedback). */
-  progress: { running: boolean; stage: 'fetch' | 'coarse' | 'admit' | 'idle'; fetched: number; candidates: number; coarsePassed: number; coarseDone: number; admissions: number; admitted: number }
+  progress: { running: boolean; stage: 'fetch' | 'coarse' | 'admit' | 'idle'; sourcesDone: number; sourcesTotal: number; fetched: number; candidates: number; coarsePassed: number; coarseDone: number; admissions: number; admitted: number }
 }
 
 export interface SubscriptionView {

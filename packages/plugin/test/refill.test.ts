@@ -310,6 +310,8 @@ test('refill progress runs the fetch→coarse→admit stages and settles idle wi
   const final = progress()
   assert.equal(final.running, false, 'settled after the round')
   assert.equal(final.stage, 'idle')
+  assert.ok(final.sourcesTotal > 0, 'source denominator seeded')
+  assert.equal(final.sourcesDone, final.sourcesTotal, 'every source answered (ok or failed)')
   assert.ok(final.fetched > 0, 'fetched counter ran')
   assert.ok(final.candidates > 0, 'candidate counter ran')
   assert.ok(final.coarseDone > 0, 'coarse screens completed')

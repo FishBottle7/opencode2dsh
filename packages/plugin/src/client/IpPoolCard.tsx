@@ -76,7 +76,7 @@ export interface PoolStatusView {
   prober: { queued: number; inFlight: number; enqueued: number; completed: number }
   refill: {
     admitted: number; rejected: number; fetched: number; coarsePassed: number; state: string; at: number
-    progress: { running: boolean; stage: 'fetch' | 'coarse' | 'admit' | 'idle'; fetched: number; candidates: number; coarsePassed: number; coarseDone: number; admissions: number; admitted: number }
+    progress: { running: boolean; stage: 'fetch' | 'coarse' | 'admit' | 'idle'; sourcesDone: number; sourcesTotal: number; fetched: number; candidates: number; coarsePassed: number; coarseDone: number; admissions: number; admitted: number }
   } | null
   subscription: { urlCount: number; pendingConversion: number; convertedAdmitted: number; plaintextAdmitted: number; lastFetch: number; lastError: string } | null
   at: number
@@ -203,7 +203,11 @@ function refillProgressLine(
     idle: t('refillStageIdle'),
   }
   const parts = [stageText[progress.stage]]
-  if (progress.stage === 'fetch') parts.push(t('refillCountFetched').replace('{n}', String(progress.fetched)))
+  if (progress.stage === 'fetch') {
+    const sources = t('refillCountSources').replace('{done}', String(progress.sourcesDone)).replace('{total}', String(progress.sourcesTotal))
+    const rows = t('refillCountFetched').replace('{n}', String(progress.fetched))
+    parts.push(sources + ' · ' + rows)
+  }
   if (progress.stage === 'coarse') {
     parts.push(t('refillCountCoarse').replace('{done}', String(progress.coarseDone)).replace('{total}', String(progress.candidates)).replace('{passed}', String(progress.coarsePassed)))
   }

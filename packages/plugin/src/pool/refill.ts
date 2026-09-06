@@ -40,6 +40,10 @@ export interface RefillProgress {
   running: boolean
   /** Current phase: fetching sources / coarse screening / admitting / idle. */
   stage: 'fetch' | 'coarse' | 'admit' | 'idle'
+  /** Source lists answered so far this round (ok or failed). */
+  sourcesDone: number
+  /** Source lists this round is trying (state-tier + breaker filtered). */
+  sourcesTotal: number
   /** Raw rows pulled from the source lists so far this round. */
   fetched: number
   /** Candidates collected for screening (after per-source caps + dedupe). */
@@ -67,8 +71,8 @@ export class RefillScheduler {
   #stopped = false
   #lastRound = { admitted: 0, rejected: 0, fetched: 0, coarsePassed: 0, state: 'healthy' as string, at: 0 }
   /** Live progress of the in-flight round (settings page 立即补充 feedback). */
-  #progress: { running: boolean; stage: 'fetch' | 'coarse' | 'admit' | 'idle'; fetched: number; candidates: number; coarsePassed: number; coarseDone: number; admissions: number; admitted: number } = {
-    running: false, stage: 'idle', fetched: 0, candidates: 0, coarsePassed: 0, coarseDone: 0, admissions: 0, admitted: 0,
+  #progress: { running: boolean; stage: 'fetch' | 'coarse' | 'admit' | 'idle'; sourcesDone: number; sourcesTotal: number; fetched: number; candidates: number; coarsePassed: number; coarseDone: number; admissions: number; admitted: number } = {
+    running: false, stage: 'idle', sourcesDone: 0, sourcesTotal: 0, fetched: 0, candidates: 0, coarsePassed: 0, coarseDone: 0, admissions: 0, admitted: 0,
   }
 
   constructor(pool: ExitPool, deps: RefillDeps, options: RefillOptions = {}) {
@@ -119,14 +123,14 @@ export class RefillScheduler {
     const quota = Math.min(this.#pool.admissionQuota(), this.#maxPerRound)
     this.#lastRound = { ...this.#lastRound, state, at: Date.now() }
     if (state === 'healthy' || quota <= 0) {
-      this.#progress = { running: false, stage: 'idle', fetched: 0, candidates: 0, coarsePassed: 0, coarseDone: 0, admissions: 0, admitted: 0 }
+      this.#progress = { running: false, stage: 'idle', sourcesDone: 0, sourcesTotal: 0, fetched: 0, candidates: 0, coarsePassed: 0, coarseDone: 0, admissions: 0, admitted: 0 }
       return
     }
 
-    // live progress: fetch stage begins
-    this.#progress = { running: true, stage: 'fetch', fetched: 0, candidates: 0, coarsePassed: 0, coarseDone: 0, admissions: 0, admitted: 0 }
     // emergency ignores the source breaker (docs 3.5); refill honors it.
     const sources = selectSources(state).filter((source) => state === 'emergency' || this.#breaker.canUse(source.url))
+    // live progress: fetch stage begins (sourcesTotal seeds the denominator)
+    this.#progress = { running: true, stage: 'fetch', sourcesDone: 0, sourcesTotal: sources.length, fetched: 0, candidates: 0, coarsePassed: 0, coarseDone: 0, admissions: 0, admitted: 0 }
     let fetched = 0
     let admitted = 0
     let rejected = 0
@@ -147,6 +151,7 @@ export class RefillScheduler {
         this.#breaker.recordSuccess(source.url)
         fetched += result.addresses.length
         this.#progress.fetched = fetched
+        this.#progress.sourcesDone += 1
         this.#progress.candidates = candidates.length
         // shuffle before capping: free lists are not uniformly distributed
         // (freshness/quality vary), a random sample beats the head of the list
@@ -169,6 +174,7 @@ export class RefillScheduler {
         this.#progress.candidates = candidates.length
       } catch {
         this.#breaker.recordFailure(source.url)
+        this.#progress.sourcesDone += 1
       }
     }
 
