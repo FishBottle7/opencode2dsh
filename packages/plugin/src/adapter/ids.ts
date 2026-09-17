@@ -61,16 +61,9 @@ export function deriveRequestIDs(messages: Array<{ role: string; content: unknow
   }
 }
 
-/**
- * CLI-identical user agent. The Zen gateway validates this value strictly:
- * it must be the bare `opencode/<current-version>` string with no suffix.
- * Parenthesized runtime details or stale versions get
- * `403 FreeTierError: free tier can only be used from within OpenCode`.
- * Bump OPENCODE_CLI_VERSION alongside CLI releases (installed CLI: 1.18.31).
- */
-const OPENCODE_CLI_VERSION = '1.18.31'
+/** CLI-identical user agent (ids.go opencodeUserAgent, node runtime values). */
 export function opencodeUserAgent(): string {
-  return `opencode/${OPENCODE_CLI_VERSION}`
+  return `opencode/1.18.21 (${process.platform} ${process.arch}; node${process.versions.node})`
 }
 
 /**
