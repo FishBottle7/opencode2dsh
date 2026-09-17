@@ -81,6 +81,8 @@ Defaults work out of the box. Override via the profile's `cordis.patch.yml`:
 | `mode` | `adapter` | `adapter`: native LlmAdapter streaming straight from Zen. `sidecar`: legacy local-agent mode, not bundled — build the agent from `legacy/agent` and pass `agentPath`. |
 | `providerId` | `opencode2dsh` | Provider name shown in DSH. |
 | `refreshSeconds` | `300` | Live catalog refresh interval. Pricing metadata refreshes every 24 h. |
+| `gatewaySession` | — | A live CLI session id sent as `x-opencode-session` (Zen only serves known sessions). Takes precedence over `gatewaySessionFile`. |
+| `gatewaySessionFile` | — | File holding the session id, re-read every turn so an external helper can rotate it without a restart. |
 | `agentPath` | auto-resolved | Sidecar only: path to the agent binary. |
 | `agentArgs` | — | Sidecar only: extra CLI args for the agent. |
 | `restartDelayMs` / `restartMaxDelayMs` / `maxConsecutiveCrashes` | `1000` / `60000` / `5` | Sidecar only: restart backoff and circuit breaker. |
@@ -92,11 +94,12 @@ DSH session
    │  harness chunks (block-start / text-delta / usage / finish …)
    ▼
 ZenAdapter (registered LlmAdapter)
-   │  pi-ai openai-completions stream
+   │  pi-ai openai-completions stream (chat models)
+   │  pi-ai openai-responses stream (`muse-spark-*`, Responses-only)
    ▼
 https://opencode.ai/zen/v1        ← Authorization: Bearer public
    with CLI-identical headers:
-     user-agent: opencode/…
+     user-agent: opencode/… (CLI-identical, runtime values)
      x-opencode-client, x-opencode-session, x-session-affinity,
      X-Session-Id, x-opencode-request, x-opencode-project
 ```
