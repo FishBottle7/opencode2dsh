@@ -8,7 +8,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { IconChevronDownOutline14 } from '@deepseek-ai/dsh-client-ui-primitives'
+import * as primitives from '@deepseek-ai/dsh-client-ui-primitives'
 import type { InjectFace, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 // Type-only: pulls the ui-settings-plugins SlotMap merge (the
 // 'settings.plugin.item' keyed entry the configurable tab declares at runtime).
@@ -16,6 +16,33 @@ import type {} from '@deepseek-ai/dsh-client-ui-settings-plugins/client'
 import type { SettingsScope, SettingsScopeSnapshot } from '@deepseek-ai/dsh-client-runtime/client'
 import type { en } from './locales.ts'
 import styles from './ip-pool.module.css'
+
+/**
+ * The disclosure chevron, resolved across host releases.
+ *
+ * The platform seed table publishes the icon set, but that export was renamed:
+ * the 0.1.2–0.1.5 line ships `IconChevronDownOutline14`, while 0.1.6+ ships the
+ * unsuffixed name plus the artwork/regular/medium triple. Importing a single
+ * name yields `undefined` on the other host, and React throws #130 ("Element
+ * type is invalid ... but got: undefined") on an undefined element type — which
+ * takes the WHOLE card down, not just the chevron. Resolve whichever this host
+ * publishes, newest first, and draw an inline glyph so an unknown host still
+ * shows the disclosure.
+ */
+const HostChevronDown = (
+  (primitives as Record<string, unknown>).IconChevronDownOutline
+  ?? (primitives as Record<string, unknown>).IconChevronDownOutlineRegular
+  ?? (primitives as Record<string, unknown>).IconChevronDownOutlineArtwork
+  ?? (primitives as Record<string, unknown>).IconChevronDownOutlineMedium
+  ?? (primitives as Record<string, unknown>).IconChevronDownOutline14
+  ?? null
+) as ((props: { className?: string }) => ReactNode) | null
+
+/** {@link HostChevronDown} with a text fallback for hosts that publish none. */
+function ChevronDown({ className }: { className?: string }): ReactNode {
+  if (HostChevronDown === null) return <span aria-hidden="true" className={className}>⌄</span>
+  return <HostChevronDown className={className} />
+}
 
 /** Injected dependencies of the card (slot `inject`). */
 export interface IpPoolCardInjected {
@@ -943,7 +970,7 @@ export function IpPoolCard(props: IpPoolCardProps): ReactNode {
           <span className={styles.name}>{t('title')}</span>
           <span className={styles.description}>{t('description')}</span>
         </span>
-        <IconChevronDownOutline14 className={styles.chevron + (open ? ` ${styles.chevronOpen}` : '')} />
+        <ChevronDown className={styles.chevron + (open ? ` ${styles.chevronOpen}` : '')} />
       </button>
       {open && <CardBody scope={scope} useSnapshot={useSnapshot} t={t} />}
     </li>

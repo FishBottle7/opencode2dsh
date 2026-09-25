@@ -54,3 +54,31 @@ test('client manifest is declared in package.json', () => {
   assert.deepEqual(pkg.dsh.client.inject, ['slots', 'locale', 'settingsScope'])
   assert.deepEqual(pkg.exports?.['./client'], './lib/client.js')
 })
+
+/**
+ * Regression: the chevron was imported as a single named binding
+ * (`IconChevronDownOutline14`). That export only exists on the 0.1.2–0.1.5
+ * line; 0.1.6+ renamed it (unsuffixed + artwork/regular/medium), so the binding
+ * is `undefined` there and React throws #130 — which kills the WHOLE card, not
+ * just the chevron. The bundle must carry a cross-release fallback chain.
+ */
+test('chevron icon resolves across host releases, never a single binding', () => {
+  const path = new URL('../lib/client.js', import.meta.url)
+  assert.ok(existsSync(path), 'lib/client.js missing — run `pnpm build:client` first')
+  const source = readFileSync(path, 'utf8')
+  for (const name of [
+    'IconChevronDownOutline',
+    'IconChevronDownOutlineRegular',
+    'IconChevronDownOutlineArtwork',
+    'IconChevronDownOutlineMedium',
+    'IconChevronDownOutline14',
+  ]) {
+    assert.ok(source.includes(name), `fallback chain must try ${name}`)
+  }
+  // The primitives must be reached as a namespace so a missing export reads as
+  // `undefined` and falls through, instead of failing at import time.
+  assert.ok(
+    /require\("@deepseek-ai\/dsh-client-ui-primitives"\)/.test(source),
+    'primitives imported as a namespace for fallback probing',
+  )
+})
