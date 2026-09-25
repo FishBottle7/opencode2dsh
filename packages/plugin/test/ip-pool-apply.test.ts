@@ -75,6 +75,32 @@ function fakeCtx(seam: unknown): PluginContext {
   }
 }
 
+/**
+ * Context for a host WITHOUT `settings.register` (DSH >= 0.1.7, where the
+ * section is the entry's own `Config` field) that also records every bridge
+ * route the plugin registers through `inject(['webServer'])`.
+ */
+function fakeNoRegisterCtx(): { ctx: PluginContext; routes: string[] } {
+  const routes: string[] = []
+  const ctx = {
+    logger: { info() {}, warn() {}, error() {} },
+    // Deliberately no `register` — this is the >= 0.1.7 seam.
+    settings: { get: () => ({}), mutate: async () => {} },
+    inject: (services: string[], callback: (bctx: unknown) => unknown) => {
+      assert.deepEqual(services, ['webServer'])
+      return callback({
+        webServer: {
+          register(route: { path?: string }) {
+            routes.push(String(route?.path))
+            return () => {}
+          },
+        },
+      })
+    },
+  }
+  return { ctx: ctx as unknown as PluginContext, routes }
+}
+
 test('disabled at boot: namespace registers, no runtime assembled', async () => {
   resetCalls()
   const { seam } = makeFakeSeam()
@@ -134,4 +160,47 @@ test('subscription urls from the settings shape flow into the config assembly', 
   assert.equal(starts.length, 1)
   const passed = starts[0]!.config as { ipPool?: { subscriptions?: string[] } }
   assert.deepEqual(passed.ipPool?.subscriptions, ['https://x/y'])
+})
+
+/**
+ * Regression: the bridge used to be mounted only on the `settings.register`
+ * path, below an early `return` taken when the seam lacks `register`. On DSH
+ * >= 0.1.7 that early return is the normal path, so no route was ever
+ * registered and every settings-card read answered `404 not found` (rendered as
+ * "状态获取失败" / "status fetch failed") even though the plugin was live.
+ */
+test('no-register host (>= 0.1.7) still mounts the ip-pool bridge', async () => {
+  resetCalls()
+  const { ctx, routes } = fakeNoRegisterCtx()
+  applyIpPoolSettings(ctx, {}, ctx.logger, { assemble })
+  await new Promise((r) => setTimeout(r, 30))
+  assert.deepEqual(
+    routes.sort(),
+    ['/api/opencode2dsh/ip-pool/models', '/api/opencode2dsh/ip-pool/probe', '/api/opencode2dsh/ip-pool/status'],
+    'all three card-facing routes register on a host without settings.register',
+  )
+})
+
+/** Regression: the register-era host keeps mounting the bridge too. */
+test('register host (<= 0.1.6) also mounts the ip-pool bridge', async () => {
+  resetCalls()
+  const { seam } = makeFakeSeam()
+  const { ctx } = fakeNoRegisterCtx()
+  // Give the same context a real register seam so it takes the legacy branch.
+  ;(ctx as unknown as { settings: unknown }).settings = seam
+  const routes: string[] = []
+  ;(ctx as unknown as { inject: unknown }).inject = (
+    _services: string[],
+    callback: (bctx: unknown) => unknown,
+  ) => callback({
+    webServer: {
+      register(route: { path?: string }) {
+        routes.push(String(route?.path))
+        return () => {}
+      },
+    },
+  })
+  applyIpPoolSettings(ctx, {}, ctx.logger, { assemble })
+  await new Promise((r) => setTimeout(r, 30))
+  assert.equal(routes.length, 3, 'legacy host mounts the same three routes')
 })

@@ -118,31 +118,21 @@ export function applyIpPoolSettings(
     }
   }
 
-  if (typeof ctx.settings?.register !== 'function') {
-    logger.warn('opencode2dsh: settings seam lacks register; ip-pool settings page disabled (patch config still works)')
-    if (controller.settings().enabled) {
-      void ensureRuntime().catch((err) => {
-        logger.warn(`opencode2dsh: ip pool start failed: ${err instanceof Error ? err.message : String(err)}`)
-      })
-    }
-    return controller
-  }
-
-  const scope = ctx.settings.register(IP_POOL_NAMESPACE, IpPoolConfigSchema, {
-    base: controller.settings(),
-    applies: 'live',
-  })
-
-  // Boot: apply the RESOLVED namespace value (the persisted document is part
-  // of it). Watch: apply every commit the same way — one path for both.
-  applyCommitted(withDefaults(scope.get() as Partial<IpPoolSettings> | undefined))
-  const disposeWatch = scope.watch((next: unknown) => {
-    applyCommitted(withDefaults(next as Partial<IpPoolSettings>))
-  })
-
-  // Bridge: mount once webServer is up. The handlers read the live runtime
-  // and the current settings value at request time (never stale closures).
-  if (typeof ctx.inject === 'function') {
+  /**
+   * Bridge: mount once webServer is up. The handlers read the live runtime and
+   * the current settings value at request time (never stale closures).
+   *
+   * Mounted for BOTH host eras. It used to sit below, inside the
+   * `settings.register` path only — so on a host that lacks `register` (DSH
+   * >= 0.1.7, where the section is the entry's own `Config` field) the early
+   * `return` above skipped it and the routes were never registered. Every card
+   * read then answered `404 not found`, which the card renders as
+   * "状态获取失败" / "status fetch failed" even though the plugin was live and
+   * model routing worked. Nothing here is era-dependent: the handler deps read
+   * the live runtime and the current section lazily.
+   */
+  const mountBridge = (): void => {
+    if (typeof ctx.inject !== 'function') return
     void Promise.resolve(ctx.inject(['webServer'], (bctx: PluginContext) => {
       if (!bctx.webServer) return
       const handlers = makeBridgeHandlers(
@@ -172,6 +162,31 @@ export function applyIpPoolSettings(
       }
     })) as unknown as Promise<unknown>
   }
+
+  if (typeof ctx.settings?.register !== 'function') {
+    logger.warn('opencode2dsh: settings seam lacks register; ip-pool settings page disabled (patch config still works)')
+    if (controller.settings().enabled) {
+      void ensureRuntime().catch((err) => {
+        logger.warn(`opencode2dsh: ip pool start failed: ${err instanceof Error ? err.message : String(err)}`)
+      })
+    }
+    mountBridge()
+    return controller
+  }
+
+  const scope = ctx.settings.register(IP_POOL_NAMESPACE, IpPoolConfigSchema, {
+    base: controller.settings(),
+    applies: 'live',
+  })
+
+  // Boot: apply the RESOLVED namespace value (the persisted document is part
+  // of it). Watch: apply every commit the same way — one path for both.
+  applyCommitted(withDefaults(scope.get() as Partial<IpPoolSettings> | undefined))
+  const disposeWatch = scope.watch((next: unknown) => {
+    applyCommitted(withDefaults(next as Partial<IpPoolSettings>))
+  })
+
+  mountBridge()
 
   logger.info('opencode2dsh: settings namespace "ip-pool" registered — live apply via 设置 → 插件 → IP 池')
   const maybeEffect = (ctx as { effect?: PluginContext['effect'] }).effect
