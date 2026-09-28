@@ -46,8 +46,13 @@ function ChevronDown({ className }: { className?: string }): ReactNode {
 
 /** Injected dependencies of the card (slot `inject`). */
 export interface IpPoolCardInjected {
-  /** The officially bound ip-pool settings scope (rc.2: always available). */
-  scope: SettingsScope<IpPoolSettingsValue>
+  /**
+   * The ip-pool settings controller for this host era, resolved lazily by the
+   * client half (see ./settings-controller.ts). Undefined until the host's
+   * settings service is up — the card renders nothing for that render and the
+   * client half retries on the next one (a miss is never cached).
+   */
+  scope?: SettingsScope<IpPoolSettingsValue>
   /** uSES subscription hook bound to the scope snapshot. */
   useSnapshot: () => SettingsScopeSnapshot<IpPoolSettingsValue>
   /** Card copy. */

@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased（0.3.3 之后的 DSH 0.1.7 兼容修复）
+
+### Fixed
+
+- **DSH 0.1.7 上设置卡片不出现的问题。** 0.1.7 对客户端侧有三处不兼容变更：
+  设置域从 `settingsScope` 服务改为 `configForms`（按 profile entry 寻址），
+  cordis 按声明列表门控服务属性访问，`settings.plugins.tab` 槽位改由 peer 插件
+  （ui-settings-plugins）声明且激活时机不定。插件现在只声明 `slots`/`locale`
+  两个注入服务，设置控制器在渲染时经 `ctx.get()` 懒解析（探测不到不缓存，下次
+  渲染重试），并同时向新旧两个槽位注入卡片（宿主契约保证未声明的槽位安静等
+  待）。新旧 DSH（≤ 0.1.6 与 ≥ 0.1.7）都能渲染设置卡片，模型路由不受影响。
+- **DSH ≥ 0.1.7 上设置卡片「状态获取失败」（所有读取 404）的问题。** 卡片的数据
+  桥（/status、/models、/probe）原先只在 `settings.register` 分支挂载，而 0.1.7
+  移除了该入口（section 变成插件 `Config` 字段），桥从未注册。现在两个宿主时代
+  都会挂载桥。
+- **设置卡片在部分 DSH 版本上整体崩溃（React #130 "Element type is invalid"）的
+  问题。** 展开箭头图标 `IconChevronDownOutline14` 在 0.1.6+ 改名（无后缀名 +
+  artwork/regular/medium 三件套），单名导入在那些宿主上是 `undefined`，整卡被
+  React 拒染。现在按「最新 → 最旧」解析图标名，都没有时退化为内联字形。
+
 ## 0.3.3 (2026-09-18)
 
 ### Added

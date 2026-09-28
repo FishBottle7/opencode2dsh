@@ -1,20 +1,19 @@
 /**
- * opencode2dsh — browser half. Registers the IP 池 plugin card inside
- * 设置 → 插件 → 可配置插件 via the `settings.plugin.item` slot (declared at
- * runtime by @deepseek-ai/dsh-client-ui-settings-plugins), keyed by the
- * `ip-pool` namespace this plugin's Host half registers.
- *
- * Configuration rides the OFFICIAL settings scope
- * (ctx.settingsScope.bind({namespace: 'ip-pool'})): the rc.2 host-apiproxy
- * serves every registered namespace, so dsh-llm-proxy's loopback fallback
- * compat layer is deliberately absent (docs/ip-pool.md §5, 2026-09-05
- * revision). Runtime state + probe actions ride the plugin's own bridge.
+ * opencode2dsh — browser half. Registers the IP 池 plugin card inside the
+ * plugin settings UI on whichever plugin-page slot this host declares:
+ * `settings.plugins.tab` (DSH >= 0.1.7, list-shaped, declared by the
+ * ui-settings-plugins peer) or `settings.plugin.item` (DSH <= 0.1.6, keyed by
+ * namespace or a plain list). Configuration rides the OFFICIAL settings domain
+ * through ./settings-controller.ts (the service/slot names differ by release —
+ * see that module). Runtime state + probe actions ride the plugin's own
+ * bridge.
  *
  * Export discipline: cross-plugin collaboration goes through cordis services
- * (`slots`, `locale`, `settingsScope`); the bundle purity gate forbids value
- * imports of other @deepseek-ai packages (type-only imports are erased).
+ * (`slots`, `locale`); the bundle purity gate forbids value imports of other
+ * @deepseek-ai packages (type-only imports are erased).
  */
 import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
+import type { SettingsScopeSnapshot } from '@deepseek-ai/dsh-client-runtime/client'
 import { useSyncExternalStore } from 'react'
 // Type-only: pulls the locale plugin's Context merge (ctx.locale).
 import type {} from '@deepseek-ai/dsh-client-locale/client'
@@ -24,6 +23,7 @@ import type {} from '@deepseek-ai/dsh-client-ui-settings-plugins/client'
 import { IpPoolCard } from './IpPoolCard.tsx'
 import type { IpPoolCardInjected } from './IpPoolCard.tsx'
 import type { IpPoolSettingsValue } from './IpPoolCard.tsx'
+import { resolveSectionController, UNAVAILABLE_SNAPSHOT, ENTRY_ID, type SettingsHostFace } from './settings-controller.ts'
 import { en, zh, type IpPoolKey } from './locales.ts'
 
 export type { IpPoolCardInjected, IpPoolCardProps, IpPoolSettingsValue } from './IpPoolCard.tsx'
@@ -36,56 +36,140 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
   }
 }
 
-/** Dictionary namespace owned by this plugin. */
+/** Dictionary namespace owned by this plugin (i18n only). */
 const NS = 'settings.ip-pool'
 
-/** The settings namespace this card edits (mirrors the Host half). */
+/** The settings namespace this card edits on DSH <= 0.1.6 (mirrors the Host half). */
 const SETTINGS_NAMESPACE = 'ip-pool'
 
-/** Required services (cordis fiber inject). */
-export const inject = ['slots', 'locale', 'settingsScope']
+/** The plugin-page slots this card can ride, across host releases. */
+type SlotName = 'settings.plugin.item' | 'settings.plugins.tab'
 
 /**
- * Register the IP 池 plugin card once the `settings.plugin.item` declaration
- * is on the ledger, and bind the ip-pool settings scope.
+ * Required services (cordis fiber inject). Deliberately NARROW: only services
+ * every supported DSH provides. The settings domain is resolved at render time
+ * (see ./settings-controller.ts) because its name differs by release and a
+ * missing inject token would park the entire client half in `pending`.
+ */
+export const inject = ['slots', 'locale']
+
+/**
+ * Register the IP 池 plugin card on whichever plugin-page slot this host
+ * declares, and bind the ip-pool settings controller.
+ *
+ * Slot history, newest first: `settings.plugins.tab` (list; id/order/label),
+ * `settings.plugin.item` keyed by namespace, `settings.plugin.item` as a plain
+ * list keyed by id. Each registration is contained, so any residual mismatch
+ * costs only this card — the boot screen never lists the whole plugin as
+ * failed.
+ *
  * @param ctx - client root context.
  */
 export function apply(ctx: ClientContext): void {
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'opencode2dsh: copy dictionaries')
 
-  const scope = ctx.settingsScope.bind({ namespace: SETTINGS_NAMESPACE }) as unknown as IpPoolCardInjected['scope']
-  // The scope's methods are instance methods (this-bound to the controller);
-  // uSES receives them as bare functions, so bind explicitly — an unbound
-  // getSnapshot reads `this.store` of undefined and crashes the card.
-  const getSnapshot = scope.getSnapshot.bind(scope)
-  const subscribe = scope.subscribe.bind(scope)
-  const useSnapshot = (): ReturnType<typeof getSnapshot> =>
-    useSyncExternalStore(subscribe, getSnapshot)
+  // [host-compat patch] Resolve the settings controller LAZILY, at render time.
+  //
+  // On DSH >= 0.1.7 the settings domain (`ui-settings`) PROVIDES `configForms`,
+  // and this plugin declares only `inject: ["slots", "locale"]` on purpose (a
+  // missing token would park the whole client half in `pending`). Reading the
+  // service synchronously inside apply() therefore races the provider's
+  // activation: when it is not up yet the probe reports "no settings service on
+  // this DSH build" and the card is dropped for the whole session, even though
+  // the service arrives moments later.
+  //
+  // A MISS IS NEVER CACHED. Only a real controller is remembered, so a probe
+  // that ran too early is retried on the next render; caching `undefined`
+  // would reproduce the original bug in a new place.
+  let scopeCache: IpPoolCardInjected['scope'] | undefined
+  const getScope = (): IpPoolCardInjected['scope'] | undefined => {
+    if (scopeCache === undefined) {
+      scopeCache = resolveSectionController(ctx as unknown as SettingsHostFace)
+    }
+    return scopeCache
+  }
+  // Stable bound identities per resolved scope: useSyncExternalStore compares
+  // the subscribe/getSnapshot references, so rebinding on every render would
+  // resubscribe continuously.
+  let boundFor: IpPoolCardInjected['scope'] | undefined
+  let boundSubscribe: ((onStoreChange: () => void) => () => void) | undefined
+  let boundGetSnapshot: (() => SettingsScopeSnapshot<IpPoolSettingsValue>) | undefined
+  const useSnapshot = (): SettingsScopeSnapshot<IpPoolSettingsValue> => {
+    const scope = getScope()
+    if (scope !== boundFor) {
+      boundFor = scope
+      boundSubscribe = scope === undefined
+        ? () => () => {}
+        : scope.subscribe.bind(scope) as (onStoreChange: () => void) => () => void
+      boundGetSnapshot = scope === undefined
+        ? () => UNAVAILABLE_SNAPSHOT
+        : scope.getSnapshot.bind(scope) as () => SettingsScopeSnapshot<IpPoolSettingsValue>
+    }
+    return useSyncExternalStore(boundSubscribe as (onStoreChange: () => void) => () => void, boundGetSnapshot as () => SettingsScopeSnapshot<IpPoolSettingsValue>)
+  }
   // Registration-time copy and the inject face share one bound translate;
   // copy freshness rides the locale revision.
   const t = ctx.locale.bind(NS) as IpPoolCardInjected['t']
-  const injected = (): IpPoolCardInjected => ({ scope, useSnapshot, t })
+  const injected = (): IpPoolCardInjected => ({ scope: getScope(), useSnapshot, t })
 
-  ctx.slots.inject('settings.plugin.item', function* () {
-    // The slot's kind flipped across DSH releases: list (id-keyed, DSH <=
-    // 0.1.0-rc.6) before keyed-by-namespace (>= 0.1.0-rc.7). A registration
-    // shaped for the wrong era throws inside the fiber and the boot screen
-    // lists the whole plugin as failed, so shape it for whichever spec this
-    // host declared and contain any residual mismatch to this card.
+  /**
+   * Register the card on one slot, converting any mismatch into a contained
+   * warning. Returns the slot disposer the injection iterator must yield.
+   */
+  const register = (slot: SlotName, options: Record<string, unknown>): (() => void) => {
+    try {
+      // The options union carries shapes the rc.2-typed overloads cannot name
+      // (both legacy shapes, and the >= 0.1.7 tab entry); all are runtime-valid
+      // for their era, so the call goes through the wide component-erased face.
+      return (ctx.slots.register as (o: typeof options, c: typeof IpPoolCard) => () => void)(options, IpPoolCard)
+    } catch (err) {
+      console.warn(`opencode2dsh: settings card rejected by this DSH build on slot "${slot}" (${err instanceof Error ? err.message : String(err)}) — model routing is unaffected`)
+      return () => {}
+    }
+  }
+
+  // [host-compat patch] Inject UNCONDITIONALLY instead of gating on
+  // `ctx.slots.spec()`.
+  //
+  // `slots.spec()` is a pure synchronous lookup, so it answers "is this slot
+  // declared RIGHT NOW" — but on DSH 0.1.7 the settings section declares
+  // `settings.plugins.tab` from a peer plugin (`ui-settings-plugins`) that may
+  // activate AFTER this one. The old gate therefore concluded "this DSH
+  // declares neither slot" and returned, so the card never appeared on a host
+  // that does declare it (README: "One page inside the Plugins settings
+  // section").
+  //
+  // `slots.inject()` — the host's own documented contract — "runs the callback
+  // synchronously when the declaration already exists; otherwise it runs inside
+  // the declaring register() call after the declaration is committed", and a
+  // never-declared slot simply waits (no throw). Injecting into both slots is
+  // therefore safe on every supported release and removes the race.
+  const injectInto = (slot: SlotName, build: () => Record<string, unknown>): void => {
+    const injectWide = ctx.slots.inject as unknown as (name: string, gen: () => Generator<unknown>) => unknown
+    injectWide(slot, function* () {
+      yield register(slot, build())
+    })
+  }
+
+  // DSH >= 0.1.7: the plugins settings tab, list-shaped and label-driven.
+  injectInto('settings.plugins.tab', () => ({
+    name: 'settings.plugins.tab',
+    id: ENTRY_ID,
+    order: 50,
+    label: () => t('nav'),
+    locale: NS,
+    inject: injected,
+  }))
+  // Legacy slot (DSH <= 0.1.6): `settings.plugin.item`, keyed or list. Only one
+  // of the two shapes is ever declared, so probing `spec()` HERE is correct —
+  // the declaration exists by the time this callback runs.
+  injectInto('settings.plugin.item', () => {
     let kind: string | undefined
     try {
       kind = (ctx.slots.spec('settings.plugin.item') as { kind?: string } | undefined)?.kind
     } catch { /* unreachable-spec hosts: default to the keyed shape below */ }
-    const options = kind === 'list'
+    return kind === 'list'
       ? { name: 'settings.plugin.item', id: SETTINGS_NAMESPACE, locale: NS, inject: injected }
       : { name: 'settings.plugin.item', key: SETTINGS_NAMESPACE, locale: NS, inject: injected }
-    try {
-      // The options union carries the list-era `id` shape that the rc.2-typed
-      // overload (keyed) cannot name; both shapes are runtime-valid for their
-      // era, so the call goes through the wide component-erased face.
-      yield (ctx.slots.register as (o: typeof options, c: typeof IpPoolCard) => () => void)(options, IpPoolCard)
-    } catch (err) {
-      console.warn(`opencode2dsh: settings card rejected by this DSH build (${err instanceof Error ? err.message : String(err)}) — model routing is unaffected; upgrade DSH to >= 0.1.0-rc.7 for the settings page`)
-    }
   })
 }

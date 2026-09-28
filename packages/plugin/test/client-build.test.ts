@@ -51,7 +51,11 @@ test('client manifest is declared in package.json', () => {
   const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
   assert.ok(pkg.dsh?.client, 'dsh.client manifest missing')
   assert.equal(pkg.dsh.client.platform, 'web')
-  assert.deepEqual(pkg.dsh.client.inject, ['slots', 'locale', 'settingsScope'])
+  // Deliberately NARROW: only services every supported DSH provides. The
+  // settings domain is resolved lazily at render time (settings-controller.ts)
+  // — declaring an era-specific token parks the entire client half in
+  // `pending` on hosts that lack it (DSH >= 0.1.7 has no settingsScope).
+  assert.deepEqual(pkg.dsh.client.inject, ['slots', 'locale'])
   assert.deepEqual(pkg.exports?.['./client'], './lib/client.js')
 })
 
@@ -81,4 +85,43 @@ test('chevron icon resolves across host releases, never a single binding', () =>
     /require\("@deepseek-ai\/dsh-client-ui-primitives"\)/.test(source),
     'primitives imported as a namespace for fallback probing',
   )
+})
+
+/**
+ * Regression (DSH >= 0.1.7 client half): the card used to die three ways on a
+ * 0.1.7 host — the settings domain was read by property access (cordis gates
+ * it by the inject list, so `configForms` stayed undefined even though the
+ * host provides it), the controller was probed synchronously inside apply()
+ * (racing the provider's activation, with the miss cached for the session),
+ * and the slot injection was gated on a synchronous `slots.spec()` probe (the
+ * >= 0.1.7 tab is declared by a peer plugin that may activate later, so the
+ * gate concluded "this DSH declares neither slot"). The bundle must carry the
+ * narrow inject list, the ctx.get() escape, the lazy never-cached resolution,
+ * and BOTH slot eras.
+ */
+test('settings domain is reached via ctx.get(), lazily, and injected into both slot eras', () => {
+  const path = new URL('../lib/client.js', import.meta.url)
+  assert.ok(existsSync(path), 'lib/client.js missing — run `pnpm build:client` first')
+  const source = readFileSync(path, 'utf8')
+  // Narrow declared inject: no era-specific token parks the half in `pending`.
+  assert.match(source, /const inject = \["slots", "locale"\]/, 'declared inject is exactly [slots, locale]')
+  // The documented cordis escape, with property access as the fallback.
+  assert.match(source, /typeof \w+\.get === ["']function["']/, 'services are probed through ctx.get()')
+  assert.ok(source.includes('configForms'), 'the >= 0.1.7 settings domain (configForms) is addressed')
+  assert.match(source, /settingsScope\.bind\(\{ namespace: \w+ \}\)/, 'the <= 0.1.6 settingsScope era is still served')
+  // Lazy resolution at render time (never a synchronous probe inside apply).
+  // The assignment must live INSIDE the void-0 guard: an undefined resolve
+  // result is then simply retried on the next render — a cached miss would
+  // reproduce the original bug one level deeper (the unit test pins the retry
+  // contract; this pins the shipped structure).
+  assert.match(
+    source,
+    /if \(scopeCache === void 0\) ?\{?\s*scopeCache = resolveSectionController/,
+    'the controller resolves lazily on the render path, and a miss is never cached',
+  )
+  // Both slot eras, injected unconditionally.
+  assert.ok(source.includes('settings.plugins.tab'), 'the >= 0.1.7 plugins-tab slot is injected')
+  assert.ok(source.includes('settings.plugin.item'), 'the legacy plugin-item slot is injected')
+  // Hosts without any settings service render their own unavailable row.
+  assert.ok(source.includes('unavailable'), 'the no-settings snapshot is carried')
 })

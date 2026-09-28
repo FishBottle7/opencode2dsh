@@ -536,7 +536,8 @@ dsh-llm-proxy 的 bridge 有四个面（describe/mutate/models/test），前两�
 - `POST /status`：池状态机快照——四态徽章 + 可用/容量 + 来源计数（free/manual/subscription）+ 两级健康（出口表：地址/来源/位置/延迟/质量/出口 IP/状态/冷却到期时刻 + 封禁表：(出口, 模型, bannedAt)）+ Prober 队列进度（enqueued/completed/inFlight/queued）+ refill 上轮摘要 + 订阅层状态（pendingConversion 数、convertedAdmitted、lastFetch、lastError——**不含 URL 明文**）。返回结构化 JSON，卡片 3s 轮询（探活进行中 1s）。
 - `POST /probe`：`{scope: 'all'|'exit'|'refill', exitId?}`。`all`：全池出口 × probeModels 的周期探测一次（入 Prober 队列，返回队列长度，前端看 /status 进度）；`exit`：单出口插队探测；`refill`：手动触发一次状态机 refill 轮（免费源抓取+准入）。探测在宿主侧跑：走 Prober 两级调度（同出口串行 + 全局上限），不碰浏览器。
 - 路由护栏照抄 dsh-llm-proxy settings.js：loopback socket + 规范 Host + same-origin 三重校验、JSON body 上限、`{ok, code, message}` 信封。**不做 settings 代理面**（官方通道在）。
-- 卡片注册进 `settings.plugin.item`（keyed slot，`key: 'ip-pool'`——即 namespace 名）；`configurable` tab 按 namespace 取交集分派，卡片在官方 settingsScope ready 后渲染。
+- 卡片注册（2026-09-25 修订，跨宿主双时代）：同时向 `settings.plugins.tab`（DSH >= 0.1.7，由 peer 插件 `ui-settings-plugins` 声明的 list 槽，按 `id` 注册并带 `label`）与 `settings.plugin.item`（DSH <= 0.1.6，keyed/list 双形态，`key: 'ip-pool'`）注入，不再用 `slots.spec()` 同步探测做前置门控（0.1.7 的 tab 槽由 peer 插件声明、时机不定，同步探测会误判「宿主不声明该槽」）；宿主契约保证未声明槽位的注入安静等待。注册失败只跳过卡片（控制台警告），不拖垮插件。
+- 设置控制器经 `ctx.get()` 懒解析（`src/client/settings-controller.ts`）：DSH >= 0.1.7 走 `configForms.get('opencode2dsh')` 并投影到 `ipPool` 子树；DSH <= 0.1.6 走 `settingsScope.bind({namespace: 'ip-pool'})`。探测不到不缓存，下次渲染重试；两个时代都没有时卡片渲染「设置服务不可用」行。机制详见 §5.5。
 
 ### 5.4 客户端构建
 
@@ -545,13 +546,30 @@ dsh-llm-proxy 的 bridge 有四个面（describe/mutate/models/test），前两�
 ```json
 "dsh": {
   "bundle": { "patch": "./cordis.patch.yml" },
-  "client": { "inject": ["slots", "locale", "settingsScope"], "platform": "web" }
+  "client": { "inject": ["slots", "locale"], "platform": "web" }
 }
 ```
 
-（`remote` 不需要：没有跨 fiber 的 settings/document-updated 监听需求，官方 mirror 自己处理失效。）
+（2026-09-25 修订：`inject` 收窄为 `["slots", "locale"]` —— 设置域在 0.1.7 改名，
+声明具体 token 会把整个 client 半 park 在 `pending`；设置控制器改为渲染时经
+`ctx.get()` 懒解析，见 §5.5。`remote` 不需要：没有跨 fiber 的
+settings/document-updated 监听需求，官方 mirror 自己处理失效。）
 
 构建链随版本走：tsdown 0.15（仓库现有 devDep）+ lightningcss 1.32（dsh-llm-proxy 同版）+ `@deepseek-ai/dsh-client-{runtime,locale,ui-slots,ui-primitives,ui-settings-plugins}@0.1.1-rc.2` 仅 devDependencies（类型与构建期 externals 对齐宿主；运行时由宿主 seeds 提供，不进生产依赖）。`build:client` 独立 script，`build`（宿主半）+ `build:client` 都进 `prepack`。
+
+### 5.5 跨宿主兼容：设置域与槽位的双时代解析（2026-09-25）
+
+DSH 0.1.7 对客户端侧有三处不兼容变更，全部打在设置卡片上；插件按「运行时探测 + 双时代回退」消化，不做宿主版本分叉：
+
+| 宿主变化 | 旧行为的失效方式 | 插件对策 |
+| --- | --- | --- |
+| 设置域从 `settingsScope` 服务改为 `configForms`（按 profile entry 寻址，ip-pool 旋钮在 `ipPool` 子树） | 声明 `settingsScope` 注入 token 在 0.1.7 不存在 → 整个 client 半 park 在 `pending` | inject 收窄为 `["slots", "locale"]`；控制器在渲染时经 `ctx.get()` 懒解析（cordis 按声明列表门控属性访问，`get()` 是文档化的逃逸口）；探测不到不缓存，下次渲染重试 |
+| `settings.plugins.tab` 槽改由 peer 插件 `ui-settings-plugins` 声明，激活时机不定 | `slots.spec()` 同步探测在声明前运行 → 误判「宿主不声明该槽」→ 卡片永不出现 | 向新旧两个槽位无条件 `slots.inject()`；宿主契约：已声明则同步回调，未声明则等待（不抛错） |
+| 图标导出改名（0.1.6+ 去 `14` 后缀 + artwork/regular/medium 三件套） | 单名导入在另一时代是 `undefined` → React #130 整卡崩溃 | 按「最新 → 最旧」解析导出名，兜底内联字形（§5.2 卡片） |
+
+设置控制器解析收在 `src/client/settings-controller.ts`（纯函数，可无浏览器单测，见 `test/settings-controller.test.ts`）：>= 0.1.7 的 entry form 投影（`value/base/user` 下探一层到 `ipPool`；`mutate` 写入路径加 `ipPool` 前缀，直接 `set/unset` 面不加）与快照恒等缓存（`useSyncExternalStore` 按引用比较，投影必须引用稳定）都在该模块内。两个时代都没有设置服务时，卡片用 `UNAVAILABLE_SNAPSHOT` 渲染「设置服务不可用」行，而不是渲染崩溃。
+
+宿主侧（`src/ip-pool-settings/apply.ts`）的对应修复：数据桥（`/status`、`/models`、`/probe`）在两个宿主时代都挂载 —— 0.1.7 移除了 `ctx.settings.register`（section 变成插件 `Config` 字段），桥原先只在 register 分支挂载，0.1.7 上从未注册，卡片所有读取 404（卡片渲染为「状态获取失败」）。
 
 ## 6. 文件落点（增量，不动现有结构）
 
