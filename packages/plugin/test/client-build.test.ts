@@ -51,6 +51,6 @@ test('client manifest is declared in package.json', () => {
   const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
   assert.ok(pkg.dsh?.client, 'dsh.client manifest missing')
   assert.equal(pkg.dsh.client.platform, 'web')
-  assert.deepEqual(pkg.dsh.client.inject, ['slots', 'locale', 'settingsScope'])
+  assert.deepEqual(pkg.dsh.client.inject, ['slots', 'locale'])
   assert.deepEqual(pkg.exports?.['./client'], './lib/client.js')
 })

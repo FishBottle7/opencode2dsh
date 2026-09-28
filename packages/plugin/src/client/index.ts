@@ -42,8 +42,52 @@ const NS = 'settings.ip-pool'
 /** The settings namespace this card edits (mirrors the Host half). */
 const SETTINGS_NAMESPACE = 'ip-pool'
 
-/** Required services (cordis fiber inject). */
-export const inject = ['slots', 'locale', 'settingsScope']
+/** Required services (cordis fiber inject).
+ *
+ * `settingsScope` is deliberately ABSENT: DSH 0.1.7 removed the service, and
+ * a missing inject token parks this whole client fiber in `pending`, which
+ * the boot screen reports as "entry did not activate" and the host recovery
+ * answers by removing the plugin. The scope is resolved defensively in
+ * `resolveSettingsScope` instead.
+ */
+export const inject = ['slots', 'locale']
+
+/**
+ * Read-only settings snapshot used when the host ships no settings service
+ * (DSH 0.1.7+). The card renders its "settings unavailable" line instead of
+ * crashing; model routing is unaffected either way.
+ */
+const UNAVAILABLE_SCOPE = {
+  getSnapshot: () => ({ status: 'unavailable', value: undefined, base: undefined }),
+  subscribe: () => () => {},
+  set: async () => {},
+  unset: async () => {},
+} as unknown as IpPoolCardInjected['scope']
+
+/**
+ * The ip-pool settings scope for this host, or an unavailable fallback.
+ *
+ * DSH 0.1.7 removed `settingsScope`, and cordis serves ctx through a strict
+ * proxy: GETting a service this fiber did not inject THROWS
+ * `cannot get property "settingsScope" without inject` instead of returning
+ * undefined (verified on 0.1.7-rc.2 — the boot screen failed the whole plugin
+ * with exactly that message while the un-guarded bind threw first in older
+ * attempts). Contain BOTH failure modes here: hosts that ship the service
+ * keep the real scope; newer hosts degrade only this card.
+ *
+ * @param ctx - client root context.
+ */
+function resolveSettingsScope(ctx: ClientContext): IpPoolCardInjected['scope'] {
+  try {
+    const service = ctx.settingsScope
+    if (service !== undefined && service !== null && typeof service.bind === 'function') {
+      return service.bind({ namespace: SETTINGS_NAMESPACE }) as unknown as IpPoolCardInjected['scope']
+    }
+  } catch {
+    /* strict-proxy hosts: settingsScope not injected (or not provided) */
+  }
+  return UNAVAILABLE_SCOPE
+}
 
 /**
  * Register the IP 池 plugin card once the `settings.plugin.item` declaration
@@ -53,7 +97,7 @@ export const inject = ['slots', 'locale', 'settingsScope']
 export function apply(ctx: ClientContext): void {
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'opencode2dsh: copy dictionaries')
 
-  const scope = ctx.settingsScope.bind({ namespace: SETTINGS_NAMESPACE }) as unknown as IpPoolCardInjected['scope']
+  const scope = resolveSettingsScope(ctx)
   // The scope's methods are instance methods (this-bound to the controller);
   // uSES receives them as bare functions, so bind explicitly — an unbound
   // getSnapshot reads `this.store` of undefined and crashes the card.

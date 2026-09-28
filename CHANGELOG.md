@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **DSH 0.1.7 上客户端激活修复（inject 收窄 + strict-proxy 兜底）。** 0.1.7 移除了
+  `settingsScope` 服务：inject 声明它会让整个 client fiber 永远 `pending`
+  （boot 报 "1 entry did not activate"，宿主 recovery 随后把插件从 profile 删掉）；
+  摘掉声明后直接 GET `ctx.settingsScope` 又会撞上 cordis 严格代理，抛
+  `cannot get property "settingsScope" without inject`（0.1.7-rc.2 实测——普通
+  对象 mock 复现不出该语义，这也是前两轮离线自测通过、真机却 `failed` 的原因）。
+  现在 inject 只保留 `slots`/`locale`，scope 经 `resolveSettingsScope()` 解析：
+  有服务的宿主拿真 scope，没有则降级为只读 `unavailable` 快照（设置卡显示
+  「设置服务不可用」，模型路由不受影响）。新增
+  `test/client-activation.test.ts`：bundle 级跑真实 `apply` + 严格代理 ctx
+  做回归守护。
+
 ## 0.3.3 (2026-09-18)
 
 ### Added

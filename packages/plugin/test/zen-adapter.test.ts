@@ -196,7 +196,7 @@ test('responses models use the wider body-idle window, injectable for tests', as
   }
   const measure = async (model: string) => {
     const adapter = new ZenAdapter(
-      { list: () => [], decision: () => ({ allowed: true, source: 'test', known: true }) },
+      { list: () => [], decision: () => ({ allowed: true, source: 'test', known: true }), reasoningCapability: () => undefined },
       { providerOverride: { streamSimple: () => hangAfterStart() }, firstEventMs: 50, bodyIdleMs: 50, responsesBodyIdleMs: 400 },
     )
     const began = Date.now()
