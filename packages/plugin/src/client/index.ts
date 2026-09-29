@@ -43,7 +43,7 @@ const NS = 'settings.ip-pool'
 const SETTINGS_NAMESPACE = 'ip-pool'
 
 /** Required services (cordis fiber inject). */
-export const inject = ['slots', 'locale', 'settingsScope']
+export const inject = ['slots', 'locale']
 
 /**
  * Register the IP 池 plugin card once the `settings.plugin.item` declaration
@@ -53,39 +53,55 @@ export const inject = ['slots', 'locale', 'settingsScope']
 export function apply(ctx: ClientContext): void {
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'opencode2dsh: copy dictionaries')
 
-  const scope = ctx.settingsScope.bind({ namespace: SETTINGS_NAMESPACE }) as unknown as IpPoolCardInjected['scope']
-  // The scope's methods are instance methods (this-bound to the controller);
-  // uSES receives them as bare functions, so bind explicitly — an unbound
-  // getSnapshot reads `this.store` of undefined and crashes the card.
-  const getSnapshot = scope.getSnapshot.bind(scope)
-  const subscribe = scope.subscribe.bind(scope)
-  const useSnapshot = (): ReturnType<typeof getSnapshot> =>
-    useSyncExternalStore(subscribe, getSnapshot)
-  // Registration-time copy and the inject face share one bound translate;
-  // copy freshness rides the locale revision.
-  const t = ctx.locale.bind(NS) as IpPoolCardInjected['t']
-  const injected = (): IpPoolCardInjected => ({ scope, useSnapshot, t })
+  const bindAndRegister = (scopedCtx: ClientContext, scopeTarget: any) => {
+    const scope = scopeTarget?.bind({ namespace: SETTINGS_NAMESPACE }) as unknown as IpPoolCardInjected['scope'] | undefined
+    if (!scope) return
 
-  ctx.slots.inject('settings.plugin.item', function* () {
-    // The slot's kind flipped across DSH releases: list (id-keyed, DSH <=
-    // 0.1.0-rc.6) before keyed-by-namespace (>= 0.1.0-rc.7). A registration
-    // shaped for the wrong era throws inside the fiber and the boot screen
-    // lists the whole plugin as failed, so shape it for whichever spec this
-    // host declared and contain any residual mismatch to this card.
-    let kind: string | undefined
-    try {
-      kind = (ctx.slots.spec('settings.plugin.item') as { kind?: string } | undefined)?.kind
-    } catch { /* unreachable-spec hosts: default to the keyed shape below */ }
-    const options = kind === 'list'
-      ? { name: 'settings.plugin.item', id: SETTINGS_NAMESPACE, locale: NS, inject: injected }
-      : { name: 'settings.plugin.item', key: SETTINGS_NAMESPACE, locale: NS, inject: injected }
-    try {
-      // The options union carries the list-era `id` shape that the rc.2-typed
-      // overload (keyed) cannot name; both shapes are runtime-valid for their
-      // era, so the call goes through the wide component-erased face.
-      yield (ctx.slots.register as (o: typeof options, c: typeof IpPoolCard) => () => void)(options, IpPoolCard)
-    } catch (err) {
-      console.warn(`opencode2dsh: settings card rejected by this DSH build (${err instanceof Error ? err.message : String(err)}) — model routing is unaffected; upgrade DSH to >= 0.1.0-rc.7 for the settings page`)
-    }
-  })
+    // The scope's methods are instance methods (this-bound to the controller);
+    // uSES receives them as bare functions, so bind explicitly — an unbound
+    // getSnapshot reads `this.store` of undefined and crashes the card.
+    const getSnapshot = scope.getSnapshot.bind(scope)
+    const subscribe = scope.subscribe.bind(scope)
+    const useSnapshot = (): ReturnType<typeof getSnapshot> =>
+      useSyncExternalStore(subscribe, getSnapshot)
+    // Registration-time copy and the inject face share one bound translate;
+    // copy freshness rides the locale revision.
+    const t = ctx.locale.bind(NS) as IpPoolCardInjected['t']
+    const injected = (): IpPoolCardInjected => ({ scope, useSnapshot, t })
+
+    ctx.slots.inject('settings.plugin.item', function* () {
+      // The slot's kind flipped across DSH releases: list (id-keyed, DSH <=
+      // 0.1.0-rc.6) before keyed-by-namespace (>= 0.1.0-rc.7). A registration
+      // shaped for the wrong era throws inside the fiber and the boot screen
+      // lists the whole plugin as failed, so shape it for whichever spec this
+      // host declared and contain any residual mismatch to this card.
+      let kind: string | undefined
+      try {
+        kind = (ctx.slots.spec('settings.plugin.item') as { kind?: string } | undefined)?.kind
+      } catch { /* unreachable-spec hosts: default to the keyed shape below */ }
+      const options = kind === 'list'
+        ? { name: 'settings.plugin.item', id: SETTINGS_NAMESPACE, locale: NS, inject: injected }
+        : { name: 'settings.plugin.item', key: SETTINGS_NAMESPACE, locale: NS, inject: injected }
+      try {
+        // The options union carries the list-era `id` shape that the rc.2-typed
+        // overload (keyed) cannot name; both shapes are runtime-valid for their
+        // era, so the call goes through the wide component-erased face.
+        yield (ctx.slots.register as (o: typeof options, c: typeof IpPoolCard) => () => void)(options, IpPoolCard)
+      } catch (err) {
+        console.warn(`opencode2dsh: settings card rejected by this DSH build (${err instanceof Error ? err.message : String(err)}) — model routing is unaffected; upgrade DSH to >= 0.1.0-rc.7 for the settings page`)
+      }
+    })
+  }
+
+  // settingsScope was renamed to configForms in DSH 0.1.7-alpha.1+, and is optional/deferred.
+  // We do not require it in the root inject list so the main client fiber activates immediately
+  // without blocking the renderer boot health check.
+  const immediateScope = (ctx as any).settingsScope
+  if (immediateScope) {
+    bindAndRegister(ctx, immediateScope)
+  } else {
+    ctx.inject(['settingsScope'], (scoped) => {
+      bindAndRegister(scoped as unknown as ClientContext, (scoped as any).settingsScope)
+    })
+  }
 }
