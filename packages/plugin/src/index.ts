@@ -135,7 +135,11 @@ function applyAdapter(
       if (lastError) logger.warn(`opencode2dsh: catalog refresh issue: ${lastError}`)
     },
   })
-  const adapter = new ZenAdapter(catalog)
+  const adapter = new ZenAdapter(catalog, {
+    firstEventMs: cfg.firstEventMs,
+    bodyIdleMs: cfg.bodyIdleMs,
+    responsesBodyIdleMs: cfg.responsesBodyIdleMs,
+  })
 
   // Register FIRST: the provider must appear in the selector right away, even
   // while the catalog is still warming up (listModels is read live at selector

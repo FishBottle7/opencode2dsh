@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- The stream-liveness watchdogs are configurable. `firstEventMs`, `bodyIdleMs`, and `responsesBodyIdleMs` widen how long a turn waits for the first stream event and how much mid-response silence it tolerates, so a slow cold start no longer has to fail as `first stream event timeout` with no recourse. Unset, the shipped 30 s / 120 s / 300 s windows still apply.
+
 ### Fixed
 
 - Image input follows the model's declared modalities instead of a hardcoded
