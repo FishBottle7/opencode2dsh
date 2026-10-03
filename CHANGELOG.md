@@ -1,10 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.3.7 (2026-10-04)
 
 ### Added
 
 - The stream-liveness watchdogs are configurable. `firstEventMs`, `bodyIdleMs`, and `responsesBodyIdleMs` widen how long a turn waits for the first stream event and how much mid-response silence it tolerates, so a slow cold start no longer has to fail as `first stream event timeout` with no recourse. Unset, the shipped 30 s / 120 s / 300 s windows still apply.
+- Add `mimo-v2.6-flash-free` to the static free-model fallback and IP-pool probe choices.
 
 ### Fixed
 
