@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Image input follows the model's declared modalities instead of a hardcoded
+  family. models.dev publishes `modalities.input` per model, but it was never
+  read, so every model outside `/^mimo-v2\.6/i` was advertised as text-only
+  and DSH refused the attachment with `Model "…" does not support image input.`
+  A model that declares `image` is now accepted, one that declares only `text`
+  is still refused, and models.dev being pending, absent or silent leaves the
+  verified family exactly as it was.
+
 ## 0.3.6 (2026-10-01)
 
 ### Fixed

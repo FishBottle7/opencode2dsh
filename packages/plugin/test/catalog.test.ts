@@ -212,6 +212,64 @@ test('ModelCatalog.limits speaks only when the metadata declares them', async ()
   }
 })
 
+test('decodeModelsDev extracts the declared input modalities', () => {
+  const payload = {
+    opencode: {
+      models: {
+        // live shape: modalities.input lists every accepted input kind
+        'multimodal-free': { cost: { input: 0, output: 0 }, modalities: { input: ['text', 'image', 'video'] } },
+        // output-only declarations are valid
+        'image-only-free': { cost: { input: 0, output: 0 }, modalities: { input: ['image'] } },
+        // no modalities block: keys stay absent so pre-modality caches stay valid
+        'plain-free': { cost: { input: 0, output: 0 } },
+        // an empty modalities object is the same as none
+        'silent-free': { cost: { input: 0, output: 0 }, modalities: {} },
+        // malformed values are dropped, not guessed
+        'bad-modalities-free': { cost: { input: 0, output: 0 }, modalities: { input: 'image' } },
+        'empty-modalities-free': { cost: { input: 0, output: 0 }, modalities: { input: [] } },
+        'noise-modalities-free': { cost: { input: 0, output: 0 }, modalities: { input: ['text', '', 7, 'image', 'image'] } },
+      },
+    },
+  }
+  const prices = decodeModelsDev(payload)
+  assert.deepEqual(prices.get('multimodal-free')?.modalities, ['text', 'image', 'video'])
+  assert.deepEqual(prices.get('image-only-free')?.modalities, ['image'])
+  assert.equal('modalities' in (prices.get('plain-free') ?? {}), false)
+  assert.equal('modalities' in (prices.get('silent-free') ?? {}), false)
+  assert.equal(prices.get('bad-modalities-free')?.modalities, undefined)
+  assert.equal(prices.get('empty-modalities-free')?.modalities, undefined)
+  assert.deepEqual(prices.get('noise-modalities-free')?.modalities, ['text', 'image'])
+})
+
+test('ModelCatalog.modalities speaks only when the metadata declares them', async () => {
+  const catalog = new ModelCatalog({
+    fetchImpl: fakeFetch({
+      'https://opencode.ai/zen/v1/models': zenBody,
+      'https://models.dev/api.json': {
+        opencode: {
+          models: {
+            'qwen-free': { cost: { input: 0, output: 0 }, modalities: { input: ['text', 'image'] } },
+            'plain-free': { cost: { input: 0, output: 0 } },
+          },
+        },
+      },
+    }),
+  })
+  try {
+    await catalog.refreshOnce()
+    assert.deepEqual(catalog.modalities('qwen-free'), ['text', 'image'])
+    // no modalities block: the adapter keeps its own vision pattern
+    assert.equal(catalog.modalities('plain-free'), undefined)
+    // metadata cannot speak for the model
+    assert.equal(catalog.modalities('ghost-free'), undefined)
+    // the returned array is a copy: a caller cannot mutate the cache
+    catalog.modalities('qwen-free')?.push('audio')
+    assert.deepEqual(catalog.modalities('qwen-free'), ['text', 'image'])
+  } finally {
+    catalog.stop()
+  }
+})
+
 function fakeFetch(routes: Record<string, unknown>, capture: { url?: string; init?: RequestInit } = {}) {
   return (async (url: string | URL, init?: RequestInit) => {
     capture.url = String(url)
