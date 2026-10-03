@@ -38,6 +38,10 @@ export interface CatalogLike {
   reasoningCapability(model: string): { reasoning: boolean; effortValues: string[] } | undefined
   /** Optional: models.dev-declared limits; absent catalogs keep the defaults. */
   limits?(model: string): { contextWindow?: number; maxOutput?: number } | undefined
+  /** Optional: models.dev `modalities.input`, the input kinds the model
+   *  accepts (["text","image","video",…]). Absent catalogs keep the built-in
+   *  vision pattern. */
+  modalities?(model: string): string[] | undefined
 }
 
 const DEFAULT_CONTEXT_WINDOW = 262144
@@ -173,19 +177,32 @@ function terminalErrorEvent(errorMessage: string, model: Model<Api>): PiEvent {
 
 
 /**
- * Vision gate: ids whose image input is verified end-to-end on the Zen lane
- * (the mimo-v2.6 family — an image round-trip through DSH 0.1.7-rc.2 was
- * live-verified on 2026-09-28). Models outside the pattern stay text-only so
- * DSH's attachment gates and pi-ai's image downgrade both refuse image parts
- * instead of forwarding them to a model that cannot see them. DSH's per-model
- * input-type checkbox overrides the declared modalities whenever another lane
- * is verified later.
+ * Vision gate: whether a model accepts image input on the Zen lane.
+ *
+ * models.dev `modalities.input` decides whenever it speaks — the same
+ * declaration that already drives `limit.context` / `limit.output` lists the
+ * input kinds each model takes, and the free roster rotates constantly, so a
+ * family-scoped pattern cannot track it: space-bunny-free,
+ * muse-spark-1.*-contributor-free, mimo-v2.5-free, fledge-alpha-free and
+ * longcat-2.5-preview-free all declare `image` upstream and are refused today
+ * with `Model "<id>" does not support image input.` A declared text-only model
+ * stays refused, so the gate still protects the lane in both directions.
+ *
+ * The built-in pattern remains the fallback for the ids whose image input was
+ * live-verified end-to-end on 2026-09-28 (the mimo-v2.6 family), so metadata
+ * being pending, absent or silent never changes what those models can do.
+ * Models that end up text-only make DSH's attachment gates and pi-ai's image
+ * downgrade refuse image parts instead of forwarding them to a model that
+ * cannot see them.
  */
-export function isVisionModel(id: string): boolean {
+export function isVisionModel(id: string, declaredModalities?: string[]): boolean {
+  if (Array.isArray(declaredModalities) && declaredModalities.length > 0) {
+    return declaredModalities.includes('image')
+  }
   return /^mimo-v2\.6/i.test(String(id ?? ''))
 }
 
-function toPiModel(id: string, reasoning: boolean, limits?: { contextWindow?: number; maxOutput?: number }): Model<Api> {
+function toPiModel(id: string, reasoning: boolean, limits?: { contextWindow?: number; maxOutput?: number }, declaredModalities?: string[]): Model<Api> {
   const isResponses = isResponsesModel(id)
   return {
     id,
@@ -196,13 +213,13 @@ function toPiModel(id: string, reasoning: boolean, limits?: { contextWindow?: nu
     // The honest capability flag: gates pi-ai's reasoning_effort branch and
     // keeps developer-role replay suppressed (the Zen lane's compat detects
     // supportsDeveloperRole=false for opencode.ai, so the system slot is
-    // unchanged either way). `image` (vision models only, see isVisionModel)
-    // keeps pi-ai's downgradeUnsupportedImages from dropping the image parts
-    // toPiContext loads from the attachment store (the Zen gateway accepts
-    // image_url data URLs, live-probed 2026-09-23; full round-trip through
+    // unchanged either way). `image` (see isVisionModel) keeps pi-ai's
+    // downgradeUnsupportedImages from dropping the image parts toPiContext
+    // loads from the attachment store (the Zen gateway accepts image_url
+    // data URLs, live-probed 2026-09-23; full round-trip through
     // DSH 0.1.7-rc.2 with mimo-v2.6-flash-free 2026-09-28).
     reasoning,
-    input: isVisionModel(id) ? ['text', 'image'] : ['text'],
+    input: isVisionModel(id, declaredModalities) ? ['text', 'image'] : ['text'],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: contextWindowFor(limits),
     maxTokens: defaultMaxTokensFor(limits),
@@ -307,6 +324,11 @@ export class ZenAdapter {
     return undefined
   }
 
+  /** The input kinds DSH is told about for one model (isVisionModel). */
+  #inputModalities(model: string): string[] {
+    return isVisionModel(model, this.#catalog.modalities?.(model)) ? ['text', 'image'] : ['text']
+  }
+
   /** Advisory catalog for the DSH model picker (deduped; dsh-llm rejects duplicates). */
   listModels(provider: string): Array<{ provider: string; id: string; name: string; inputModalities: string[] }> {
     const seen = new Set<string>()
@@ -314,7 +336,7 @@ export class ZenAdapter {
     for (const id of this.#catalog.list()) {
       if (seen.has(id)) continue
       seen.add(id)
-      models.push({ provider, id, name: id, inputModalities: isVisionModel(id) ? ['text', 'image'] : ['text'] })
+      models.push({ provider, id, name: id, inputModalities: this.#inputModalities(id) })
     }
     return models
   }
@@ -332,7 +354,7 @@ export class ZenAdapter {
       provider,
       id: model,
       name: model,
-      inputModalities: isVisionModel(model) ? ['text', 'image'] : ['text'],
+      inputModalities: this.#inputModalities(model),
       context: { contextWindow: contextWindowFor(this.#catalog.limits?.(model)) },
       defaultMaxTokens: defaultMaxTokensFor(this.#catalog.limits?.(model)),
     }
@@ -440,7 +462,7 @@ export class ZenAdapter {
   async *#streamAttempt(options: HarnessGenerateOptions, onTerminal?: (message: PiDoneMessage) => void): AsyncGenerator<HarnessChunk> {
     const context = await toPiContext(options)
     const ids = deriveRequestIDs(options.messages)
-    const model = toPiModel(options.model, this.#catalog.reasoningCapability(options.model)?.reasoning === true, this.#catalog.limits?.(options.model))
+    const model = toPiModel(options.model, this.#catalog.reasoningCapability(options.model)?.reasoning === true, this.#catalog.limits?.(options.model), this.#catalog.modalities?.(options.model))
     // IP-pool routing context (docs/ip-pool.md 3.3): pi-ai builds the request
     // body and dispatches it on separate layers with no channel for "which
     // model is this fetch for", so the per-request context rides AsyncLocalStorage.

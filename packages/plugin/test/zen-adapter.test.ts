@@ -26,7 +26,8 @@ test('providerRetryPolicy defers to the host default', () => {
   assert.equal(adapter.providerRetryPolicy('opencode2dsh'), undefined)
 })
 
-test('resolveModel declares image input only for verified vision models', () => {
+test('resolveModel declares image input from models.dev, and the built-in pattern otherwise', () => {
+  // No metadata loaded: the built-in live-verified family is the only source.
   const adapter = new ZenAdapter(new ModelCatalog())
   const textOnly = adapter.resolveModel('opencode2dsh', 'big-pickle')
   assert.deepEqual(textOnly.inputModalities, ['text'])
@@ -37,7 +38,40 @@ test('resolveModel declares image input only for verified vision models', () => 
   // The mimo-v2.6 family is the live-verified vision lane (2026-09-28).
   const vision = adapter.resolveModel('opencode2dsh', 'mimo-v2.6-flash-free')
   assert.deepEqual(vision.inputModalities, ['text', 'image'])
+
+  // A declared `image` opens a model outside the family, and a declared
+  // text-only model is refused even inside it — the declaration wins both ways.
+  const declared = new ZenAdapter(catalogWithModalities({
+    'space-bunny-free': ['text', 'image', 'video'],
+    'text-only-free': ['text'],
+    'mimo-v2.6-text-free': ['text'],
+    'undeclared-free': undefined,
+  }))
+  assert.deepEqual(declared.resolveModel('opencode2dsh', 'space-bunny-free').inputModalities, ['text', 'image'])
+  assert.deepEqual(declared.resolveModel('opencode2dsh', 'text-only-free').inputModalities, ['text'])
+  assert.deepEqual(declared.resolveModel('opencode2dsh', 'mimo-v2.6-text-free').inputModalities, ['text'])
+  // metadata silent for this id: the built-in pattern still decides
+  assert.deepEqual(declared.resolveModel('opencode2dsh', 'undeclared-free').inputModalities, ['text'])
+  assert.deepEqual(declared.resolveModel('opencode2dsh', 'mimo-v2.6-undeclared-free').inputModalities, ['text', 'image'])
+  // a catalog without a modalities() member at all (structural CatalogLike)
+  const legacy = new ZenAdapter({
+    list: () => ['space-bunny-free', 'mimo-v2.6-flash-free'],
+    decision: () => ({ allowed: true, source: 'test', known: true }),
+    reasoningCapability: () => undefined,
+  })
+  assert.deepEqual(legacy.resolveModel('opencode2dsh', 'space-bunny-free').inputModalities, ['text'])
+  assert.deepEqual(legacy.resolveModel('opencode2dsh', 'mimo-v2.6-flash-free').inputModalities, ['text', 'image'])
 })
+
+/** A catalog whose models.dev `modalities.input` is `byModel` (undefined = silent). */
+function catalogWithModalities(byModel: Record<string, string[] | undefined>) {
+  return {
+    list: () => Object.keys(byModel),
+    decision: () => ({ allowed: true, source: 'test', known: true }),
+    reasoningCapability: () => undefined,
+    modalities: (model: string) => byModel[model],
+  }
+}
 
 test('resolveModel prefers models.dev limits and keeps the defaults without them', () => {
   const catalog = (limits?: { contextWindow?: number; maxOutput?: number }) => ({
@@ -81,14 +115,15 @@ test('prepareCall returns the resolved model and a stream dispatcher', async () 
 
 test('listModels mirrors the catalog without duplicates', () => {
   const adapter = new ZenAdapter({
-    list: () => ['big-pickle', 'big-pickle', 'mimo-v2.5-free', 'mimo-v2.6-flash-free'],
+    list: () => ['big-pickle', 'big-pickle', 'mimo-v2.5-free', 'mimo-v2.6-flash-free', 'space-bunny-free'],
     decision: () => ({ allowed: true, source: 'test', known: true }),
     reasoningCapability: () => ({ reasoning: true, effortValues: [] }),
+    modalities: (model: string) => (model === 'mimo-v2.5-free' ? ['text', 'image'] : undefined),
   })
   const models = adapter.listModels('opencode2dsh')
-  assert.deepEqual(models.map((m) => m.id), ['big-pickle', 'mimo-v2.5-free', 'mimo-v2.6-flash-free'])
-  // Only the verified vision family advertises image input.
-  assert.deepEqual(models.map((m) => m.inputModalities), [['text'], ['text'], ['text', 'image']])
+  assert.deepEqual(models.map((m) => m.id), ['big-pickle', 'mimo-v2.5-free', 'mimo-v2.6-flash-free', 'space-bunny-free'])
+  // models.dev declares the modality per model; the built-in family is the fallback.
+  assert.deepEqual(models.map((m) => m.inputModalities), [['text'], ['text', 'image'], ['text', 'image'], ['text']])
 })
 
 test('reasoningEfforts: declared ladder wins, none folds into off, default ladder otherwise', () => {

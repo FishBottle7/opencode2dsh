@@ -55,6 +55,10 @@ interface ModelPrice {
   contextWindow?: number
   /** models.dev `limit.output`: the model's real max output tokens. */
   maxOutput?: number
+  /** models.dev `modalities.input`: the input kinds the model accepts
+   *  (["text","image","video",…]). Absent when the metadata declares none, so
+   *  the adapter keeps its own vision pattern for such a model. */
+  modalities?: string[]
 }
 
 /** Decide (model_metadata.go Decide, ported with the deprecation fix).
@@ -121,10 +125,12 @@ export function decodeModelsDev(data: unknown): Map<string, ModelPrice> {
       const modelId = typeof raw.id === 'string' && raw.id.length > 0 ? raw.id : modelKey
       const cost = (raw.cost ?? {}) as Record<string, unknown>
       const limit = (raw.limit ?? {}) as Record<string, unknown>
+      const modalities = (raw.modalities ?? {}) as Record<string, unknown>
       const num = (value: unknown): number | undefined =>
         typeof value === 'number' && Number.isFinite(value) ? value : undefined
       const contextWindow = num(limit.context)
       const maxOutput = num(limit.output)
+      const inputModalities = decodeModalities(modalities.input)
       result.set(modelId, {
         input: num(cost.input),
         output: num(cost.output),
@@ -134,6 +140,9 @@ export function decodeModelsDev(data: unknown): Map<string, ModelPrice> {
         // Omitted when absent so caches written before limits existed stay valid.
         ...(contextWindow !== undefined ? { contextWindow } : {}),
         ...(maxOutput !== undefined ? { maxOutput } : {}),
+        // Same for modalities: a cache written before this field existed carries
+        // none, and the adapter then keeps its built-in vision pattern.
+        ...(inputModalities !== undefined ? { modalities: inputModalities } : {}),
       })
     }
     if (result.size > 0) return result
@@ -168,6 +177,21 @@ function decodeEffortValues(raw: unknown): { effortValues?: string[] } {
     }
   }
   return values.length > 0 ? { effortValues: values } : { effortValues: [] }
+}
+
+/**
+ * models.dev `modalities.input` (live shape 2026-09-28): an array of lowercase
+ * kind strings such as ["text","image","video","pdf","audio"]. Only a non-empty
+ * array of non-empty strings is kept, so a malformed or absent field speaks for
+ * nothing and the adapter keeps its own vision pattern (isVisionModel).
+ */
+function decodeModalities(input: unknown): string[] | undefined {
+  if (!Array.isArray(input)) return undefined
+  const kinds: string[] = []
+  for (const kind of input) {
+    if (typeof kind === 'string' && kind.length > 0 && !kinds.includes(kind)) kinds.push(kind)
+  }
+  return kinds.length > 0 ? kinds : undefined
 }
 
 export interface CatalogSnapshot {
@@ -350,6 +374,17 @@ export class ModelCatalog {
       ...(price.contextWindow !== undefined ? { contextWindow: price.contextWindow } : {}),
       ...(price.maxOutput !== undefined ? { maxOutput: price.maxOutput } : {}),
     }
+  }
+
+  /**
+   * models.dev `modalities.input` for one model: the input kinds it accepts
+   * (["text","image","video",…]). undefined when the metadata cannot speak for
+   * the model (pending, or id absent) or declares no modalities — the caller
+   * then keeps its own vision pattern (isVisionModel).
+   */
+  modalities(model: string): string[] | undefined {
+    const modalities = this.#prices.get(model)?.modalities
+    return modalities === undefined ? undefined : [...modalities]
   }
 
   /**
