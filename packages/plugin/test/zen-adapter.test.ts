@@ -2,7 +2,8 @@ import { normalizeResponsesPayload } from '../src/adapter/zen-adapter.ts'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { ModelCatalog } from '../src/adapter/catalog.ts'
-import { isResponsesModel, PROVIDER_ID, reasoningEfforts, reasoningEffortWire, ZenAdapter } from '../src/adapter/zen-adapter.ts'
+import { isResponsesModel, PROVIDER_ID, reasoningEfforts, reasoningEffortWire, WATCHDOG_FIRST_MESSAGE, ZenAdapter } from '../src/adapter/zen-adapter.ts'
+import { Config, resolveConfig } from '../src/config.ts'
 
 /**
  * The exact method surface dsh-llm touches on a registered adapter. A missing
@@ -289,9 +290,14 @@ test('responses models use the wider body-idle window, injectable for tests', as
   // A provider that emits `start` immediately, then never speaks again: the
   // stream can only end through the body-idle watchdog, so the surfaced
   // error's arrival time measures the window actually applied per model.
+  // keepAlive is REF'D (and cleared below) for the reason spelled out in
+  // rotate.test.ts's muteProvider(): the adapter's deadline is unref'd, so a
+  // fake parked on a bare promise drains the event loop and `node --test`
+  // cancels the file before the watchdog can fire.
+  let keepAlive: NodeJS.Timeout | undefined
   async function* hangAfterStart(): AsyncGenerator<{ type: string; partial: unknown }> {
     yield { type: 'start', partial: { content: [] } }
-    await new Promise(() => {})
+    await new Promise((resolve) => { keepAlive = setTimeout(resolve, 60_000) })
   }
   const measure = async (model: string) => {
     const adapter = new ZenAdapter(
@@ -312,13 +318,71 @@ test('responses models use the wider body-idle window, injectable for tests', as
     }
     return { reason, elapsed: Date.now() - began }
   }
-  const chat = await measure('big-pickle')
-  assert.equal(chat.reason?.kind, 'error')
-  assert.ok(chat.elapsed < 200, `chat should honor the injected 50ms window, took ${chat.elapsed}ms`)
-  const responses = await measure('muse-spark-1.2-contributor-free')
-  assert.equal(responses.reason?.kind, 'error')
-  assert.ok(responses.elapsed > 350, `responses should honor the injected 400ms window, took ${responses.elapsed}ms`)
+  try {
+    const chat = await measure('big-pickle')
+    assert.equal(chat.reason?.kind, 'error')
+    assert.ok(chat.elapsed < 200, `chat should honor the injected 50ms window, took ${chat.elapsed}ms`)
+    const responses = await measure('muse-spark-1.2-contributor-free')
+    assert.equal(responses.reason?.kind, 'error')
+    assert.ok(responses.elapsed > 350, `responses should honor the injected 400ms window, took ${responses.elapsed}ms`)
+  } finally {
+    clearTimeout(keepAlive)
+  }
 })
+
+test('ZenAdapter arms the first-event window the plugin config carries, not the 30s default', async () => {
+  // The production wiring, end to end: `Config` -> `resolveConfig` -> the
+  // constructor options exactly as src/index.ts passes them. A provider that
+  // never yields a single pi-ai event (the tunnel that stood and went mute)
+  // leaves the first-event watchdog as the only thing that can end the turn,
+  // so the surfaced error's arrival time measures the window actually armed.
+  //
+  // keepAlive is REF'd, and cleared in the finally: the adapter's own deadline
+  // is unref'd so a watchdog never holds a real process open, which means a
+  // fake provider parked on a bare promise lets the event loop drain and
+  // node:test cancels the file before the watchdog can fire. It only holds the
+  // loop open — the measured window is still the adapter's own clock.
+  let keepAlive: NodeJS.Timeout | undefined
+  async function* mute(): AsyncGenerator<{ type: string; partial: unknown }> {
+    await new Promise((resolve) => { keepAlive = setTimeout(resolve, 60_000) })
+  }
+  const cfg = resolveConfig({ firstEventMs: Config({ firstEventMs: 300 }).firstEventMs })
+  assert.equal(cfg.firstEventMs, 300, 'the configured window must reach resolveConfig')
+  const adapter = new ZenAdapter(
+    {
+      list: () => [],
+      decision: () => ({ allowed: true, source: 'test', known: true }),
+      reasoningCapability: () => undefined,
+    },
+    {
+      providerOverride: { streamSimple: () => mute() },
+      firstEventMs: cfg.firstEventMs,
+      bodyIdleMs: cfg.bodyIdleMs,
+      responsesBodyIdleMs: cfg.responsesBodyIdleMs,
+    },
+  )
+  const began = Date.now()
+  let reason: { kind: string; failure?: { message: string; code: string } } | undefined
+  try {
+    for await (const chunk of adapter.stream({ provider: 'opencode2dsh', model: 'big-pickle', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] })) {
+      if (chunk.type === 'finish') {
+        reason = chunk.reason
+        break
+      }
+    }
+  } finally {
+    clearTimeout(keepAlive)
+  }
+  const elapsed = Date.now() - began
+  assert.equal(reason?.kind, 'error')
+  // Verbatim watchdog message: the "timeout" keyword is load-bearing, it is
+  // what classifyStreamFailure() reads to rotate the egress.
+  assert.equal(reason?.failure?.message, WATCHDOG_FIRST_MESSAGE)
+  assert.equal(reason?.failure?.code, 'TIMEOUT')
+  assert.ok(elapsed > 200, `should honor the configured 300ms first-event window, took ${elapsed}ms`)
+  assert.ok(elapsed < 1500, `must not fall back to the 30s default window, took ${elapsed}ms`)
+})
+
 test('Responses payloads use reasoning and remove unsupported none/off fields', () => {
   assert.deepEqual(
     normalizeResponsesPayload({ input: [], reasoning: { effort: 'none' }, reasoning_effort: 'none' }),

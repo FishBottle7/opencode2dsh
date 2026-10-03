@@ -71,6 +71,23 @@ async function collect(adapter: ZenAdapter): Promise<string[]> {
   return out
 }
 
+/**
+ * A provider that yields NOTHING and never will — the tunnel that stood and
+ * went mute. Parks on a REF'D timer instead of a bare promise: the adapter's
+ * deadline is unref'd on purpose (a watchdog must never hold a real process
+ * open), so with no ref'd handle left the event loop drains and `node --test`
+ * cancels the file before the watchdog can fire. Callers clear the timer.
+ */
+function muteProvider(armed?: { timer?: NodeJS.Timeout }): { streamSimple(): AsyncIterable<ScriptedEvent> } {
+  return {
+    streamSimple(): AsyncIterable<ScriptedEvent> {
+      return (async function* (): AsyncGenerator<ScriptedEvent> {
+        await new Promise((resolve) => { if (armed) armed.timer = setTimeout(resolve, 60_000) })
+      })()
+    },
+  }
+}
+
 const err = (message: string): ScriptedEvent => ({
   type: 'error',
   error: {
@@ -229,24 +246,26 @@ test('adapter watchdog: pre-content silence times out and rotates to a live exit
   // attempt 1: a stream that never sends ANY event (the tunnel that stood
   // and went mute — the 70-minute hang shape); attempt 2: healthy.
   let call = 0
+  const armed: { timer?: NodeJS.Timeout } = {}
+  const mute = muteProvider(armed)
   const provider = {
     streamSimple(): AsyncIterable<ScriptedEvent> {
       call += 1
-      if (call === 1) {
-        return (async function* (): AsyncGenerator<ScriptedEvent> {
-          await new Promise(() => {}) // never resolves: total silence
-        })()
-      }
+      if (call === 1) return mute.streamSimple()
       return (async function* () {
         for (const e of ok()) yield e
       })()
     },
   }
   const adapter = new ZenAdapter(fakeCatalog(), { providerOverride: provider, firstEventMs: 80 })
-  const chunks = await collect(adapter)
-  assert.ok(chunks.some((c) => c.includes('hi')), 'the watchdog rotated past the mute exit to content')
-  assert.ok(!chunks.some((c) => c.includes('timeout')), 'the intermediate watchdog error never surfaces')
-  setRotateDelegate(null)
+  try {
+    const chunks = await collect(adapter)
+    assert.ok(chunks.some((c) => c.includes('hi')), 'the watchdog rotated past the mute exit to content')
+    assert.ok(!chunks.some((c) => c.includes('timeout')), 'the intermediate watchdog error never surfaces')
+  } finally {
+    clearTimeout(armed.timer)
+    setRotateDelegate(null)
+  }
 })
 
 test('adapter watchdog: no usable exit left -> the timeout error surfaces with the story', async () => {
@@ -254,19 +273,17 @@ test('adapter watchdog: no usable exit left -> the timeout error surfaces with t
   const pool = new ExitPool()
   pool.add(node({ id: 'a:1', exitIP: '1.1.1.1' }))
   setRotateDelegate(createRotateDelegate(pool, { maxAttempts: 3 }))
-  const provider = {
-    streamSimple(): AsyncIterable<ScriptedEvent> {
-      return (async function* (): AsyncGenerator<ScriptedEvent> {
-        await new Promise(() => {}) // never resolves: total silence
-      })()
-    },
+  const armed: { timer?: NodeJS.Timeout } = {}
+  const adapter = new ZenAdapter(fakeCatalog(), { providerOverride: muteProvider(armed), firstEventMs: 80 })
+  try {
+    const chunks = await collect(adapter)
+    const surfaced = chunks.find((c) => c.includes('timeout'))
+    assert.ok(surfaced !== undefined, 'the watchdog error surfaces when rotation is impossible')
+    assert.ok(surfaced!.includes('first stream event timeout'), 'the message names the silence window')
+  } finally {
+    clearTimeout(armed.timer)
+    setRotateDelegate(null)
   }
-  const adapter = new ZenAdapter(fakeCatalog(), { providerOverride: provider, firstEventMs: 80 })
-  const chunks = await collect(adapter)
-  const surfaced = chunks.find((c) => c.includes('timeout'))
-  assert.ok(surfaced !== undefined, 'the watchdog error surfaces when rotation is impossible')
-  assert.ok(surfaced!.includes('first stream event timeout'), 'the message names the silence window')
-  setRotateDelegate(null)
 })
 
 test('adapter watchdog: mid-stream silence after delivered content surfaces, never hangs', async () => {
@@ -277,21 +294,32 @@ test('adapter watchdog: mid-stream silence after delivered content surfaces, nev
   // content flows, then the stream goes mute forever (dead tunnel mid-body).
   // No rotate is allowed after content (3.4) — the failure must SURFACE.
   let sawContent = false
+  const armed: { timer?: NodeJS.Timeout } = {}
+  const mute = muteProvider(armed)
   const provider = {
     streamSimple(): AsyncIterable<ScriptedEvent> {
       return (async function* () {
         yield { type: 'start' }
         yield { type: 'text_delta', delta: 'partial' }
         sawContent = true
-        await new Promise(() => {}) // mute mid-body, forever
+        // mute mid-body, forever
+        await new Promise<void>((resolve) => {
+          const later = setTimeout(resolve, 60_000)
+          clearTimeout(armed.timer)
+          armed.timer = later
+        })
       })()
     },
   }
   const adapter = new ZenAdapter(fakeCatalog(), { providerOverride: provider, firstEventMs: 40, bodyIdleMs: 80 })
-  const chunks = await collect(adapter)
-  assert.ok(sawContent, 'content was delivered before the mute')
-  assert.ok(chunks.some((c) => c.includes('partial')), 'partial content reached the consumer')
-  const surfaced = chunks.find((c) => c.includes('body idle timeout'))
-  assert.ok(surfaced !== undefined, 'the mid-stream mute surfaces as a terminal error instead of hanging')
-  setRotateDelegate(null)
+  try {
+    const chunks = await collect(adapter)
+    assert.ok(sawContent, 'content was delivered before the mute')
+    assert.ok(chunks.some((c) => c.includes('partial')), 'partial content reached the consumer')
+    const surfaced = chunks.find((c) => c.includes('body idle timeout'))
+    assert.ok(surfaced !== undefined, 'the mid-stream mute surfaces as a terminal error instead of hanging')
+  } finally {
+    clearTimeout(armed.timer)
+    setRotateDelegate(null)
+  }
 })
