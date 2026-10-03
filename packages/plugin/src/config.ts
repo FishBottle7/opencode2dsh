@@ -36,6 +36,20 @@ export interface Opencode2dshConfig {
   /** Consecutive crash count that trips the circuit breaker. */
   maxConsecutiveCrashes?: number
   /**
+   * Watchdog: ms to wait for the first pi-ai stream event (issue #33). The
+   * shipped window (zen-adapter.ts DEFAULT_FIRST_EVENT_MS) is the fallback
+   * when unset, so nobody who does not set it sees a behavior change.
+   */
+  firstEventMs?: number
+  /** Watchdog: ms of body silence tolerated mid-stream (chat models). */
+  bodyIdleMs?: number
+  /**
+   * Watchdog: body-idle window for Responses models (muse-spark-*), whose
+   * bursty reasoning needs the wider window (issue #7). Applied as a floor
+   * over `bodyIdleMs`, never below it.
+   */
+  responsesBodyIdleMs?: number
+  /**
    * IP-pool exit routing (docs/ip-pool.md). Everything below is pure plugin
    * config; the settings page (IP-6) will own these live, this object is
    * the cordis.patch.yml seam.
@@ -136,6 +150,17 @@ export const Config = Schema.object({
   restartMaxDelayMs: Schema.number().step(1).min(0).default(defaults.restartMaxDelayMs),
   /** Consecutive crash count that trips the circuit breaker. */
   maxConsecutiveCrashes: Schema.number().step(1).min(0).default(defaults.maxConsecutiveCrashes),
+  /**
+   * Watchdog: ms to wait for the first stream event. No `.default()` on
+   * purpose — the adapter owns those numbers (DEFAULT_FIRST_EVENT_MS &
+   * friends), and duplicating them here would make two sources of truth for
+   * one window. Undefined leaves the shipped value in force.
+   */
+  firstEventMs: Schema.number().step(1).min(0),
+  /** Watchdog: ms of body silence tolerated mid-stream (chat models). */
+  bodyIdleMs: Schema.number().step(1).min(0),
+  /** Watchdog: body-idle floor for Responses models (muse-spark-*). */
+  responsesBodyIdleMs: Schema.number().step(1).min(0),
   /** The ip-pool settings form (docs/ip-pool.md §5.1); served as this entry. */
   ipPool: IpPoolConfigSchema.volatile(),
 })
