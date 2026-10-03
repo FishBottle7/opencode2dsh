@@ -135,11 +135,6 @@ function applyAdapter(
       if (lastError) logger.warn(`opencode2dsh: catalog refresh issue: ${lastError}`)
     },
   })
-  // Watchdog windows (issue #33): the adapter already accepted them, but this
-  // was the only production call site and it passed none, so a user on a slow
-  // cold start had no way to widen the first-event budget. Unset keys stay
-  // undefined and the constructor's `?? DEFAULT_*_MS` keeps the shipped
-  // windows.
   const adapter = new ZenAdapter(catalog, {
     firstEventMs: cfg.firstEventMs,
     bodyIdleMs: cfg.bodyIdleMs,

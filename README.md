@@ -87,7 +87,7 @@ Defaults work out of the box. Override via the profile's `cordis.patch.yml`:
 | `agentPath` | auto-resolved | Sidecar only: path to the agent binary. |
 | `agentArgs` | — | Sidecar only: extra CLI args for the agent. |
 | `restartDelayMs` / `restartMaxDelayMs` / `maxConsecutiveCrashes` | `1000` / `60000` / `5` | Sidecar only: restart backoff and circuit breaker. |
-| `firstEventMs` / `bodyIdleMs` / `responsesBodyIdleMs` | `30000` / `120000` / `300000` | Stream-liveness watchdogs, in ms: how long to wait for the first stream event, how much body silence to tolerate mid-response, and the wider body-idle floor for Responses models (`muse-spark-*`). Widen `firstEventMs` on a slow cold start. Unset keeps the shipped windows. |
+| `firstEventMs` / `bodyIdleMs` / `responsesBodyIdleMs` | `30000` / `120000` / `300000` | Adapter only: stream-liveness watchdogs, in ms (integers from `1` to `600000`). Time to the first stream event, mid-response body silence, and the body-idle floor for Responses models (`muse-spark-*`). Increase `firstEventMs` for slow cold starts. Unset keeps the defaults; restart DSH after editing. |
 
 ## How it works
 

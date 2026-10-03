@@ -310,11 +310,15 @@ test('responses models use the wider body-idle window, injectable for tests', as
     )
     const began = Date.now()
     let reason: { kind: string } | undefined
-    for await (const chunk of adapter.stream({ provider: 'opencode2dsh', model, messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] })) {
-      if (chunk.type === 'finish') {
-        reason = chunk.reason as { kind: string }
-        break
+    try {
+      for await (const chunk of adapter.stream({ provider: 'opencode2dsh', model, messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] })) {
+        if (chunk.type === 'finish') {
+          reason = chunk.reason as { kind: string }
+          break
+        }
       }
+    } finally {
+      clearTimeout(keepAlive)
     }
     return { reason, elapsed: Date.now() - began }
   }
@@ -331,17 +335,8 @@ test('responses models use the wider body-idle window, injectable for tests', as
 })
 
 test('ZenAdapter arms the first-event window the plugin config carries, not the 30s default', async () => {
-  // The production wiring, end to end: `Config` -> `resolveConfig` -> the
-  // constructor options exactly as src/index.ts passes them. A provider that
-  // never yields a single pi-ai event (the tunnel that stood and went mute)
-  // leaves the first-event watchdog as the only thing that can end the turn,
-  // so the surfaced error's arrival time measures the window actually armed.
-  //
-  // keepAlive is REF'd, and cleared in the finally: the adapter's own deadline
-  // is unref'd so a watchdog never holds a real process open, which means a
-  // fake provider parked on a bare promise lets the event loop drain and
-  // node:test cancels the file before the watchdog can fire. It only holds the
-  // loop open — the measured window is still the adapter's own clock.
+  // Measure constructor injection with a silent provider. Production entry
+  // wiring is covered separately in watchdog-config.test.ts.
   let keepAlive: NodeJS.Timeout | undefined
   async function* mute(): AsyncGenerator<{ type: string; partial: unknown }> {
     await new Promise((resolve) => { keepAlive = setTimeout(resolve, 60_000) })

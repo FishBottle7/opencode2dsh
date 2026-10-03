@@ -78,11 +78,12 @@ async function collect(adapter: ZenAdapter): Promise<string[]> {
  * open), so with no ref'd handle left the event loop drains and `node --test`
  * cancels the file before the watchdog can fire. Callers clear the timer.
  */
-function muteProvider(armed?: { timer?: NodeJS.Timeout }): { streamSimple(): AsyncIterable<ScriptedEvent> } {
+function muteProvider(armed: { timer?: NodeJS.Timeout }): { streamSimple(): AsyncIterable<ScriptedEvent> } {
   return {
     streamSimple(): AsyncIterable<ScriptedEvent> {
       return (async function* (): AsyncGenerator<ScriptedEvent> {
-        await new Promise((resolve) => { if (armed) armed.timer = setTimeout(resolve, 60_000) })
+        clearTimeout(armed.timer)
+        await new Promise((resolve) => { armed.timer = setTimeout(resolve, 60_000) })
       })()
     },
   }
@@ -295,7 +296,6 @@ test('adapter watchdog: mid-stream silence after delivered content surfaces, nev
   // No rotate is allowed after content (3.4) — the failure must SURFACE.
   let sawContent = false
   const armed: { timer?: NodeJS.Timeout } = {}
-  const mute = muteProvider(armed)
   const provider = {
     streamSimple(): AsyncIterable<ScriptedEvent> {
       return (async function* () {
@@ -304,9 +304,7 @@ test('adapter watchdog: mid-stream silence after delivered content surfaces, nev
         sawContent = true
         // mute mid-body, forever
         await new Promise<void>((resolve) => {
-          const later = setTimeout(resolve, 60_000)
-          clearTimeout(armed.timer)
-          armed.timer = later
+          armed.timer = setTimeout(resolve, 60_000)
         })
       })()
     },

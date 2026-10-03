@@ -156,11 +156,11 @@ export const Config = Schema.object({
    * friends), and duplicating them here would make two sources of truth for
    * one window. Undefined leaves the shipped value in force.
    */
-  firstEventMs: Schema.number().step(1).min(0),
+  firstEventMs: Schema.number().step(1).min(1).max(600_000),
   /** Watchdog: ms of body silence tolerated mid-stream (chat models). */
-  bodyIdleMs: Schema.number().step(1).min(0),
+  bodyIdleMs: Schema.number().step(1).min(1).max(600_000),
   /** Watchdog: body-idle floor for Responses models (muse-spark-*). */
-  responsesBodyIdleMs: Schema.number().step(1).min(0),
+  responsesBodyIdleMs: Schema.number().step(1).min(1).max(600_000),
   /** The ip-pool settings form (docs/ip-pool.md §5.1); served as this entry. */
   ipPool: IpPoolConfigSchema.volatile(),
 })

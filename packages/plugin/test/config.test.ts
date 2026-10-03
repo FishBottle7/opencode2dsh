@@ -77,9 +77,13 @@ test('Config declares and bounds the stream watchdog windows, undefined when uns
   assert.equal(config.firstEventMs, 300)
   assert.equal(config.bodyIdleMs, 900)
   assert.equal(config.responsesBodyIdleMs, 1800)
-  assert.throws(() => Config({ firstEventMs: -1 }), /firstEventMs/)
-  assert.throws(() => Config({ bodyIdleMs: -1 }), /bodyIdleMs/)
-  assert.throws(() => Config({ responsesBodyIdleMs: -1 }), /responsesBodyIdleMs/)
+  for (const key of ['firstEventMs', 'bodyIdleMs', 'responsesBodyIdleMs'] as const) {
+    for (const value of [-1, 0, 0.5, 600_001, 2 ** 31, Infinity, NaN, '300']) {
+      assert.throws(() => Config({ [key]: value }), new RegExp(key))
+    }
+    assert.equal(Config({ [key]: 1 })[key], 1)
+    assert.equal(Config({ [key]: 600_000 })[key], 600_000)
+  }
   // No schema default on purpose: an unset window must stay undefined so the
   // adapter's own `?? DEFAULT_*_MS` owns the shipped number (one source).
   const bare = Config({})

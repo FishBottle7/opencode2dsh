@@ -83,7 +83,7 @@ dsh plugin --profile web add ./opencode2dsh-dsh-plugin-<version>.tgz
 | `agentPath` | 自动解析 | 仅 sidecar：agent 二进制路径。 |
 | `agentArgs` | — | 仅 sidecar：传给 agent 的额外 CLI 参数。 |
 | `restartDelayMs` / `restartMaxDelayMs` / `maxConsecutiveCrashes` | `1000` / `60000` / `5` | 仅 sidecar：重启退避与熔断阈值。 |
-| `firstEventMs` / `bodyIdleMs` / `responsesBodyIdleMs` | `30000` / `120000` / `300000` | 流存活看门狗（单位毫秒）：等待首个流事件的时长、可容忍的流中静默时长，以及 Responses 模型（`muse-spark-*`）更宽的静默下限。冷启动慢时可调大 `firstEventMs`。不设置则保持内置窗口。 |
+| `firstEventMs` / `bodyIdleMs` / `responsesBodyIdleMs` | `30000` / `120000` / `300000` | 仅 adapter：流存活超时，单位毫秒，取 `1` 到 `600000` 的整数。分别控制首事件等待、流中静默，以及 Responses 模型（`muse-spark-*`）的静默下限。冷启动慢时可调大 `firstEventMs`。不设置则使用默认值；修改后重启 DSH。 |
 
 ## 工作原理
 
