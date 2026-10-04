@@ -5,7 +5,7 @@ import * as openaiCompletions from '@earendil-works/pi-ai/api/openai-completions
 import type { Context, Model } from '@earendil-works/pi-ai'
 import { ZenAdapter } from '../src/adapter/zen-adapter.ts'
 import type { HarnessChunk, PiDoneMessage, PiEvent } from '../src/adapter/events.ts'
-import type { HarnessGenerateOptions } from '../src/adapter/messages.ts'
+import { piAiTranscriptShape, type HarnessGenerateOptions } from '../src/adapter/messages.ts'
 
 const options: HarnessGenerateOptions = {
   provider: 'opencode2dsh',
@@ -13,6 +13,27 @@ const options: HarnessGenerateOptions = {
   messages: [{ role: 'user', content: [{ type: 'text', text: 'Calculate 17 * 19.' }] }],
   reasoningEffort: 'high',
   maxTokens: 64,
+}
+
+// pi-ai >= 0.87 splits the provider-facing context type: every api
+// implementation takes a `TranscriptContext`, which is the `Context` already
+// folded by `normalizeContext`. The subpath that exports it only exists from
+// 0.86 on, so it is reached dynamically and only when the installed pi-ai is
+// actually message-shaped; on 0.82.x the api layer reads `Context` directly and
+// this is the identity. 0.82's exports map has no `./utils/*` entry at all,
+// which is why this cannot be a static import.
+async function brandForInstalledPiAi(context: Context): Promise<unknown> {
+  if ((await piAiTranscriptShape()) !== 'message') return context
+  const specifier = `${'@earendil-works'}/pi-ai/utils/transcript`
+  const { normalizeContext } = await import(specifier)
+  return normalizeContext(context)
+}
+
+// The api layer is called through a cast: its context parameter carries a brand
+// that only exists from 0.87 on and that this test cannot name without importing
+// the 0.86+-only subpath above.
+const openaiCompletionsUnbranded = openaiCompletions as unknown as {
+  streamSimple(model: Model<'openai-completions'>, context: unknown, wireOptions: never): AsyncIterable<unknown>
 }
 
 function message(overrides: Partial<PiDoneMessage> = {}): PiDoneMessage {
@@ -92,7 +113,9 @@ test('reasoning-only length retries once with Off, streams immediately and aggre
 
   assert.equal(calls.length, 2)
   assert.equal((calls[0]!.options.onPayload({}) as Record<string, unknown>).reasoning_effort, 'high')
-  assert.equal((calls[1]!.options.onPayload({}) as Record<string, unknown>).reasoning_effort, 'none')
+  // the Off retry has no wire spelling (both 'none' and 'off' are a hard 400),
+  // so the payload must come back with no reasoning_effort field at all
+  assert.equal(calls[1]!.options.onPayload({}), undefined)
   assert.deepEqual(calls[1]!.context, calls[0]!.context, 'retry uses the original conversation')
   assert.equal(calls[1]!.options.maxTokens, 64)
   assert.equal(calls[1]!.options.headers['x-opencode-session'], calls[0]!.options.headers['x-opencode-session'])
@@ -225,13 +248,17 @@ test('real pi-ai HTTP streaming sends the Off fallback and returns one usable re
       reasoningCapability: () => ({ reasoning: true, effortValues: [] }),
     }, { providerOverride: {
       streamSimple(model: Model<'openai-completions'>, context: Context, wireOptions: never) {
-        return openaiCompletions.streamSimple({ ...model, baseUrl }, context, wireOptions)
+        // a generator, not an async function: the adapter consumes this as an
+        // AsyncIterable, and awaiting the brand must not wrap it in a Promise
+        return (async function* () {
+          yield* openaiCompletionsUnbranded.streamSimple({ ...model, baseUrl }, await brandForInstalledPiAi(context), wireOptions)
+        })()
       },
     } })
     const chunks = await collect(adapter, { ...options, signal: AbortSignal.timeout(5000) })
     assert.equal(bodies.length, 2)
     assert.equal(bodies[0]!.reasoning_effort, 'high')
-    assert.equal(bodies[1]!.reasoning_effort, 'none')
+    assert.equal('reasoning_effort' in bodies[1]!, false, 'the Off retry omits the field')
     assert.deepEqual(bodies[0]!.messages, bodies[1]!.messages)
     assert.equal(chunks.filter((c) => c.type === 'text-delta').map((c) => c.text).join(''), '323')
     assert.deepEqual(chunks.filter((c) => c.type === 'block-start').map((c) => c.index), [0, 1])

@@ -151,6 +151,7 @@ The plugin writes a health snapshot after every refresh round:
 | Muse reports `REGION_BLOCKED` / "This model is not available in your country" | Zen has rejected the current network region for this model. Plugin 0.3.5 preserves that explanation; older versions mislabeled the same 403 as an invalid API key. The anonymous lane does not need a personal key. Use a model available in your region. |
 | Connection error to `127.0.0.1:*` | A stale sidecar route shadows the adapter; plugin ≥ 0.2.1 removes it at startup. |
 | Install fails with `ERR_PNPM_IGNORED_BUILDS` | A transitive dependency of `pi-ai` (`@google/genai`, `protobufjs`) has build scripts that are not needed at runtime. Approve-or-decline them via the plugin market, or set both to `false` under `allowBuilds:` in the profile's `pnpm-workspace.yaml`. |
+| Another pi-ai plugin fails with `Cannot read properties of undefined (reading 'length')` | Your profile installs every plugin into one hoisted tree, so they all share a single `@earendil-works/pi-ai`. A plugin whose own range wants a newer version than the one that won is installed anyway and then fails on every turn. `pnpm peers check` in the profile directory names it. Upgrade that plugin. |
 
 ## Security
 

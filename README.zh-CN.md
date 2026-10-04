@@ -142,6 +142,7 @@ https://opencode.ai/zen/v1        ← Authorization: Bearer public
 | Muse 报 `REGION_BLOCKED` / "This model is not available in your country" | Zen 不向当前网络地区提供该模型。插件 0.3.5 保留上游解释；旧版会把这个 403 误报为 API 密钥无效。匿名通道不需要个人密钥，可使用当前地区可用的模型。 |
 | 连接 `127.0.0.1:*` 报错 | 残留的 sidecar 路由遮蔽了 adapter；插件 ≥ 0.2.1 启动时会自动清理。 |
 | 安装时报 `ERR_PNPM_IGNORED_BUILDS` | `pi-ai` 的传递依赖（`@google/genai`、`protobufjs`）带构建脚本，运行时并不需要。在插件市场里按提示选择允许/拒绝，或在 profile 的 `pnpm-workspace.yaml` 的 `allowBuilds:` 下把这两项设为 `false`。 |
+| 另一个 pi-ai 插件报 `Cannot read properties of undefined (reading 'length')` | profile 会把所有插件装进同一棵 hoisted 树，因此共用一份 `@earendil-works/pi-ai`。某个插件要求的区间比实际装上的版本新时，它照样会被装上，然后每一轮都失败。到 profile 目录跑 `pnpm peers check` 能定位到它。升级那个插件即可。 |
 
 ## 安全性
 

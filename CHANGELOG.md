@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- The adapter now reads the transcript shape off the installed `@earendil-works/pi-ai` instead of assuming one, so it emits the shape that pi-ai actually reads on any version in the declared range. pi-ai 0.86.0 added a `system` case to `utils/estimate.js`, so which of the two shapes is correct depends entirely on the version a profile happens to resolve; this removes the dependency on that being right.
+
+- Selecting the `off` effort level no longer fails the request. The Zen gateway accepts `minimal|low|medium|high|xhigh|max` and answers a hard 400 to both `none` and `off`, so there is no wire spelling for "do not think" and the field is now omitted instead. This is the path the max-tokens recovery retry takes when a turn stops on reasoning alone, which means that retry could not succeed before.
+
 ## 0.3.7 (2026-10-04)
 
 ### Added
