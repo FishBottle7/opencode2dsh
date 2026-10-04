@@ -151,13 +151,15 @@ test('reasoningEfforts: declared ladder wins, none folds into off, default ladde
 })
 
 test('reasoningEffortWire maps picker ids to the gateway spelling', () => {
-  // no selection: inject nothing (provider default keeps always-think models thinking)
+  // no selection: inject nothing, which is the provider default
   assert.equal(reasoningEffortWire(undefined), undefined)
-  // off must SEND none — a mere omission never disables Zen's thinking models
-  assert.equal(reasoningEffortWire('off'), 'none')
-  // ladder levels pass through verbatim
+  // off must inject NOTHING: live-probed 2026-10-04, the gateway 400s on both
+  // 'none' and 'off', so there is no wire spelling for "do not think"
+  assert.equal(reasoningEffortWire('off'), undefined)
+  // ladder levels pass through verbatim, and 'max' is accepted by the gateway
   assert.equal(reasoningEffortWire('low'), 'low')
   assert.equal(reasoningEffortWire('xhigh'), 'xhigh')
+  assert.equal(reasoningEffortWire('max'), 'max')
   // unknown ids were never advertised; inject nothing rather than risk the 400
   assert.equal(reasoningEffortWire('banana'), undefined)
 })
@@ -218,9 +220,10 @@ async function runStream(catalogReasoning: boolean, effort?: string): Promise<Ar
 }
 
 test('stream injects the selected reasoning_effort into the outgoing body', async () => {
-  // off -> wire none (the only spelling that stops the always-think models)
+  // off has no wire spelling, so it must not add the field at all; the onPayload
+  // falls back to the plain gate shaper (undefined on a gate-satisfied body)
   const offOptions = (await runStream(true, 'off'))[0]!
-  assert.deepEqual(offOptions.onPayload?.({ ...gateBody }), { ...gateBody, reasoning_effort: 'none' })
+  assert.equal(offOptions.onPayload?.({ ...gateBody }), undefined)
 
   // ladder levels ride verbatim
   const lowOptions = (await runStream(true, 'low'))[0]!
@@ -234,9 +237,9 @@ test('stream injects the selected reasoning_effort into the outgoing body', asyn
 
 test('stream keeps the free-lane gate rewrite alongside the effort injection', async () => {
   // a body missing the gate tools gets them AND the effort in one rewrite
-  const offOptions = (await runStream(true, 'off'))[0]!
-  const shaped = offOptions.onPayload?.({ model: 'big-pickle', messages: [], stream: true }) as Record<string, unknown>
-  assert.equal(shaped.reasoning_effort, 'none')
+  const lowOptions = (await runStream(true, 'low'))[0]!
+  const shaped = lowOptions.onPayload?.({ model: 'big-pickle', messages: [], stream: true }) as Record<string, unknown>
+  assert.equal(shaped.reasoning_effort, 'low')
   assert.deepEqual(
     (shaped.tools as Array<{ function: { name: string } }>).map((t) => t.function.name).sort(),
     ['bash', 'read'],
@@ -244,7 +247,7 @@ test('stream keeps the free-lane gate rewrite alongside the effort injection', a
   assert.equal(shaped.tool_choice, 'none')
 
   // non-chat payloads pass through untouched even with an effort selected
-  assert.equal(offOptions.onPayload?.(null), undefined)
+  assert.equal(lowOptions.onPayload?.(null), undefined)
 })
 
 test('stream builds the pi-ai wire model with the catalog limits', async () => {

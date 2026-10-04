@@ -113,17 +113,20 @@ export function reasoningEfforts(capability: { reasoning: boolean; effortValues:
 }
 
 /**
- * The `reasoning_effort` wire value for a selected effort id. The Zen gateway
- * validates the field against `minimal|low|medium|high|xhigh|max|none`
- * (live-probed 2026-09-18: any other value is a hard 400), and `none` is the
- * only spelling that stops the always-think free models from thinking — a
- * mere omission keeps the provider default. So `off` maps to wire `none`,
- * ladder levels pass through verbatim, and unknown ids (never advertised)
- * inject nothing rather than risk the 400.
+ * The `reasoning_effort` wire value for a selected effort id.
+ *
+ * Live-probed 2026-10-04 against the Zen free lane: the gateway accepts
+ * `minimal|low|medium|high|xhigh|max` and rejects `none` and `off` with a hard
+ * 400. So the wire has no way to spell "do not think", and an omitted field is
+ * the only safe encoding. Ladder levels pass through verbatim, `off` is dropped
+ * rather than translated, and unknown ids inject nothing rather than risk the
+ * 400. Re-probe before changing this; the earlier comment here claimed `none`
+ * was the one accepted spelling of "off" and was wrong on both halves.
  */
 export function reasoningEffortWire(id: string | undefined): string | undefined {
   if (id === undefined) return undefined
-  if (id === 'off') return 'none'
+  // 'off' is deliberately not translated: every wire spelling for it is a 400.
+  if (id === 'off') return undefined
   return (REASONING_EFFORT_LADDER as readonly string[]).includes(id) ? id : undefined
 }
 
@@ -663,8 +666,8 @@ export class ZenAdapter {
     // serialized body right before dispatch — plain-chat contexts carry no
     // tools and the anonymous lane 403s every body without bash+read. The same
     // seam carries the selected reasoning effort: pi-ai has no option with the
-    // wire semantics this lane needs (selected off must SEND `none`, not omit),
-    // so the effort rides the payload rewrite instead.
+    // wire semantics this lane needs, so the effort rides the payload rewrite
+    // instead. With no effort to inject the hook stays the plain gate shaper.
     const onPayload =
       isResponses
         ? (payload: unknown): unknown => {
