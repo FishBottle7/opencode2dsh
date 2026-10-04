@@ -91,33 +91,33 @@ export interface PiTool {
 /**
  * pi-ai Context. The system prompt and the tool set ride a LEADING
  * `role: 'system'` message when the installed pi-ai reads that message, and the
- * `systemPrompt` / `tools` context fields when it reads those fields instead
- * (pi-ai 0.82.x). The two shapes are NOT interchangeable:
+ * `systemPrompt` / `tools` context fields when it reads those fields instead.
+ * The two shapes are NOT interchangeable:
  *
- * - Message-shaped pi-ai (from 0.86.0 up, including 1.x) reads the prompt and
- *   tools only from a leading `role: 'system'` message
- *   (`utils/transcript.js createInitialSystemMessage`,
+ * - A message-shaped pi-ai reads the prompt and tools only from a leading
+ *   `role: 'system'` message (`utils/transcript.js createInitialSystemMessage`,
  *   `api/openai-completions.js` `i === 0 ? getSystemMessageText(msg)`).
  *   `Context.systemPrompt` / `Context.tools` are gone from the api layer --
  *   `grep systemPrompt` over `dist/api/` hits only `normalizeContext`, which
  *   this adapter never triggers (it dispatches straight to the api layer
- *   through `createProvider(...).streamSimple`).
- * - 0.82 does the opposite: `convertMessages` has no `system` branch, so a
- *   leading system MESSAGE is dropped, and `utils/estimate.js`
+ *   through `createProvider(...).streamSimple`). So on that shape, putting the
+ *   prompt in the fields loses it silently.
+ * - A context-shaped pi-ai does the opposite: `convertMessages` has no `system`
+ *   branch, so a leading system MESSAGE is dropped, and `utils/estimate.js`
  *   `estimateMessageTokens` iterates `message.content` as blocks, so a
  *   string-content system message throws
  *   `Cannot read properties of undefined (reading 'length')`.
  *
- * Emitting both shapes at once would double the system prompt and, on 0.82,
- * throw before the request is even sent. {@link piAiTranscriptShape} picks
- * one from the capability the installed pi-ai exposes, so the adapter works
- * against any version of it.
+ * Emitting both shapes at once would double the system prompt and, on a
+ * context-shaped pi-ai, throw before the request is even sent.
+ * {@link piAiTranscriptShape} picks one from the capability the installed pi-ai
+ * exposes, so the adapter works against any version of it.
  */
 export interface PiContext {
   messages: PiMessage[]
-  /** Read by context-shaped pi-ai (0.82.x); otherwise nothing reads it. */
+  /** Read by context-shaped pi-ai; on a message-shaped pi-ai nothing reads it. */
   systemPrompt?: string
-  /** Read by context-shaped pi-ai (0.82.x); otherwise nothing reads it. */
+  /** Read by context-shaped pi-ai; on a message-shaped pi-ai nothing reads it. */
   tools?: PiTool[]
 }
 
@@ -131,8 +131,8 @@ export interface PiContext {
  * needs no change here. The probe is anchored on `getSystemMessageText` -- the
  * function pi-ai's own api layer calls to read that leading message -- because
  * it is the reader itself: it exists in every version that needs the message
- * shape and in no version that needs the context shape. Verified against every
- * published version from 0.82.1 through 1.0.2.
+ * shape and in no version that needs the context shape. Checked against every
+ * published version this package's range accepts, 0.82.1 through 1.0.2.
  */
 export type PiTranscriptShape = 'message' | 'context'
 
@@ -380,10 +380,9 @@ export async function toPiContext(options: HarnessGenerateOptions): Promise<PiCo
  * - `'message'`: a leading `role: 'system'` message holding the prompt text
  *   and `toolsAdded`. Omitted entirely when prompt and tools are both empty,
  *   matching `createInitialSystemMessage` returning `undefined`.
- * - `'context'`: the prompt and tool set go into the context fields instead,
- *   which is what pi-ai 0.82 reads. A leading system message would be dropped
- *   by 0.82's `convertMessages`, and its string `content` would crash 0.82's
- *   `estimateMessageTokens`.
+ * - `'context'`: the prompt and tool set go into the context fields instead. A
+ *   leading system message would be dropped by `convertMessages`, which has no
+ *   `system` branch, and its string `content` would crash `estimateMessageTokens`.
  */
 export function applyPiTranscriptShape(
   messages: PiMessage[],
