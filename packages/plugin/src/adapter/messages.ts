@@ -139,28 +139,59 @@ export type PiTranscriptShape = 'message' | 'context'
 let cachedShape: PiTranscriptShape | undefined
 
 /**
+ * A pi-ai that cannot be loaded leaves the transcript shape unknown, and the
+ * two shapes fail in opposite ways: on a message-shaped pi-ai a context
+ * transcript silently drops the prompt and the tool set, while on a
+ * context-shaped pi-ai a leading system message throws inside
+ * `estimateMessageTokens` before a request goes out. Failing to load the
+ * dependency cannot be resolved in favour of either, so it is surfaced instead
+ * of guessed.
+ */
+export class PiAiShapeUnknownError extends Error {
+  constructor(cause: unknown) {
+    super(
+      'cannot determine the pi-ai transcript shape: @earendil-works/pi-ai did not load. ' +
+        'Its transcript shape has to be known because the prompt and the tool set ' +
+        'live in different places in the two shapes.',
+      { cause },
+    )
+    this.name = 'PiAiShapeUnknownError'
+  }
+}
+
+/**
  * Probe the installed pi-ai for the transcript shape it reads. The root entry
  * point is imported through the root specifier rather than a
  * `@earendil-works/pi-ai/utils/transcript` subpath, because that subpath only
- * exists from 0.86 on: a release that narrows or drops it would turn this probe
- * into ERR_PACKAGE_PATH_NOT_EXPORTED, and the package root is the one
- * specifier every version this range accepts exports. Resolved once per
- * process, and cached -- the answer cannot change under a live process.
+ * exists from 0.86 on, and the nine versions below 0.86 are the ones the probe
+ * has to answer 'context' for. The package root is the one specifier every
+ * version this range accepts exports. Resolved once per process, and cached --
+ * the answer cannot change under a live process.
  */
+/** Loads the installed pi-ai root entry point. Injected in tests. */
+export type PiAiModuleLoader = () => Promise<{ getSystemMessageText?: unknown }>
+
+/**
+ * The probe itself, with the loader injected so both answers and the
+ * load-failure path can be exercised against a fabricated pi-ai rather than
+ * only against whichever version happens to be installed.
+ */
+export async function probePiAiTranscriptShape(
+  load: PiAiModuleLoader = () => import('@earendil-works/pi-ai') as Promise<{ getSystemMessageText?: unknown }>,
+): Promise<PiTranscriptShape> {
+  let piAi: { getSystemMessageText?: unknown }
+  try {
+    piAi = await load()
+  } catch (error) {
+    throw new PiAiShapeUnknownError(error)
+  }
+  return typeof piAi.getSystemMessageText === 'function' ? 'message' : 'context'
+}
+
 export async function piAiTranscriptShape(): Promise<PiTranscriptShape> {
   if (cachedShape !== undefined) return cachedShape
-  let shape: PiTranscriptShape = 'message'
-  try {
-    const piAi = (await import('@earendil-works/pi-ai')) as {
-      getSystemMessageText?: unknown
-    }
-    if (typeof piAi.getSystemMessageText !== 'function') shape = 'context'
-  } catch {
-    // A pi-ai too old to expose the root entry point at all.
-    shape = 'context'
-  }
-  cachedShape = shape
-  return shape
+  cachedShape = await probePiAiTranscriptShape()
+  return cachedShape
 }
 
 /** Test seam: forget the cached {@link piAiTranscriptShape} probe. */
@@ -322,6 +353,17 @@ function flattenText(message: HarnessMessage): string {
  * {@link PiContext} explains why emitting both would be wrong.
  */
 export async function toPiContext(options: HarnessGenerateOptions): Promise<PiContext> {
+  return toPiContextWithLoader(options, piAiTranscriptShape)
+}
+
+/**
+ * {@link toPiContext} with the shape probe injected, so a test can drive the
+ * path where pi-ai does not load at all.
+ */
+export async function toPiContextWithLoader(
+  options: HarnessGenerateOptions,
+  probe: () => Promise<PiTranscriptShape>,
+): Promise<PiContext> {
   const providerId = options.provider
   const toolNames = new Map<string, string>()
   const messages: PiMessage[] = []
@@ -369,7 +411,7 @@ export async function toPiContext(options: HarnessGenerateOptions): Promise<PiCo
   const system = typeof options.system === 'string' ? options.system : ''
   const tools: PiTool[] = (options.tools ?? [])
     .map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.parameters }))
-  return applyPiTranscriptShape(messages, system, tools, await piAiTranscriptShape())
+  return applyPiTranscriptShape(messages, system, tools, await probe())
 }
 
 /**

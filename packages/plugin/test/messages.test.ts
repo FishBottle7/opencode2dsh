@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { applyPiTranscriptShape, ensureFreeLaneShape, piAiTranscriptShape, resetPiAiTranscriptShape, toPiContext, type HarnessGenerateOptions, type HarnessMessage, type PiMessage } from '../src/adapter/messages.ts'
+import { applyPiTranscriptShape, ensureFreeLaneShape, PiAiShapeUnknownError, piAiTranscriptShape, probePiAiTranscriptShape, resetPiAiTranscriptShape, toPiContext, toPiContextWithLoader, type HarnessGenerateOptions, type HarnessMessage, type PiMessage } from '../src/adapter/messages.ts'
 
 function expectAssistant(message: PiMessage | undefined): Extract<PiMessage, { role: 'assistant' }> {
   assert.equal(message?.role, 'assistant')
@@ -427,6 +427,42 @@ test('piAiTranscriptShape picks the shape the installed pi-ai can actually read 
   } else {
     assert.equal(context.systemPrompt, 'THE_PROMPT', 'the context shape carries the prompt where 0.82 reads it')
   }
+})
+
+test('the probe reads the shape off the loader and needs no version list', async () => {
+  // The probe is the whole mechanism, so both answers are pinned against a
+  // fabricated pi-ai instead of against whichever version is installed. A
+  // probe that was later rewritten to compare version numbers could not pass
+  // this: it would have to know what version the stub claims to be.
+  assert.equal(await probePiAiTranscriptShape(async () => ({ getSystemMessageText: () => 'x' })), 'message')
+  assert.equal(await probePiAiTranscriptShape(async () => ({})), 'context')
+  // The real export is a function on 0.86+, so a stub that exports something
+  // else under that name must not be mistaken for the reader.
+  assert.equal(await probePiAiTranscriptShape(async () => ({ getSystemMessageText: 'not a function' })), 'context')
+})
+
+test('a pi-ai that will not load surfaces as PiAiShapeUnknownError', async () => {
+  // Guessing a shape here would drop the prompt silently on the versions that
+  // need 'message', which is the failure the probe exists to prevent.
+  const cause = new Error('ERR_MODULE_NOT_FOUND')
+  await assert.rejects(
+    () => probePiAiTranscriptShape(async () => { throw cause }),
+    (error: unknown) => {
+      assert.ok(error instanceof PiAiShapeUnknownError, `expected PiAiShapeUnknownError, got ${String(error)}`)
+      assert.match((error as PiAiShapeUnknownError).message, /did not load/)
+      assert.equal((error as PiAiShapeUnknownError).cause, cause, 'the import failure is kept as the cause')
+      return true
+    },
+  )
+})
+
+test('toPiContext propagates the shape-unknown failure instead of guessing', async () => {
+  // Swallowing this would fall back to the pre-fix hard-coded shape, which is
+  // the bug this PR removes. Driven through the real probe with a loader that
+  // fails, so the wiring from toPiContext to the thrown error is covered and not
+  // just the probe in isolation.
+  const unloadable = () => probePiAiTranscriptShape(async () => { throw new Error('ERR_MODULE_NOT_FOUND') })
+  await assert.rejects(() => toPiContextWithLoader(options({ system: 'sys' }), unloadable), PiAiShapeUnknownError)
 })
 
 test('piAiTranscriptShape answers the same way through a folded transcript', async () => {
