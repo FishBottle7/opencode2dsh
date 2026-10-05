@@ -23,10 +23,19 @@
  * Options, so the host-side half is measured with the same script:
  *
  *   --auto-install-peers[=true]   set autoInstallPeers in the workspace file
+  *   --resolve-peers-from-workspace-root[=true]   set it, rather than assume it
+  *   --dedupe-peer-dependents[=false]             set it, rather than assume it
  *   --root <range>                the profile's own package.json declares
  *                                 pi-ai as a plain dependency on <range>
  *
- * Read the result this way: a hoisted profile gets ONE copy of a shared
+ * The two settings flags exist because both defaults have changed pnpm's
+  * answer, so neither may be assumed. `resolvePeersFromWorkspaceRoot` lets the
+  * profile's own package.json satisfy an unmet peer, and `dedupePeerDependents:
+  * false` builds a per-consumer peer-suffixed copy instead of forcing every peer
+  * onto the one hoisted copy. Either one changes what "there is only one copy"
+  * means, so every run prints the settings it used.
+  *
+  * Read the result this way: a hoisted profile gets ONE copy of a shared
  * dependency, at the root, for every plugin. Which version lands there is
  * decided by the first plugin in the tree that declares it as a plain
  * dependency, and every other plugin is handed that one whether or not it
@@ -44,7 +53,7 @@ import { join } from 'node:path'
 const NODE = process.execPath
 const PNPM = process.argv[2]
 if (!PNPM) {
-  console.error('usage: node repro-pi-ai-hoisting.mjs <path-to-pnpm.cjs> [name:kind:range ...] [--auto-install-peers] [--root <range>]')
+  console.error('usage: node repro-pi-ai-hoisting.mjs <path-to-pnpm.cjs> [name:kind:range ...] [--auto-install-peers] [--root <range>] [--resolve-peers-from-workspace-root] [--dedupe-peer-dependents]')
   process.exit(2)
 }
 
@@ -53,10 +62,16 @@ const argv = process.argv.slice(3)
 const positional = []
 let AUTO_INSTALL_PEERS = false
 let ROOT_RANGE = null
+/** Defaults are printed, never assumed: both of these changed pnpm's answer. */
+const SETTINGS = new Map()
 for (let i = 0; i < argv.length; i++) {
   const arg = argv[i]
   if (arg === '--auto-install-peers' || arg === '--auto-install-peers=true') {
     AUTO_INSTALL_PEERS = true
+  } else if (arg === '--resolve-peers-from-workspace-root' || arg.startsWith('--resolve-peers-from-workspace-root=')) {
+    SETTINGS.set('resolvePeersFromWorkspaceRoot', arg.includes('=') ? arg.split('=')[1] : 'true')
+  } else if (arg === '--dedupe-peer-dependents' || arg.startsWith('--dedupe-peer-dependents=')) {
+    SETTINGS.set('dedupePeerDependents', arg.includes('=') ? arg.split('=')[1] : 'false')
   } else if (arg === '--root' || arg.startsWith('--root=')) {
     ROOT_RANGE = arg.includes('=') ? arg.split('=')[1] : argv[++i]
     if (!ROOT_RANGE) {
@@ -130,7 +145,9 @@ const dir = mkdtempSync(join(tmpdir(), 'dsh-pi-ai-hoist-'))
 try {
   writeFileSync(
     join(dir, 'pnpm-workspace.yaml'),
-    `packages:\n  - .\nnodeLinker: hoisted\nhoistPattern:\n  - '*'\nautoInstallPeers: ${AUTO_INSTALL_PEERS}\n`,
+    `packages:\n  - .\nnodeLinker: hoisted\nhoistPattern:\n  - '*'\nautoInstallPeers: ${AUTO_INSTALL_PEERS}\n${
+      SETTINGS.size ? `${[...SETTINGS].map(([k, v]) => `${k}: ${v}`).join('\n')}\n` : ''
+    }`,
   )
   for (const { name, range, kind } of SPECS) {
     const field = kind === 'peer' ? 'peerDependencies' : 'dependencies'
@@ -157,11 +174,12 @@ try {
     ? JSON.parse(readFileSync(join(rootDir, 'package.json'), 'utf8')).version
     : 'absent'
   console.log('declared:')
-  if (ROOT_RANGE) console.log(`  profile    ${ROOT_RANGE.padEnd(18)} dependencies (the host's own file)`)
+  if (ROOT_RANGE) console.log(`  profile    ${ROOT_RANGE.padEnd(18)} dependencies (the profile's own file)`)
   for (const { name, range, kind } of SPECS) {
     console.log(`  plugin-${name}  ${range.padEnd(18)} ${kind === 'peer' ? 'peerDependencies' : 'dependencies'}`)
   }
   console.log(`\nautoInstallPeers: ${AUTO_INSTALL_PEERS}`)
+  for (const [key, value] of SETTINGS) console.log(`${key}: ${value}`)
   console.log(`the hoisted root copy: ${rootVersion}`)
 
   console.log('\nloaded:')
