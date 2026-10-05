@@ -106,9 +106,21 @@ export class RoutingInstaller {
       proxyHosts: this.#deps.proxyHosts,
       logger: this.#deps.logger,
     })
-    const previous = this.#deps.undici.setGlobalDispatcher(router as unknown as InstallableDispatcher)
-    // undici's setter returns the replaced dispatcher (void on some hosts)
-    if (previous instanceof Object) this.#previous = previous as Dispatcher
+    // Read BEFORE swapping: undici's `setGlobalDispatcher` returns void (not
+    // the replaced dispatcher) on Node 24 / undici 8.x — verified live, it
+    // yields `undefined`. The old code trusted a return value that is never
+    // there, so `#previous` stayed null and `disable()` could never restore
+    // the host's dispatcher: the routing layer outlived the plugin and kept
+    // capturing every later fetch in the process. Capture via the getter.
+    let previous: unknown = null
+    try {
+      previous = this.#deps.undici.getGlobalDispatcher()
+    } catch {
+      // a host with a broken slot still gets our layer; restore then falls
+      // back to undici's own default on disable
+    }
+    this.#deps.undici.setGlobalDispatcher(router as unknown as InstallableDispatcher)
+    if (previous !== null && previous !== undefined) this.#previous = previous as Dispatcher
     const old = this.#current
     this.#current = router
     this.#enabled = true
@@ -134,23 +146,42 @@ export class RoutingInstaller {
   disable(): void {
     if (!this.#enabled) return
     this.#enabled = false
-    if (this.#savedGlobalFetch !== null) {
+    const restoreFetch = this.#savedGlobalFetch !== null
+    if (restoreFetch) {
       ;(globalThis as { fetch: unknown }).fetch = this.#savedGlobalFetch
       this.#savedGlobalFetch = null
     }
+    let restored = false
+    // Destroy OUR layer before installing the previous one back: leaving the
+    // router alive while the slot points elsewhere would keep its per-exit
+    // ProxyAgents (and their sockets) in memory after the plugin is gone.
+    const dying = this.#current
+    this.#current = null
+    if (dying !== null) void dying.destroy().catch(() => {})
     if (this.#previous !== null) {
       try {
         this.#deps.undici.setGlobalDispatcher(this.#previous)
+        restored = true
       } catch {
         // the saved dispatcher may already be gone (host teardown) — our
         // uninstall still succeeded for our own layer
       }
       this.#previous = null
     }
-    const dying = this.#current
-    this.#current = null
-    if (dying !== null) void dying.destroy().catch(() => {})
-    this.#deps.logger?.info('opencode2dsh: exit routing disabled; previous global dispatcher restored')
+    if (!restored && dying !== null) {
+      // Nothing to restore (the slot was empty when we installed, or the
+      // saved dispatcher died with the host): hand undici its own default
+      // back so the process does not keep calling into a destroyed layer.
+      try {
+        this.#deps.undici.setGlobalDispatcher(new this.#deps.undici.Agent())
+        restored = true
+      } catch {}
+    }
+    this.#deps.logger?.info(
+      restored
+        ? `opencode2dsh: exit routing disabled; previous global dispatcher restored${restoreFetch ? ' and globalThis.fetch restored' : ''}`
+        : 'opencode2dsh: exit routing disabled; no previous dispatcher to restore',
+    )
   }
 
   /** Full teardown (plugin dispose): same as disable. */
