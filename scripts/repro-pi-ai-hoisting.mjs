@@ -1,98 +1,150 @@
 #!/usr/bin/env node
 /**
- * Repro: a hoisted DSH profile holds exactly ONE copy of @earendil-works/pi-ai,
- * so a plugin that pins an old minor forces that copy onto every other plugin in
- * the profile, past what their own peer ranges allow. pnpm installs anyway,
- * because a hoisted profile does not enforce peer ranges.
+ * Repro: what a hoisted profile actually resolves for @earendil-works/pi-ai.
  *
- * Layout mirrors what DSH creates:
- *   .npmrc                          node-linker=hoisted, auto-install-peers=false
- *   package.json                    the profile: two plugins as file: deps
- *   plugins/a/                      depends on pi-ai ^0.82.1        (the pin)
- *   plugins/b/                      peer-depends on pi-ai >=0.85    (the victim)
+ * Every plugin goes in as an argument, then the script asks each one, by
+ * importing pi-ai from inside that plugin's own directory, which version it got
+ * and whether that version is inside the range it declared. The lockfile is
+ * printed too, but it is evidence, not the measurement.
  *
- *   node scripts/repro-pi-ai-hoisting.mjs <path-to-pnpm.cjs> [range-a] [range-b]
+ *   node scripts/repro-pi-ai-hoisting.mjs <path-to-pnpm.cjs> [name:kind:range ...] [options]
  *
- * Both ranges are arguments so a reader can put their own next to ours:
+ * kind is `dep` or `peer`. Defaults to this plugin's pin against one peer:
  *
- *   node scripts/repro-pi-ai-hoisting.mjs <pnpm> '^0.82.1' '>=0.85.0 <0.88.0'
- *   node scripts/repro-pi-ai-hoisting.mjs <pnpm> '>=0.82.1 <0.88.0' '>=0.85.0 <0.88.0'
+ *   node scripts/repro-pi-ai-hoisting.mjs <pnpm>
+ *
+ * A whole profile at once, with the ranges swapped, is the interesting run:
+ *
+ *   node scripts/repro-pi-ai-hoisting.mjs <pnpm> \
+ *     a:dep:^0.82.1 b:peer:>=0.85.0 <0.88.0 c:peer:^0.87.1
+ *   node scripts/repro-pi-ai-hoisting.mjs <pnpm> \
+ *     a:dep:>=0.82.1 <0.88.0 b:peer:>=0.85.0 <0.88.0 c:peer:^0.87.1
+ *
+ * Options, so the host-side half is measured with the same script:
+ *
+ *   --auto-install-peers[=true]   set autoInstallPeers in the workspace file
+ *   --root <range>                the profile's own package.json declares
+ *                                 pi-ai as a plain dependency on <range>
+ *
+ * Read the result this way: a hoisted profile gets ONE copy of a shared
+ * dependency, at the root, for every plugin. Which version lands there is
+ * decided by the first plugin in the tree that declares it as a plain
+ * dependency, and every other plugin is handed that one whether or not it
+ * agreed to it. A peer range that rejects the winner does not stop the install.
+ *
+ * pnpm v11 reads linker settings from pnpm-workspace.yaml. An .npmrc carrying
+ * `node-linker=hoisted` is ignored, which silently gives you an isolated layout
+ * and a profile that resolves nothing the way a real one does.
  */
 import { execFileSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-/** What the plugin that ships with the profile pins. */
-const PLUGIN_A_RANGE = process.argv[3] ?? '^0.82.1'
-/** What a second, unrelated plugin in the same profile asks for. */
-const PLUGIN_B_PEER_RANGE = process.argv[4] ?? '>=0.85.0 <0.88.0'
-
 const NODE = process.execPath
 const PNPM = process.argv[2]
+if (!PNPM) {
+  console.error('usage: node repro-pi-ai-hoisting.mjs <path-to-pnpm.cjs> [name:kind:range ...] [--auto-install-peers] [--root <range>]')
+  process.exit(2)
+}
+
+const argv = process.argv.slice(3)
+/** Walked once: a flag takes its value with it, so `--root ^0.82.1` never reads as a spec. */
+const positional = []
+let AUTO_INSTALL_PEERS = false
+let ROOT_RANGE = null
+for (let i = 0; i < argv.length; i++) {
+  const arg = argv[i]
+  if (arg === '--auto-install-peers' || arg === '--auto-install-peers=true') {
+    AUTO_INSTALL_PEERS = true
+  } else if (arg === '--root' || arg.startsWith('--root=')) {
+    ROOT_RANGE = arg.includes('=') ? arg.split('=')[1] : argv[++i]
+    if (!ROOT_RANGE) {
+      console.error('--root needs a version range')
+      process.exit(2)
+    }
+  } else {
+    positional.push(arg)
+  }
+}
+const SPECS = (positional.length ? positional : ['a:dep:^0.82.1', 'b:peer:>=0.85.0 <0.88.0']).map((spec) => {
+  const at = spec.indexOf(':')
+  const kind = spec.indexOf(':', at + 1)
+  return {
+    name: spec.slice(0, at),
+    range: spec.slice(kind + 1),
+    kind: spec.slice(at + 1, kind) === 'peer' ? 'peer' : 'dep',
+  }
+})
 
 const write = (path, value) => {
   mkdirSync(join(path, '..'), { recursive: true })
   writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`)
 }
 
-/**
- * The single pi-ai version a whole profile ends up with.
- *
- * Both plugins are dependencies of the profile root, so the lockfile records
- * their resolutions under the `.` importer. A plugin that declares pi-ai as a
- * plain dependency contributes nothing to that resolution string -- only the
- * peer edge does, which is exactly the asymmetry that causes the bug: the peer
- * is recorded as `file:plugins/b(@earendil-works/pi-ai@0.82.1(...))`, i.e. the
- * older version plugin-a dragged in, not the range plugin-b asked for.
- */
-function resolvedVersion(lock, plugin) {
-  const importers = lock.slice(lock.indexOf('\nimporters:'), lock.indexOf('\npackages:'))
-  const entry = importers.match(new RegExp(`^\\s{6}${plugin}:\\n\\s{8}specifier: .*\\n\\s{8}version: (.+)$`, 'm'))?.[1]
-  return entry?.match(/pi-ai@(\d+\.\d+\.\d+)/)?.[1] ?? null
-}
-
-/** Minimal semver check: caret, or an explicit >= / < pair. */
+/** Minimal semver: caret on 0.x locks the minor, or an explicit >= / < pair. */
 function satisfies(version, range) {
   const parse = (v) => v.split('.').map(Number)
   const cmp = (a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2]
   const actual = parse(version)
   if (range.startsWith('^')) {
     const base = parse(range.slice(1))
+    if (base[0] === 0) return actual[0] === 0 && actual[1] === base[1] && cmp(actual, base) >= 0
     return actual[0] === base[0] && cmp(actual, base) >= 0
   }
+  let ok = true
   const lower = range.match(/>=\s*(\d+\.\d+\.\d+)/)
   const upper = range.match(/<\s*(\d+\.\d+\.\d+)/)
-  let ok = true
   if (lower) ok = ok && cmp(actual, parse(lower[1])) >= 0
   if (upper) ok = ok && cmp(actual, parse(upper[1])) < 0
   return ok
 }
 
+/** Asks the question from inside a plugin: which pi-ai, which shape, shared or nested. */
+const PROBE = `
+import { existsSync, readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+let dir
+try {
+  dir = dirname(fileURLToPath(import.meta.resolve('@earendil-works/pi-ai')))
+} catch (error) {
+  console.log('absent  ERR_MODULE_NOT_FOUND  no copy to load')
+  process.exit(0)
+}
+for (;;) {
+  if (existsSync(join(dir, 'package.json'))) break
+  const up = dirname(dir)
+  if (up === dir) break
+  dir = up
+}
+const version = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')).version
+const api = await import('@earendil-works/pi-ai')
+const tail = dir.slice(dir.indexOf('plugins'))
+const nested = (tail.match(/node_modules/g) ?? []).length > 1
+console.log([version, typeof api.getSystemMessageText === 'function' ? 'message-shaped' : 'context-shaped',
+  nested ? 'a nested copy' : 'the root copy'].join('  '))
+`
+
 const dir = mkdtempSync(join(tmpdir(), 'dsh-pi-ai-hoist-'))
 try {
-  writeFileSync(join(dir, '.npmrc'), 'node-linker=hoisted\nauto-install-peers=false\n')
-
-  write(join(dir, 'plugins', 'a', 'package.json'), {
-    name: 'plugin-a',
-    version: '1.0.0',
-    dependencies: { '@earendil-works/pi-ai': PLUGIN_A_RANGE },
-  })
-  write(join(dir, 'plugins', 'b', 'package.json'), {
-    name: 'plugin-b',
-    version: '1.0.0',
-    peerDependencies: { '@earendil-works/pi-ai': PLUGIN_B_PEER_RANGE },
-  })
-
-  write(join(dir, 'package.json'), {
-    name: 'profile-sim',
-    version: '0.0.0',
-    private: true,
-    dependencies: {
-      'plugin-a': 'file:./plugins/a',
-      'plugin-b': 'file:./plugins/b',
-    },
-  })
+  writeFileSync(
+    join(dir, 'pnpm-workspace.yaml'),
+    `packages:\n  - .\nnodeLinker: hoisted\nhoistPattern:\n  - '*'\nautoInstallPeers: ${AUTO_INSTALL_PEERS}\n`,
+  )
+  for (const { name, range, kind } of SPECS) {
+    const field = kind === 'peer' ? 'peerDependencies' : 'dependencies'
+    write(join(dir, 'plugins', name, 'package.json'), {
+      name: `plugin-${name}`,
+      version: '1.0.0',
+      [field]: { '@earendil-works/pi-ai': range },
+    })
+    writeFileSync(join(dir, 'plugins', name, 'probe.mjs'), PROBE)
+  }
+  const root = {}
+  for (const { name } of SPECS) root[`plugin-${name}`] = `file:./plugins/${name}`
+  if (ROOT_RANGE) root['@earendil-works/pi-ai'] = ROOT_RANGE
+  write(join(dir, 'package.json'), { name: 'profile-sim', version: '0.0.0', private: true, dependencies: root })
 
   const out = execFileSync(NODE, [PNPM, 'install', '--ignore-scripts'], {
     cwd: dir,
@@ -100,34 +152,55 @@ try {
     stdio: ['ignore', 'pipe', 'pipe'],
   })
 
-  const lock = readFileSync(join(dir, 'pnpm-lock.yaml'), 'utf8')
-  const rootCopy = lock.match(/^  '@earendil-works\/pi-ai@(\d+\.\d+\.\d+)':/m)?.[1] ?? null
-  const aSees = resolvedVersion(lock, 'plugin-a')
-  const bSees = resolvedVersion(lock, 'plugin-b') ?? rootCopy
-  console.log(`plugin-a declares        ${PLUGIN_A_RANGE}`)
-  console.log(`plugin-b peer-depends on ${PLUGIN_B_PEER_RANGE}`)
-  console.log('')
-  console.log(`one pi-ai copy on disk   ${rootCopy}`)
-  console.log(`plugin-a resolves        ${aSees ?? 'no peer edge (it is the plain dependency)'}`)
-  console.log(`plugin-b resolves        ${bSees}   <- its own peer range says ${PLUGIN_B_PEER_RANGE}`)
-  console.log('')
+  const rootDir = join(dir, 'node_modules', '@earendil-works', 'pi-ai')
+  const rootVersion = existsSync(rootDir)
+    ? JSON.parse(readFileSync(join(rootDir, 'package.json'), 'utf8')).version
+    : 'absent'
+  console.log('declared:')
+  if (ROOT_RANGE) console.log(`  profile    ${ROOT_RANGE.padEnd(18)} dependencies (the host's own file)`)
+  for (const { name, range, kind } of SPECS) {
+    console.log(`  plugin-${name}  ${range.padEnd(18)} ${kind === 'peer' ? 'peerDependencies' : 'dependencies'}`)
+  }
+  console.log(`\nautoInstallPeers: ${AUTO_INSTALL_PEERS}`)
+  console.log(`the hoisted root copy: ${rootVersion}`)
 
-  const broken = !satisfies(bSees, PLUGIN_B_PEER_RANGE)
-  console.log(
-    broken
-      ? `BROKEN: plugin-b peer-depends on ${PLUGIN_B_PEER_RANGE} but the profile gave it ${bSees}. pnpm installed it anyway -- a hoisted profile does not enforce peer ranges.`
-      : `OK: the profile gave plugin-b ${bSees}, which satisfies its peer range.`,
-  )
-
-  console.log('\nlockfile:')
-  for (const line of lock.split('\n').filter((l) => /plugin-b|pi-ai@/.test(l)).slice(0, 8)) {
-    console.log(`  ${line.trim()}`)
+  console.log('\nloaded:')
+  const verdicts = []
+  for (const { name, range } of SPECS) {
+    const line = execFileSync(NODE, [join(dir, 'plugins', name, 'probe.mjs')], {
+      cwd: join(dir, 'plugins', name),
+      encoding: 'utf8',
+    }).trim()
+    console.log(`  plugin-${name}  ${line}`)
+    const version = line.split(/\s{2,}/)[0]
+    verdicts.push([name, range, version, satisfies(version, range)])
   }
 
-  const warned = out.split('\n').filter((l) => /peer|ignored/i.test(l))
-  if (warned.length) {
-    console.log('\npnpm said:')
-    for (const line of warned) console.log(`  ${line}`)
+  console.log('\nagainst what each plugin asked for:')
+  for (const [name, range, version, ok] of verdicts) {
+    const verdict = version === 'absent' ? 'NOTHING INSTALLED' : ok ? 'ok' : 'OUTSIDE ITS OWN DECLARED RANGE'
+    console.log(`  plugin-${name} asked for ${range.padEnd(18)} got ${version.padEnd(8)} ${verdict}`)
+  }
+
+  const copies = (() => {
+    try {
+      return readdirSync(join(dir, 'node_modules', '.pnpm')).filter((d) => d.startsWith('@earendil-works+pi-ai@'))
+    } catch (error) {
+      return []
+    }
+  })()
+  console.log(`\npi-ai copies pnpm put on disk: ${copies.length === 0 ? 'none beyond the root' : copies.join(', ')}`)
+
+  const warned = out.split('\n').filter((l) => /peer/i.test(l) && l.trim())
+  console.log(`pnpm warned about peers: ${warned.length === 0 ? 'no' : 'yes'}`)
+  for (const line of warned) console.log(`  ${line.trim()}`)
+
+  console.log('\nlockfile lines:')
+  for (const line of readFileSync(join(dir, 'pnpm-lock.yaml'), 'utf8')
+    .split('\n')
+    .filter((l) => /^\s{6}version: file:/.test(l) || /^\s{2}'@earendil-works\/pi-ai@/.test(l))
+    .slice(0, 10)) {
+    console.log(`  ${line.trim()}`)
   }
 } finally {
   rmSync(dir, { recursive: true, force: true })
