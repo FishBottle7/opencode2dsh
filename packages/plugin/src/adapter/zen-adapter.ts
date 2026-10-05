@@ -266,6 +266,7 @@ export class ZenAdapter {
   readonly #firstEventMs: number
   readonly #bodyIdleMs: number
   readonly #responsesBodyIdleMs: number
+  readonly #report: (message: string) => void
 
   constructor(catalog: CatalogLike, options: {
     zenBaseUrl?: string
@@ -275,7 +276,10 @@ export class ZenAdapter {
     bodyIdleMs?: number
     /** Overrides RESPONSES_BODY_IDLE_MS (watchdog tests inject short ones). */
     responsesBodyIdleMs?: number
+    /** Diagnostics sink for the one-off transcript-shape line. */
+    report?: (message: string) => void
   } = {}) {
+    this.#report = options.report ?? (() => {})
     this.#catalog = catalog
     this.#firstEventMs = options.firstEventMs ?? DEFAULT_FIRST_EVENT_MS
     this.#bodyIdleMs = options.bodyIdleMs ?? DEFAULT_BODY_IDLE_MS
@@ -463,7 +467,7 @@ export class ZenAdapter {
    * failure is not exit-shaped) = the original stream surface untouched.
    */
   async *#streamAttempt(options: HarnessGenerateOptions, onTerminal?: (message: PiDoneMessage) => void): AsyncGenerator<HarnessChunk> {
-    const context = await toPiContext(options)
+    const context = await toPiContext(options, this.#report)
     const ids = deriveRequestIDs(options.messages)
     const model = toPiModel(options.model, this.#catalog.reasoningCapability(options.model)?.reasoning === true, this.#catalog.limits?.(options.model), this.#catalog.modalities?.(options.model))
     // IP-pool routing context (docs/ip-pool.md 3.3): pi-ai builds the request

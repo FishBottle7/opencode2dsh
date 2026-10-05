@@ -429,6 +429,21 @@ test('piAiTranscriptShape picks the shape the installed pi-ai can actually read 
   }
 })
 
+test('the probed shape is reported once per process, on the turn that needs it', async () => {
+  // The reason this line exists: a probe that answers wrong is silent by
+  // construction, because the pi-ai that got it wrong still answers the turn.
+  // So the line has to fire exactly once, and not on a cached read, or the
+  // signal either disappears or becomes noise nobody reads.
+  resetPiAiTranscriptShape()
+  const seen: string[] = []
+  await toPiContext(options({ system: 'sys' }), (message) => seen.push(message))
+  assert.equal(seen.length, 1, `expected one line, got ${JSON.stringify(seen)}`)
+  const shape = await piAiTranscriptShape()
+  assert.match(seen[0]!, new RegExp(`reads the ${shape} transcript shape`))
+  await toPiContext(options({ system: 'sys' }), (message) => seen.push(message))
+  assert.equal(seen.length, 1, 'a cached probe must not report a second time')
+})
+
 test('the probe reads the shape off the loader and needs no version list', async () => {
   // The probe is the whole mechanism, so both answers are pinned against a
   // fabricated pi-ai instead of against whichever version is installed. A

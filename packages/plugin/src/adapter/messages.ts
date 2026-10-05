@@ -188,9 +188,20 @@ export async function probePiAiTranscriptShape(
   return typeof piAi.getSystemMessageText === 'function' ? 'message' : 'context'
 }
 
-export async function piAiTranscriptShape(): Promise<PiTranscriptShape> {
+export async function piAiTranscriptShape(
+  report?: (message: string) => void,
+): Promise<PiTranscriptShape> {
   if (cachedShape !== undefined) return cachedShape
   cachedShape = await probePiAiTranscriptShape()
+  // A wrong answer here is silent by construction: the pi-ai that got it wrong
+  // drops the prompt and the tool set and still answers, plausibly. The line
+  // below is the only signal that names the shape, so it is emitted once per
+  // process, on the turn that first needs it. Without it, an export renamed
+  // without the shape changing is a support ticket with nothing to read.
+  report?.(
+    `opencode2dsh: pi-ai reads the ${cachedShape} transcript shape; ` +
+      `the prompt and tool set are carried there this turn`,
+  )
   return cachedShape
 }
 
@@ -352,8 +363,11 @@ function flattenText(message: HarnessMessage): string {
  * shape the installed pi-ai reads, decided by {@link piAiTranscriptShape}.
  * {@link PiContext} explains why emitting both would be wrong.
  */
-export async function toPiContext(options: HarnessGenerateOptions): Promise<PiContext> {
-  return toPiContextWithLoader(options, piAiTranscriptShape)
+export async function toPiContext(
+  options: HarnessGenerateOptions,
+  report?: (message: string) => void,
+): Promise<PiContext> {
+  return toPiContextWithLoader(options, () => piAiTranscriptShape(report))
 }
 
 /**

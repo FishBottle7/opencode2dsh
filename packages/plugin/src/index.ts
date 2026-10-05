@@ -139,6 +139,7 @@ function applyAdapter(
     firstEventMs: cfg.firstEventMs,
     bodyIdleMs: cfg.bodyIdleMs,
     responsesBodyIdleMs: cfg.responsesBodyIdleMs,
+    report: (message) => logger.info(message),
   })
 
   // Register FIRST: the provider must appear in the selector right away, even
