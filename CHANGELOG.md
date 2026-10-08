@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.9 (2026-10-08)
+
+### Fixed
+
+- Exit routing now restores the host's global dispatcher on disable and plugin unload. `install()` read the replaced dispatcher off `setGlobalDispatcher()`'s return value, which is `void` on undici 8.x, so the previous dispatcher was never saved and `disable()` left the `PoolRoutingDispatcher` installed process-wide: every later `fetch` — including unrelated providers' requests — kept routing through the plugin, failing with `routing dispatcher closed` after teardown, and only a process restart cleared it. The outgoing dispatcher is now captured with `getGlobalDispatcher()` before the swap, ours is destroyed before the previous one is reinstalled, a fresh undici `Agent` takes over when nothing was saved, and the "restored" log line only appears when a restore actually happened. The installer test fixture no longer models a `setGlobalDispatcher` that returns the replaced dispatcher (the fiction that hid this bug from the suite).
+
 ## 0.3.8 (2026-10-08)
 
 ### Fixed
