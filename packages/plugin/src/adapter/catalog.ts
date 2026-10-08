@@ -248,6 +248,8 @@ export class ModelCatalog {
   #stopped = false
   #onRefresh?: (status: CatalogSnapshot, lastError: string) => void
   #startupRetryMs: number
+  /** In-flight refresh round (deduped so warm() shares start()'s first fetch). */
+  #refreshing: Promise<void> | null = null
 
   constructor(options: CatalogOptions = {}) {
     this.#refreshSeconds = options.refreshSeconds ?? 300
@@ -289,7 +291,19 @@ export class ModelCatalog {
     }
   }
 
-  async refreshOnce(): Promise<void> {
+  /** One refresh round, deduped while in flight: a concurrent caller (warm()
+   *  racing start()'s first round, or the interval timer) joins the running
+   *  round instead of firing a parallel fetch of the same endpoints. */
+  refreshOnce(): Promise<void> {
+    if (this.#refreshing === null) {
+      this.#refreshing = this.#refreshRound().finally(() => {
+        this.#refreshing = null
+      })
+    }
+    return this.#refreshing
+  }
+
+  async #refreshRound(): Promise<void> {
     await Promise.allSettled([this.refreshZen(), this.refreshMetadata()])
     if (this.#onRefresh) {
       try {
@@ -333,6 +347,25 @@ export class ModelCatalog {
       }
       this.#lastError = err instanceof Error ? err.message : String(err)
     }
+  }
+
+  /**
+   * Resolve once the first live fetch has settled, so a model-list read is
+   * never answered from the bootstrap list (issue #45: the host caches the
+   * snapshot its picker took at adapter registration, and the re-read
+   * triggers are topology/settings events a warming catalog never fires —
+   * so the 7-id staticFreeModels roster could stick for the whole host
+   * generation). Bounded: a dead network still answers promptly with the
+   * static list. Joins start()'s in-flight round when one exists (no
+   * duplicate fetch), or triggers a round of its own when none does.
+   */
+  async warm(ms = 4_000): Promise<void> {
+    if (this.#zen.size > 0 || this.#stopped) return
+    const timeout = new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, ms)
+      timer.unref?.()
+    })
+    await Promise.race([this.refreshOnce().catch(() => {}), timeout])
   }
 
   decision(model: string): AnonymousDecision {

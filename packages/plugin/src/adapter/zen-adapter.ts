@@ -35,6 +35,13 @@ export interface ZenModelInfo {
 export interface CatalogLike {
   list(): string[]
   decision(model: string): { allowed: boolean; source: string; known: boolean }
+  /**
+   * Optional: bounded wait for the first live fetch (issue #45). listModels
+   * awaits it so the host's registration-time snapshot is the live roster,
+   * never the bootstrap list. Catalogs without it answer immediately from
+   * whatever they have.
+   */
+  warm?(ms?: number): Promise<void>
   reasoningCapability(model: string): { reasoning: boolean; effortValues: string[] } | undefined
   /** Optional: models.dev-declared limits; absent catalogs keep the defaults. */
   limits?(model: string): { contextWindow?: number; maxOutput?: number } | undefined
@@ -329,8 +336,15 @@ export class ZenAdapter {
     return isVisionModel(model, this.#catalog.modalities?.(model)) ? ['text', 'image'] : ['text']
   }
 
-  /** Advisory catalog for the DSH model picker (deduped; dsh-llm rejects duplicates). */
-  listModels(provider: string): Array<{ provider: string; id: string; name: string; inputModalities: string[] }> {
+  /**
+   * Advisory catalog for the DSH model picker (deduped; dsh-llm rejects
+   * duplicates). Async on purpose (issue #45): the host awaits this call and
+   * caches its answer per host generation, so the first read waits —
+   * bounded, inside the catalog — for the live Zen fetch instead of handing
+   * the host the staticFreeModels bootstrap list it would then keep showing.
+   */
+  async listModels(provider: string): Promise<Array<{ provider: string; id: string; name: string; inputModalities: string[] }>> {
+    await this.#catalog.warm?.()
     const seen = new Set<string>()
     const models: Array<{ provider: string; id: string; name: string; inputModalities: string[] }> = []
     for (const id of this.#catalog.list()) {

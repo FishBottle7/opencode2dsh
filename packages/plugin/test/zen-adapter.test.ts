@@ -114,17 +114,64 @@ test('prepareCall returns the resolved model and a stream dispatcher', async () 
   assert.equal(typeof call.stream, 'function')
 })
 
-test('listModels mirrors the catalog without duplicates', () => {
+test('listModels mirrors the catalog without duplicates', async () => {
   const adapter = new ZenAdapter({
     list: () => ['big-pickle', 'big-pickle', 'mimo-v2.5-free', 'mimo-v2.6-flash-free', 'space-bunny-free'],
     decision: () => ({ allowed: true, source: 'test', known: true }),
     reasoningCapability: () => ({ reasoning: true, effortValues: [] }),
     modalities: (model: string) => (model === 'mimo-v2.5-free' ? ['text', 'image'] : undefined),
   })
-  const models = adapter.listModels('opencode2dsh')
+  const models = await adapter.listModels('opencode2dsh')
   assert.deepEqual(models.map((m) => m.id), ['big-pickle', 'mimo-v2.5-free', 'mimo-v2.6-flash-free', 'space-bunny-free'])
   // models.dev declares the modality per model; the built-in family is the fallback.
   assert.deepEqual(models.map((m) => m.inputModalities), [['text'], ['text', 'image'], ['text', 'image'], ['text']])
+})
+
+test('listModels awaits the catalog warm before reading (issue #45)', async () => {
+  let warmCalls = 0
+  let readAfterWarm = false
+  const adapter = new ZenAdapter({
+    list: () => {
+      if (warmCalls > 0) readAfterWarm = true
+      return ['exo-free']
+    },
+    decision: () => ({ allowed: true, source: 'test', known: true }),
+    reasoningCapability: () => undefined,
+    warm: async () => {
+      warmCalls += 1
+    },
+  })
+  const models = await adapter.listModels('opencode2dsh')
+  assert.equal(warmCalls, 1)
+  assert.ok(readAfterWarm, 'the roster was read only after warm() resolved')
+  assert.deepEqual(models.map((m) => m.id), ['exo-free'])
+})
+
+test('listModels answers from the live roster once the first fetch lands (issue #45)', async () => {
+  // The registration-time read races the first Zen fetch; before the fix it
+  // handed the host the 7-id bootstrap list, which the picker then kept for
+  // the whole host generation.
+  let release: (() => void) | undefined
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const fetchImpl = (async (url: string | URL) => {
+    if (String(url).includes('/v1/models')) await gate
+    const body = String(url).includes('/v1/models')
+      ? { data: [{ id: 'exo-free' }, { id: 'fledge-alpha-free' }] }
+      : { opencode: { models: { 'exo-free': { cost: { input: 0, output: 0 } }, 'fledge-alpha-free': { cost: { input: 0, output: 0 } } } } }
+    return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } })
+  }) as typeof fetch
+  const catalog = new ModelCatalog({ fetchImpl })
+  const adapter = new ZenAdapter(catalog)
+  try {
+    const listing = adapter.listModels('opencode2dsh')
+    queueMicrotask(() => release?.())
+    const models = await listing
+    assert.deepEqual(models.map((m) => m.id), ['exo-free', 'fledge-alpha-free'])
+  } finally {
+    catalog.stop()
+  }
 })
 
 test('reasoningEfforts: declared ladder wins, none folds into off, default ladder otherwise', () => {

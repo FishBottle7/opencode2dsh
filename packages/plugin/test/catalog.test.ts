@@ -362,6 +362,85 @@ test('ModelCatalog falls back to static ids while the live catalog is pending', 
   catalog.stop()
 })
 
+test('warm() waits for the first live fetch so a list() read is never the bootstrap list (issue #45)', async () => {
+  // The gate holds the first fetch back, exactly like a slow first round on
+  // a cold start: cold list() reads staticFreeModels, warm() blocks until
+  // the fetch lands, then list() exposes the live roster.
+  let release: (() => void) | undefined
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const fetchImpl = (async (url: string | URL) => {
+    if (String(url).includes('/v1/models')) await gate
+    const body = String(url).includes('/v1/models') ? zenBody : metadataBody
+    return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } })
+  }) as typeof fetch
+  const catalog = new ModelCatalog({ fetchImpl })
+  try {
+    assert.deepEqual(catalog.list(), staticFreeModels, 'cold catalog answers with the bootstrap list')
+    const warmed = catalog.warm()
+    queueMicrotask(() => release?.())
+    await warmed
+    assert.deepEqual(catalog.list(), ['qwen-free'], 'warm() resolves into the live roster')
+    assert.equal(catalog.snapshot().status, 'ready')
+  } finally {
+    catalog.stop()
+  }
+})
+
+test('warm() shares the in-flight refresh round instead of fetching twice', async () => {
+  let zenCalls = 0
+  const fetchImpl = (async (url: string | URL) => {
+    const body = String(url).includes('/v1/models') ? zenBody : metadataBody
+    if (String(url).includes('/v1/models')) {
+      zenCalls += 1
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } })
+  }) as typeof fetch
+  const catalog = new ModelCatalog({ fetchImpl })
+  try {
+    const inFlight = catalog.refreshOnce()
+    await catalog.warm()
+    await inFlight
+    assert.equal(zenCalls, 1, 'warm() joins start()\'s in-flight round, no duplicate fetch')
+    assert.deepEqual(catalog.list(), ['qwen-free'])
+  } finally {
+    catalog.stop()
+  }
+})
+
+test('warm() is bounded: a dead network answers with the static list, a slow one times out', async () => {
+  // the round settles (network error) before the bound: static list, promptly
+  const fail = (async () => {
+    throw new Error('network down')
+  }) as typeof fetch
+  const dead = new ModelCatalog({ fetchImpl: fail })
+  try {
+    await dead.warm(2_000)
+    assert.deepEqual(dead.list(), staticFreeModels)
+    assert.equal(dead.snapshot().status, 'pending')
+  } finally {
+    dead.stop()
+  }
+
+  // the round outlives the bound: warm() still returns at the deadline
+  const slow = (async (url: string | URL) => {
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    const body = String(url).includes('/v1/models') ? zenBody : metadataBody
+    return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } })
+  }) as typeof fetch
+  const catalog = new ModelCatalog({ fetchImpl: slow })
+  try {
+    const startedAt = Date.now()
+    await catalog.warm(25)
+    assert.ok(Date.now() - startedAt < 250, 'warm() returned at its bound, not with the fetch')
+    assert.deepEqual(catalog.list(), staticFreeModels)
+  } finally {
+    catalog.stop()
+  }
+})
+
 test('S3 vouch survives a stale deprecated flag but not a paid verdict', async () => {
   // hy3-free regression: models.dev flags it deprecated while it still works
   // upstream — a compile-time verified id keeps its vouch until delisted.
