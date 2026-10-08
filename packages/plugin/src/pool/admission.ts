@@ -22,6 +22,7 @@ import { ZEN_BASE_URL } from '../adapter/catalog.ts'
 import { FREE_LANE_GATE_TOOL_NAMES, freeLaneGateTool } from '../adapter/messages.ts'
 import { canonicalSessionID, disguiseHeaders, opencodeUserAgent, randomID, stableID } from '../adapter/ids.ts'
 import { gradeOf, type ExitNode, type ExitPool } from './pool.ts'
+import { exitProxyUri } from './dispatcher.ts'
 
 export interface AdmissionDeps {
   pool: ExitPool
@@ -66,9 +67,10 @@ export async function coarseScreen(
 
   let agent: Dispatcher | null = null
   try {
-    agent = new deps.undici.ProxyAgent({
-      uri: candidate.protocol === 'socks5' ? `socks5://${candidate.address}` : `http://${candidate.address}`,
-    })
+    // exitProxyUri keeps a scheme the address already carries (issue #44):
+    // manual ids are parsed with their scheme, and `http://http://host:port`
+    // makes undici's ProxyAgent throw InvalidArgumentError.
+    agent = new deps.undici.ProxyAgent({ uri: exitProxyUri(candidate.address, candidate.protocol) })
   } catch (err) {
     return { rejected: `agent-build: ${err instanceof Error ? err.message : String(err)}` }
   }
@@ -208,9 +210,7 @@ export async function admitCandidate(
 
   let agent: Dispatcher | null = null
   try {
-    agent = new deps.undici.ProxyAgent({
-      uri: candidate.protocol === 'socks5' ? `socks5://${candidate.address}` : `http://${candidate.address}`,
-    })
+    agent = new deps.undici.ProxyAgent({ uri: exitProxyUri(candidate.address, candidate.protocol) })
   } catch (err) {
     return { admitted: false, reason: `agent-build: ${err instanceof Error ? err.message : String(err)}` }
   }
