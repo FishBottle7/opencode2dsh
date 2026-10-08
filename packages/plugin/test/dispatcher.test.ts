@@ -154,13 +154,17 @@ test('installer: install/disable swaps the global dispatcher and restores the pr
   const installed: unknown[] = []
   const originalDispatcher = { tag: 'original' }
   let current: unknown = originalDispatcher
+  // Faithful undici 8.x slot: the getter and setter share ONE cell, and the
+  // setter returns void — it does NOT hand back the replaced dispatcher. The
+  // previous fixture returned `previous` here, which is the exact fiction that
+  // let the "restore never happens" bug pass this suite.
   const recordingSeam = {
     ...seam,
+    getGlobalDispatcher: () => current,
     setGlobalDispatcher: (dispatcher: unknown) => {
       installed.push(dispatcher)
-      const previous = current
       current = dispatcher
-      return previous
+      return undefined
     },
   }
   const logs: string[] = []
@@ -180,6 +184,11 @@ test('installer: install/disable swaps the global dispatcher and restores the pr
   assert.ok(!installer.enabled)
   // second setGlobalDispatcher call restored the original
   assert.equal(installed[1], originalDispatcher)
+  assert.equal(
+    current,
+    originalDispatcher,
+    'the global slot itself must be back on the original dispatcher',
+  )
 })
 
 test('end-to-end: builtin fetch routes through a real local proxy via the installer', async () => {
