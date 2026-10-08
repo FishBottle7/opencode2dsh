@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.8 (2026-10-08)
+
+### Fixed
+
+- Manual `ipPool.manual` entries keep the scheme the settings card requires. Admission prefixed its own scheme onto an address that already carried one, so `http://host:port` built `http://http://host:port`, undici's `ProxyAgent` threw `InvalidArgumentError`, and the trusted-source fallback admitted the node with empty facts — the pool read healthy while exit IP, latency, quality and the geo/latency gates never ran for manual exits. Both admission call sites now reuse `exitProxyUri`, the guard the routing path already had, so the two paths cannot drift apart again.
+- The model picker no longer sticks to the bootstrap list after a plugin (re)load. Registration-time `listModels()` answered from the 7-id static fallback whenever the client's first read beat the first Zen fetch, and the host caches that snapshot for its whole generation (delisted `mimo-v2.5-free` shown, live ids such as `exo-free` missing). `listModels()` is now async — the host contract already awaits it — and waits for the live catalog, bounded to 4 s so a dead network still answers promptly with the static list; concurrent warmups share `start()`'s in-flight first fetch.
+
 ## 0.3.7 (2026-10-04)
 
 ### Added
