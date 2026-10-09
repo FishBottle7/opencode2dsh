@@ -272,6 +272,121 @@ test('an empty tool result without images falls back to (no output)', async () =
   assert.deepEqual(toolResult.content, [{ type: 'text', text: '(no output)' }])
 })
 
+test('message-level tool results (DSH >= 0.2 role:tool shape) emit toolResult, never a user message', async () => {
+  // Regression for issue #50: DSH 0.2 delivers tool results as
+  // { role: 'tool', toolCallId, content: ContentBlock[], isError } — no
+  // 'tool-result' wrapper block. The adapter must not leak the output text
+  // in as a phantom user message.
+  const messages: HarnessMessage[] = [
+    { role: 'user', content: [{ type: 'text', text: 'run it' }] },
+    {
+      role: 'assistant',
+      content: [{ type: 'tool-call', id: 'call_1', name: 'pwsh', arguments: '{"cmd":"echo LIVE-PROBE-42"}' }],
+    },
+    {
+      role: 'tool',
+      toolCallId: 'call_1',
+      content: [{ type: 'text', text: 'LIVE-PROBE-42' }],
+      isError: false,
+      source: { kind: 'tool', callId: 'call_1' },
+    },
+  ]
+  const context = await toPiContext(options({ messages }))
+  assert.equal(context.messages.length, 3, 'no phantom user message after the tool call')
+  expectRole(context.messages[0], 'user')
+  expectRole(context.messages[1], 'assistant')
+  const toolResult = expectRole(context.messages[2], 'toolResult') as Extract<PiMessage, { role: 'toolResult' }>
+  assert.equal(toolResult.toolCallId, 'call_1')
+  assert.equal(toolResult.toolName, 'pwsh')
+  assert.equal(toolResult.isError, false)
+  assert.deepEqual(toolResult.content, [{ type: 'text', text: 'LIVE-PROBE-42' }])
+})
+
+test('message-level tool results keep isError and fall back to source.callId', async () => {
+  const messages: HarnessMessage[] = [
+    { role: 'assistant', content: [{ type: 'tool-call', id: 'c7', name: 'shell', arguments: '{}' }] },
+    {
+      role: 'tool',
+      content: [{ type: 'text', text: 'boom' }],
+      isError: true,
+      source: { kind: 'tool', callId: 'c7' },
+    },
+  ]
+  const context = await toPiContext(options({ messages }))
+  assert.equal(context.messages.length, 2)
+  const toolResult = expectRole(context.messages[1], 'toolResult') as Extract<PiMessage, { role: 'toolResult' }>
+  assert.equal(toolResult.toolCallId, 'c7')
+  assert.equal(toolResult.isError, true)
+  assert.deepEqual(toolResult.content, [{ type: 'text', text: 'boom' }])
+})
+
+test('message-level tool results with empty output fall back to (no output)', async () => {
+  const messages: HarnessMessage[] = [
+    { role: 'assistant', content: [{ type: 'tool-call', id: 'c8', name: 'shell', arguments: '{}' }] },
+    { role: 'tool', toolCallId: 'c8', content: [{ type: 'text', text: '' }], source: { kind: 'tool', callId: 'c8' } },
+  ]
+  const context = await toPiContext(options({ messages }))
+  const toolResult = expectRole(context.messages[1], 'toolResult') as Extract<PiMessage, { role: 'toolResult' }>
+  assert.deepEqual(toolResult.content, [{ type: 'text', text: '(no output)' }])
+})
+
+test('a message-level tool result for an unknown call id reports toolName unknown', async () => {
+  const context = await toPiContext(
+    options({
+      messages: [{ role: 'tool', toolCallId: 'ghost', content: [{ type: 'text', text: 'orphan' }] }],
+    }),
+  )
+  const toolResult = expectRole(context.messages[0], 'toolResult') as Extract<PiMessage, { role: 'toolResult' }>
+  assert.equal(toolResult.toolName, 'unknown')
+})
+
+test('legacy tool-result blocks still win when a tool-sourced message carries both shapes', async () => {
+  // DSH 0.1.x tool results are user messages with source.callId AND a
+  // 'tool-result' content block holding the per-result isError. The block
+  // path must keep precedence so isError is not lost on older hosts.
+  const messages: HarnessMessage[] = [
+    { role: 'assistant', content: [{ type: 'tool-call', id: 'c1', name: 'shell', arguments: '{}' }] },
+    {
+      role: 'user',
+      source: { kind: 'tool', callId: 'c1' },
+      content: [{ type: 'tool-result', toolCallId: 'c1', content: [{ type: 'text', text: 'failed' }], isError: true }],
+    },
+  ]
+  const context = await toPiContext(options({ messages }))
+  assert.equal(context.messages.length, 2)
+  const toolResult = expectRole(context.messages[1], 'toolResult') as Extract<PiMessage, { role: 'toolResult' }>
+  assert.equal(toolResult.toolCallId, 'c1')
+  assert.equal(toolResult.isError, true, 'per-block isError preserved on the legacy path')
+  assert.deepEqual(toolResult.content, [{ type: 'text', text: 'failed' }])
+})
+
+test('message-level tool results keep image blocks alongside text', async () => {
+  const sha = 'd'.repeat(64)
+  const bytes = Buffer.from('message-level tool result image bytes')
+  await withDshHome(async (home) => {
+    await putObject(home, sha, bytes)
+    const messages: HarnessMessage[] = [
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'c3', name: 'read', arguments: '{}' }] },
+      {
+        role: 'tool',
+        toolCallId: 'c3',
+        content: [
+          { type: 'text', text: 'caption' },
+          { type: 'image', attachment: { attachmentId: `sha256:${sha}`, mediaType: 'image/webp' } },
+        ],
+        source: { kind: 'tool', callId: 'c3' },
+      },
+    ]
+    const context = await toPiContext(options({ messages }))
+    assert.equal(context.messages.length, 2)
+    const toolResult = expectRole(context.messages[1], 'toolResult') as Extract<PiMessage, { role: 'toolResult' }>
+    assert.deepEqual(toolResult.content, [
+      { type: 'text', text: 'caption' },
+      { type: 'image', data: bytes.toString('base64'), mimeType: 'image/webp' },
+    ])
+  })
+})
+
 test('unreadable image references degrade to stable text instead of failing', async () => {
   const context = await toPiContext(
     options({
