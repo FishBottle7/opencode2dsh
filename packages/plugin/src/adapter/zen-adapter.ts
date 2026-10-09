@@ -138,6 +138,23 @@ export function reasoningEffortWire(id: string | undefined): string | undefined 
 const ANONYMOUS_KEY = 'public'
 
 /**
+ * Retry policy the host (dsh-llm-retry) runs for this provider. Resolved
+ * shape is FLAT (backoff fields at top level — see ResolvedNormalRetryPolicy,
+ * dsh-llm index.js:1867 consumes the adapter value verbatim). Retryable codes
+ * mirror the host default set so behavior differs only in patience, not in
+ * which failures qualify. Cumulative worst case per step:
+ * 1+2+4+8+16+20+20+20 ≈ 91s of silent retries before the error surfaces.
+ */
+export const FREE_LANE_RETRY_POLICY = Object.freeze({
+  mode: 'normal' as const,
+  maxRetries: 8,
+  retryableCodes: Object.freeze(['EMPTY_RESPONSE', 'RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT']),
+  initialDelayMs: 1_000,
+  maxDelayMs: 20_000,
+  jitterRatio: 0.2,
+})
+
+/**
  * Stream-liveness watchdogs (live-observed 2026-09-07): neither fetch nor
  * pi-ai owns a body-silence timeout, so a tunnel that stands but never
  * streams hangs the turn forever (70 minutes observed). Both messages
@@ -319,11 +336,18 @@ export class ZenAdapter {
   }
 
   /**
-   * dsh-llm calls this unconditionally at registration (index.js:1208).
-   * undefined = the host default retry policy, matching sidecar behavior.
+   * Provider-owned retry policy (dsh-llm calls this unconditionally at
+   * registration, index.js:1208). The anonymous free lane 429s in bursts —
+   * live-probed 2026-10-09 (issue #51): 5/8 immediate failures on
+   * step-5-preview-free, with contention windows that outlast the host
+   * default (5 retries over ~15s), so transient throttling surfaced as
+   * user-visible errors. This policy stretches the silent absorption window
+   * to ~90s per step (8 retries, 1s→20s backoff, wider jitter). Retryable
+   * codes mirror the host default set; deterministic failures (AUTH,
+   * REGION_BLOCKED, INVALID_REQUEST) stay non-retryable.
    */
-  providerRetryPolicy(_provider: string): undefined {
-    return undefined
+  providerRetryPolicy(_provider: string): typeof FREE_LANE_RETRY_POLICY {
+    return FREE_LANE_RETRY_POLICY
   }
 
   /** No image pricing for the free Zen lane. */
