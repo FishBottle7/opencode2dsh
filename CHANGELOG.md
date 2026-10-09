@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.10 (2026-10-09)
+
+### Fixed
+
+- Tool results from DSH >= 0.2 hosts now land in the `toolResult` slot instead of being re-emitted as phantom `user` messages (#50). dsh-llm 0.2.0-rc.2's `createToolResultMessage` puts the call id on the message (`role: 'tool'`, `toolCallId`, `source.callId`) with plain content blocks and no `tool-result` wrapper, but `toPiContext()` only looked for wrapper blocks — so every tool result arrived as a new user message while no `toolResult` was ever sent, making models report "the tool returned nothing" (`No result provided`) and mistake tool output for user input. A message with no `tool-result` content blocks but a message-level call id now emits exactly one `toolResult` (never a user message); the wrapper-block path keeps precedence so DSH 0.1.x hosts — whose `isError` lives on the block — behave byte-identically. Reproduced and fixed-verified against the real dsh 0.2.0-rc.2 CLI with a control group (stock 0.3.9 reproduces the issue verbatim; the patched build returns the real stdout in the tool slot with no new user message).
+- Free-lane 429 bursts are now ridden out silently instead of surfacing mid-conversation (#51). The adapter's `providerRetryPolicy` hook was returning `undefined`, deferring to the host default (5 retries over ~15s), which transient Zen quota windows (~60s, as measured by the IP pool's cooldown bookkeeping) outlasted — a live probe of the reporter's exact combo (`step-5-preview-free`, high effort) saw 5/8 requests immediately 429'd. The returned policy now runs 8 retries with 1s→20s backoff (~91s silent absorption per step, retries still executed — and cancellable — by the host, with the default retryable-code set so deterministic AUTH/REGION_BLOCKED failures are never retried). Live A/B on the same lane: unretryed baseline 5/8 ok, tuned policy 6/6 + 8/8 with bursts absorbed invisibly, stock-policy control stalled one request for 154s where the tuned spacing kept the worst request at 5.2s; real DSH 0.2.0-rc.2 headless e2e (3 sequential tool calls, high effort) completed cleanly.
+
 ## 0.3.9 (2026-10-08)
 
 ### Fixed
