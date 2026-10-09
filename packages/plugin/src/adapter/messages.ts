@@ -25,8 +25,15 @@ export type HarnessBlock =
   | { type: 'tool-result'; toolCallId: string; content: HarnessBlock[]; isError?: boolean; [key: string]: unknown }
 
 export interface HarnessMessage {
-  role: 'system' | 'user' | 'assistant'
+  /**
+   * DSH >= 0.2 delivers tool results as `role: 'tool'` messages with the call
+   * id at the message level; older hosts wrap them in `role: 'user'` messages
+   * carrying `tool-result` content blocks. Both shapes are handled.
+   */
+  role: 'system' | 'user' | 'assistant' | 'tool'
   content: HarnessBlock[]
+  toolCallId?: string
+  isError?: boolean
   source?: { kind: string; provider?: string; model?: string; callId?: string; [key: string]: unknown }
 }
 
@@ -231,6 +238,42 @@ function flattenText(message: HarnessMessage): string {
 }
 
 /**
+ * Call id of a message-level tool result (DSH >= 0.2: `role: 'tool'`,
+ * `toolCallId` on the message, plain content blocks, `source.callId` as a
+ * mirror). Returns undefined for ordinary user/system messages. Only consult
+ * `source.callId` when the source is a tool, so model/user provenance can
+ * never be mistaken for a tool result.
+ */
+function messageToolCallId(message: HarnessMessage): string | undefined {
+  if (typeof message.toolCallId === 'string' && message.toolCallId.length > 0) return message.toolCallId
+  const source = message.source
+  if (source?.kind === 'tool' && typeof source.callId === 'string' && source.callId.length > 0) return source.callId
+  return undefined
+}
+
+/** Emit one pi-ai toolResult, substituting a placeholder for empty output. */
+async function pushToolResult(
+  messages: PiMessage[],
+  toolNames: Map<string, string>,
+  toolCallId: string,
+  content: HarnessBlock[],
+  isError: boolean,
+): Promise<void> {
+  let rparts = await toolResultParts(content)
+  const hasImage = rparts.some((part) => part.type === 'image')
+  const hasText = rparts.some((part) => part.type === 'text' && part.text.length > 0)
+  if (!hasImage && !hasText) rparts = [{ type: 'text', text: '(no output)' }]
+  messages.push({
+    role: 'toolResult',
+    toolCallId,
+    toolName: toolNames.get(toolCallId) ?? 'unknown',
+    content: rparts,
+    isError,
+    timestamp: 0,
+  })
+}
+
+/**
  * Convert the harness conversation into a pi-ai Context. User and tool-result
  * messages keep text AND image blocks (images load from the harness
  * attachment store); tool results as toolResult messages, assistant history as
@@ -254,10 +297,21 @@ export async function toPiContext(options: HarnessGenerateOptions): Promise<PiCo
       messages.push(assistant)
       continue
     }
-    const parts = await userParts(message.content)
     const results = message.content.filter((block) => block.type === 'tool-result') as Array<
       Extract<HarnessBlock, { type: 'tool-result' }>
     >
+    if (results.length === 0) {
+      // DSH >= 0.2 tool result: call id lives on the message, content is
+      // plain text/image blocks. It must land in the toolResult slot only —
+      // emitting it as a user message makes the model mistake tool output
+      // for user input (and the real toolResult is never sent).
+      const toolCallId = messageToolCallId(message)
+      if (toolCallId !== undefined) {
+        await pushToolResult(messages, toolNames, toolCallId, message.content, message.isError ?? false)
+        continue
+      }
+    }
+    const parts = await userParts(message.content)
     if (parts.length > 0 || results.length === 0) {
       const first = parts[0]
       let content: string | PiContentBlock[]
@@ -267,18 +321,7 @@ export async function toPiContext(options: HarnessGenerateOptions): Promise<PiCo
       messages.push({ role: 'user', content, timestamp: 0 })
     }
     for (const result of results) {
-      let rparts = await toolResultParts(result.content)
-      const hasImage = rparts.some((part) => part.type === 'image')
-      const hasText = rparts.some((part) => part.type === 'text' && part.text.length > 0)
-      if (!hasImage && !hasText) rparts = [{ type: 'text', text: '(no output)' }]
-      messages.push({
-        role: 'toolResult',
-        toolCallId: result.toolCallId,
-        toolName: toolNames.get(result.toolCallId) ?? 'unknown',
-        content: rparts,
-        isError: result.isError ?? false,
-        timestamp: 0,
-      })
+      await pushToolResult(messages, toolNames, result.toolCallId, result.content, result.isError ?? false)
     }
   }
   const context: PiContext = { messages }
