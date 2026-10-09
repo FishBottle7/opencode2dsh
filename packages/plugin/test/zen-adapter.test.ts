@@ -22,9 +22,17 @@ test('providerInfo preserves the route id and names the provider', () => {
   assert.deepEqual(adapter.providerInfo('opencode2dsh'), { id: 'opencode2dsh', name: PROVIDER_ID })
 })
 
-test('providerRetryPolicy defers to the host default', () => {
+test('providerRetryPolicy tunes the host retry for free-lane 429 bursts (issue #51)', () => {
   const adapter = new ZenAdapter(new ModelCatalog())
-  assert.equal(adapter.providerRetryPolicy('opencode2dsh'), undefined)
+  const policy = adapter.providerRetryPolicy('opencode2dsh')
+  assert.equal(policy.mode, 'normal')
+  assert.ok(policy.maxRetries > 5, 'more retries than the host default (5)')
+  assert.deepEqual([...policy.retryableCodes], ['EMPTY_RESPONSE', 'RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT'])
+  assert.ok(policy.initialDelayMs >= 1_000, 'no instant re-hammering of a throttled lane')
+  assert.ok(policy.maxDelayMs >= 20_000, 'backoff must outlast measured quota windows (~60s)')
+  // flat resolved shape — dsh-llm consumes the adapter value verbatim
+  assert.equal('backoff' in policy, false)
+  assert.ok(Object.isFrozen(policy))
 })
 
 test('resolveModel declares image input from models.dev, and the built-in pattern otherwise', () => {
