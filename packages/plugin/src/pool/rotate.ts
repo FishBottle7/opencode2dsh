@@ -42,9 +42,63 @@ export function setRotateDelegate(next: RotateDelegate | null): void {
   delegate = next
 }
 
-/** True when a runtime delegate is installed (adapter fast-path). */
-export function hasRotateDelegate(): boolean {
-  return delegate !== null
+/**
+ * Reports a stream that died AFTER content had already landed.
+ *
+ * This is the reporting half of the same seam, and it exists because of a gap
+ * the dispatcher cannot cover. Its sentinel is disarmed the moment response
+ * headers land (`onResponseStart` -> `disarm()`), so once the body goes silent
+ * mid-stream there is no longer ANY layer that tells the pool the exit died:
+ * the adapter alone sees the watchdog fire, and it used to simply yield a
+ * terminal error. The exit therefore stayed `ok` with whatever latency it had
+ * measured — i.e. near the front of the pick order — so the SAME exit kept
+ * winning the next request and could tear the next stream down too.
+ *
+ * No rotation here (a partially delivered stream is never replayed, docs 3.4):
+ * this only closes the accounting, reusing the pool's existing transport-failure
+ * verdict so the exit leaves rotation and the semantics stay uniform.
+ */
+let failureReporter: ((session: string, model: string) => void) | null = null
+
+/** Install the runtime's stream-failure reporter (startIpPool). */
+export function setStreamFailureReporter(next: ((session: string, model: string) => void) | null): void {
+  failureReporter = next
+}
+
+/** Report a mid-stream death; no-op when no pool is running. */
+export function reportStreamFailure(session: string, model: string): void {
+  failureReporter?.(session, model)
+}
+
+/**
+ * Build the reporting half over the live pool (mirrors createRotateDelegate).
+ *
+ * Reuses the pool's existing transport verdict rather than inventing a second
+ * one: a body that stops mid-stream with no error status IS a transport failure
+ * by docs §4.2, so `recordPassiveTransport` is exactly the right call and the
+ * two-tier semantics stay uniform with the dispatcher's own accounting.
+ *
+ * `avoid` is what actually fixes the reported symptom: the exit keeps its `ok`
+ * mark for a subscription source (disable-only, §3.5) and would otherwise stay
+ * at the front of the pick order, so the avoid window is what stops the next
+ * request from being torn down by the same exit.
+ */
+export function createStreamFailureReporter(
+  pool: ExitPool,
+  onReported?: (exitId: string) => void,
+): (session: string, model: string) => void {
+  return (session, model) => {
+    const failedExit = pool.exitOfSession(session)
+    if (failedExit === null) return
+    pool.recordPassiveTransport(failedExit)
+    pool.avoid(failedExit)
+    pool.rerouteSession(session)
+    onReported?.(failedExit)
+    // `model` is part of the seam for symmetry with the rotate delegate (and
+    // for ban-level bookkeeping if this ever grows); the transport verdict is
+    // exit-level, so it does not need it today.
+    void model
+  }
 }
 
 /** Ask the installed delegate; false when no pool is running. */
@@ -83,13 +137,21 @@ export function createRotateDelegate(pool: ExitPool, options: { maxAttempts?: nu
   const maxAttempts = options.maxAttempts ?? 3
   return {
     decide(failure, model, session, attempt, deterministic = false) {
+      // The exit this turn was pinned to (the one that just failed).
+      const failedExit = pool.exitOfSession(session)
       // Deterministic refusal (RegionError): ban the sticky exit's pairing
       // immediately — the dispatcher layer recorded the refusal but cannot
       // see the body; the adapter's classify knows it on sight (docs 4.2).
-      if (deterministic) {
-        const failedExit = pool.exitOfSession(session)
-        if (failedExit !== null) pool.markModelBanned(failedExit, model)
+      if (deterministic && failedExit !== null) {
+        pool.markModelBanned(failedExit, model)
       }
+      // Exclude the exit that just failed THIS turn, however it failed. A first
+      // 403 is only 'suspect' (the ban needs a second sample) and a 5xx
+      // deliberately does not strike the exit dead, so either left the exit
+      // fully usable and the restarted stream re-picked it
+      // (measured: `sub-0 -> sub-0 -> sub-5`), spending a rotate attempt on a
+      // known-bad exit instead of trying a different one.
+      if (failedExit !== null) pool.avoid(failedExit)
       if (attempt > maxAttempts) return false
       // Anything usable for this model left? (pick filters cooldowns, bans,
       // dead.) Nothing usable -> let the error surface honestly.

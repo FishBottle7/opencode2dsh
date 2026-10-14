@@ -8,6 +8,7 @@ import { ExitPool, type ExitNode } from '../src/pool/pool.ts'
 import {
   PoolRoutingDispatcher,
   exitProxyUri,
+  httpsProxyOptions,
   isLoopback,
   normalizeHost,
   routingContext,
@@ -42,6 +43,25 @@ test('exitProxyUri maps exit ids to ProxyAgent URIs', () => {
   assert.equal(exitProxyUri('h:1', 'http'), 'http://h:1')
   assert.equal(exitProxyUri('h:1', 'socks5'), 'socks5://h:1')
   assert.equal(exitProxyUri('http://pre.formatted:3', 'http'), 'http://pre.formatted:3')
+})
+
+// Regression, measured live 2026-10-15: `https` was collapsed to `http` here,
+// so every https:// proxy got a bare CONNECT to a TLS listener. The listener
+// closed without a status line, undici reported `other side closed`, and 46 of
+// 118 exits were struck dead while all of them were in fact serving.
+test('exitProxyUri keeps https:// proxies on their own scheme', () => {
+  assert.equal(exitProxyUri('h:443', 'https'), 'https://h:443')
+  // An id that already carries a scheme is passed through untouched.
+  assert.equal(exitProxyUri('https://pre.formatted:443', 'https'), 'https://pre.formatted:443')
+  // http/socks5 must NOT grow a scheme they never had.
+  assert.equal(exitProxyUri('h:1', 'http'), 'http://h:1')
+})
+
+test('httpsProxyOptions un-verifies only the proxy hop', () => {
+  // An IP-literal proxy has no hostname a certificate could be issued for, so
+  // verification always fails (measured: "Secure Proxy Connection failed" on
+  // every sampled exit until this was passed).
+  assert.deepEqual(httpsProxyOptions(), { proxyTls: { rejectUnauthorized: false } })
 })
 
 /** A recording fake undici seam: dispatch tags each hop. */

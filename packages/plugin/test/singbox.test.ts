@@ -82,6 +82,54 @@ test('buildOutbound: unknown types return null (skipped)', () => {
   }, 'out-x'), null)
 })
 
+test('buildOutbound: only sing-box-valid uTLS fingerprints reach the config', () => {
+  // Live regression (2026-10-13): 2 nodes carried `client-fingerprint: unsafe`
+  // (v2ray's spelling for "no uTLS"), and because all 470 nodes shared one
+  // config and one `sing-box check` preflight, the whole batch failed:
+  //   FATAL[0000] initialize outbound[140]: unknown uTLS fingerprint: unsafe
+  type TlsView = { enabled?: boolean; server_name?: string; utls?: { enabled: boolean; fingerprint: string } }
+  const tlsOf = (out: Record<string, unknown> | null): TlsView => (out?.tls ?? {}) as TlsView
+
+  const valid = ['chrome', 'firefox', 'edge', 'safari', '360', 'qq', 'ios', 'android', 'random', 'randomized']
+  for (const fingerprint of valid) {
+    const out = buildOutbound({
+      name: 'v', type: 'vless', server: 'v.example.com', port: 443,
+      raw: { type: 'vless', uuid: 'u', sni: 'v.example.com', 'client-fingerprint': fingerprint },
+    }, 'out-v')
+    assert.deepEqual(tlsOf(out).utls, { enabled: true, fingerprint }, `${fingerprint} must survive`)
+  }
+  // 'unsafe' means "do not use uTLS": the block is dropped, TLS itself stays.
+  const unsafe = buildOutbound({
+    name: 'v', type: 'vless', server: 'v.example.com', port: 443,
+    raw: { type: 'vless', uuid: 'u', sni: 'v.example.com', 'client-fingerprint': 'unsafe' },
+  }, 'out-v')
+  assert.equal(tlsOf(unsafe).utls, undefined, 'an unknown fingerprint must not reach sing-box')
+  assert.equal(tlsOf(unsafe).enabled, true, 'dropping uTLS must not drop TLS')
+  assert.equal(tlsOf(unsafe).server_name, 'v.example.com')
+  // case-insensitive: real subscriptions are not consistent
+  const upper = buildOutbound({
+    name: 'v', type: 'vless', server: 'v.example.com', port: 443,
+    raw: { type: 'vless', uuid: 'u', 'client-fingerprint': 'Chrome' },
+  }, 'out-v')
+  assert.deepEqual(tlsOf(upper).utls, { enabled: true, fingerprint: 'chrome' })
+})
+
+test('generateConfig: a batch mixing an unknown fingerprint stays generatable', () => {
+  // The mapper is the first line of defence; the binary-level bisect in
+  // SingBoxSupervisor is the second. Here we only pin that the mapper no longer
+  // emits the value that aborted the shared preflight.
+  const good = vmessNode()
+  const bad = {
+    name: 'bad', type: 'vless', server: 'b.example.com', port: 443,
+    raw: { type: 'vless', uuid: 'u2', sni: 'b.example.com', 'client-fingerprint': 'unsafe' },
+  } satisfies ParsedNode
+  const { config, portMap } = generateConfig([good, bad], 30_000)
+  const cfg = config as { outbounds: Array<{ tls?: { utls?: { fingerprint?: string } } }> }
+  assert.equal(portMap.size, 2, 'both nodes keep a port')
+  const fingerprints = cfg.outbounds.map((o) => o.tls?.utls?.fingerprint).filter(Boolean)
+  assert.ok(!fingerprints.includes('unsafe'))
+})
+
 test('generateConfig: per-node inbound/outbound/rule with ascending ports + direct default', () => {
   const nodes = [vmessNode(), vmessNode({ name: 'second', server: 'v2.example.com', raw: { type: 'vmess', uuid: 'u2' } })]
   const { config, portMap } = generateConfig(nodes, 30_000)

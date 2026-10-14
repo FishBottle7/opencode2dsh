@@ -11,7 +11,7 @@
 
 import type { Dispatcher } from 'undici'
 
-import { ExitPool } from './pool.ts'
+import { ExitPool, type ExitProtocol } from './pool.ts'
 import { Prober, type ProbeTask } from './prober.ts'
 import { SourceBreaker, dedupeAddresses, fetchSource, selectSources, type FetchResult, type FreeSource } from './sources.ts'
 import { admitCandidate, coarseScreenBatch, type AdmissionDeps } from './admission.ts'
@@ -161,7 +161,7 @@ export class RefillScheduler {
     // bounded by admissionQuota per round.
     const candidateCap = 20_000
     const perSourceCap = 5_000
-    const candidates: Array<{ address: string; host: string; port: number; protocol: 'http' | 'socks5' }> = []
+    const candidates: Array<{ address: string; host: string; port: number; protocol: ExitProtocol }> = []
     const seen = new Set<string>(this.#poolAddresses())
 
     for (const source of sources) {

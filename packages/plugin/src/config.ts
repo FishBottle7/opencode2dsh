@@ -94,6 +94,8 @@ export interface IpPoolConfig {
   probeModels?: string[]
   /** Same-request rotate attempts on pre-content failures (docs 3.4). */
   maxRotateAttempts?: number
+  /** Periodic health-probe tick in ms (docs 4.6 probeIntervalMs). */
+  probeIntervalMs?: number
 }
 
 export const defaults = {

@@ -13,7 +13,7 @@
  */
 
 import type { IpPoolRuntime } from '../ip-pool.ts'
-import type { PoolState, ExitSource } from '../pool/pool.ts'
+import type { PoolState, ExitSource, ProbeFailure } from '../pool/pool.ts'
 
 /** Bridge route prefix (same-origin, loopback-only). */
 export const IP_POOL_BRIDGE_PREFIX = '/api/opencode2dsh/ip-pool'
@@ -37,6 +37,19 @@ export interface ExitRowView {
   cooldownUntil: number
   consecutiveLimited: number
   bannedModels: Array<{ model: string; state: 'suspect' | 'banned'; bannedAt: number }>
+  /**
+   * Last probe's outcome, when the exit has been probed at least once.
+   * `state: 'unknown'` + `lastProbeFailure: null` = genuinely never probed;
+   * a non-null class = probed and this is why it did not pass. Live-measured
+   * 2026-10-14: 703 of 726 subscription exits rendered as the same 未探活
+   * label whether or not a probe had ever run, which is what made it
+   * impossible to tell dead nodes from merely-unprobed ones.
+   */
+  lastProbeFailure: ProbeFailure | null
+  /** Human-readable detail for `lastProbeFailure` (diagnostics only). */
+  lastProbeReason: string
+  /** Epoch ms of the last probe attempt (0 = never probed). */
+  lastProbedAt: number
   /** Passive-signal counters from real requests (docs §4.3, IP-6). */
   passive: { ok: number; limited: number; refused: number; dead: number; transport: number }
 }
@@ -116,6 +129,9 @@ export function buildStatusView(
       bannedModels: entry.bans
         .filter((b) => b.ban.state !== 'ok')
         .map((b) => ({ model: b.model, state: b.ban.state as 'suspect' | 'banned', bannedAt: b.ban.bannedAt })),
+      lastProbeFailure: entry.health.lastProbeFailure === '' ? null : entry.health.lastProbeFailure,
+      lastProbeReason: entry.health.lastProbeReason,
+      lastProbedAt: entry.health.lastProbedAt,
       passive: runtime.pool.passiveStats(entry.id),
     }))
     : []

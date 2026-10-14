@@ -18,10 +18,49 @@
 
 export type ExitSource = 'free' | 'manual' | 'subscription' | 'goproxy'
 
+/**
+ * Transport used to reach the exit. `https` is an HTTP proxy whose OWN hop is
+ * TLS-wrapped (`https://host:port` in a subscription) — a different wire
+ * protocol from plaintext `http`, not a cosmetic variant. Conflating the two
+ * is a measured defect, not a style choice; see dispatcher.exitProxyUri.
+ */
+export type ExitProtocol = 'http' | 'https' | 'socks5'
+
+/**
+ * Why a probe failed, classified at the failure site (docs/ip-pool.md §4.2
+ * rule table). Declared HERE rather than in admission.ts because it is part
+ * of the pool's own vocabulary — `ExitHealth` records it — and admission.ts
+ * already imports this module, so the other direction would be circular.
+ *
+ * Only `transport` legitimately means "this link is dead" (dial failure,
+ * SOCKS5 handshake failure, timeout, socket reset — the node never answered).
+ * Every other class means the exit DID answer, so striking it dead would kill
+ * a working route. Live-observed 2026-10-14: 23 of 24 sampled subscription
+ * failures were `transport`, 1 was a refusal.
+ */
+export type ProbeFailure =
+  | 'transport'
+  | 'refused'
+  | 'server-error'
+  | 'quota'
+  | 'geo-blocked'
+  | 'slow'
+  | 'malformed'
+  /**
+   * The echo step could not reach its endpoint at all (connect timeout, SOCKS5
+   * handshake failure, socket reset to the IP echo). Distinct from
+   * `transport`: an echo-side network failure says nothing about whether the
+   * exit can reach the REAL target (`opencode.ai`), so a trusted-path probe
+   * continues to the tunnel step rather than striking the exit dead. Free
+   * candidates still die here (they are cheap to refill, and a node that
+   * cannot reach the echo also cannot have its geo/exit-IP recorded).
+   */
+  | 'echo-unavailable'
+
 export interface ExitNode {
   /** host:port, unique inside the pool (the address we dial). */
   id: string
-  protocol: 'http' | 'socks5'
+  protocol: ExitProtocol
   source: ExitSource
   /** Fixed primary exit (docs/ip-pool.md 3.6). */
   pinned: boolean
@@ -35,7 +74,6 @@ export interface ExitNode {
 
 export type ExitState = 'unknown' | 'ok' | 'dead'
 export type BanState = 'ok' | 'suspect' | 'banned'
-
 interface ExitHealth {
   state: ExitState
   lastProbedAt: number
@@ -46,6 +84,16 @@ interface ExitHealth {
   inflight: boolean
   /** Consecutive dead rechecks; eviction after deadEvictions (3.5). */
   deadStrikes: number
+  /**
+   * Why the last probe failed, classified (see probe-verdict.ts). Empty means
+   * the exit has never failed a probe. This is what separates "never probed"
+   * from "probed and the link was gone" on the settings card — live-observed
+   * 2026-10-14, 703 of 726 subscription exits rendered as the same
+   * "未探活" whether or not a probe had ever run against them.
+   */
+  lastProbeFailure: ProbeFailure | ''
+  /** Human-readable detail for the same failure (diagnostics only). */
+  lastProbeReason: string
 }
 
 interface ModelBan {
@@ -67,6 +115,8 @@ export interface PoolOptions {
   modelBanConfirmations?: number
   /** Dead exits are evicted after this many probe strikes (free source only). */
   deadEvictions?: number
+  /** How long a session avoids the exit that just failed it (rotate escape). */
+  avoidMs?: number
   now?: () => number
 }
 
@@ -78,12 +128,24 @@ export function gradeOf(latencyMs: number): ExitNode['quality'] {
   return 'C'
 }
 
+/**
+ * Sort key for latency. `0` means "never measured" (a trusted-conversion
+ * fallback, or a manual entry before its first probe), NOT "instantaneously
+ * fast". Treating it as a real measurement put unverified exits ahead of every
+ * exit that had actually answered, so it sorts last instead.
+ */
+function latencyRank(latencyMs: number): number {
+  return latencyMs > 0 ? latencyMs : Number.POSITIVE_INFINITY
+}
+
 const banKey = (exitId: string, model: string) => `${exitId}\u0000${model}`
 
 export class ExitPool {
   readonly #nodes = new Map<string, ExitNode>()
   readonly #health = new Map<string, ExitHealth>()
   readonly #bans = new Map<string, ModelBan>()
+  /** exitId -> its ban records, so per-exit lookups never scan all bans. */
+  readonly #bansByExit = new Map<string, Map<string, ModelBan>>()
   readonly #sessionExit = new Map<string, string>()
   /** Passive-signal counters per exit (docs/ip-pool.md §4.3 被动 + IP-6 stats). */
   readonly #passive = new Map<string, { ok: number; limited: number; refused: number; dead: number; transport: number }>()
@@ -92,6 +154,9 @@ export class ExitPool {
   #cooldownMax: number
   #banConfirmations: number
   #deadEvictions: number
+  #avoidMs: number
+  /** exitId -> epoch ms until which a rotate loop should skip it (§3.4). */
+  readonly #avoidUntil = new Map<string, number>()
   #now: () => number
 
   constructor(options: PoolOptions = {}) {
@@ -100,6 +165,7 @@ export class ExitPool {
     this.#cooldownMax = options.limitedCooldownMaxMs ?? 30 * 60_000
     this.#banConfirmations = options.modelBanConfirmations ?? 2
     this.#deadEvictions = options.deadEvictions ?? 2
+    this.#avoidMs = options.avoidMs ?? 30_000
     this.#now = options.now ?? Date.now
   }
 
@@ -129,6 +195,8 @@ export class ExitPool {
         cooldownUntil: 0,
         inflight: false,
         deadStrikes: 0,
+        lastProbeFailure: '',
+        lastProbeReason: '',
       })
     }
     return true
@@ -154,13 +222,27 @@ export class ExitPool {
     this.#nodes.delete(id)
     this.#health.delete(id)
     this.#passive.delete(id)
-    for (const key of this.#bans.keys()) {
-      if (key.startsWith(`${id}\u0000`)) this.#bans.delete(key)
+    this.#avoidUntil.delete(id)
+    const nodeBans = this.#bansByExit.get(id)
+    if (nodeBans !== undefined) {
+      for (const model of nodeBans.keys()) this.#bans.delete(banKey(id, model))
+      this.#bansByExit.delete(id)
     }
     for (const [session, exitId] of this.#sessionExit) {
       if (exitId === id) this.#sessionExit.delete(session)
     }
     this.#clearPinnedIf(id)
+  }
+
+  /** Single write path for ban records, keeping the per-exit index in sync. */
+  #setBan(id: string, model: string, ban: ModelBan): void {
+    this.#bans.set(banKey(id, model), ban)
+    let nodeBans = this.#bansByExit.get(id)
+    if (nodeBans === undefined) {
+      nodeBans = new Map<string, ModelBan>()
+      this.#bansByExit.set(id, nodeBans)
+    }
+    nodeBans.set(model, ban)
   }
 
   /** Disable without dropping (dead manual/subscription/goproxy nodes, 3.5). */
@@ -169,6 +251,7 @@ export class ExitPool {
     if (!health) return
     health.state = 'dead'
     health.inflight = false
+    if (health.lastProbeFailure === '') health.lastProbeFailure = 'transport'
   }
 
   #clearPinnedIf(id: string): void {
@@ -213,10 +296,32 @@ export class ExitPool {
       health.consecutiveLimited = 0
       health.cooldownUntil = 0
       health.deadStrikes = 0
+      // A passing probe clears the failure record: "last probe failed" must
+      // never outlive the probe that superseded it.
+      health.lastProbeFailure = ''
+      health.lastProbeReason = ''
     }
     if (model !== undefined) {
-      this.#bans.set(banKey(id, model), { state: 'ok', bannedAt: 0, consecutiveFailures: 0 })
+      this.#setBan(id, model, { state: 'ok', bannedAt: 0, consecutiveFailures: 0 })
     }
+  }
+
+  /**
+   * Record a failed probe's class + reason without touching health.
+   *
+   * Split out of the mark* family deliberately: several failure classes
+   * (server-error, geo-blocked, slow, malformed) must leave the exit's health
+   * EXACTLY as it was — the node answered, it just could not serve this probe
+   * — yet the settings card still needs to show "probed, and here is why it
+   * did not pass" instead of the indistinguishable 未探活. The single
+   * write path keeps `lastProbeFailure` and `lastProbeReason` consistent.
+   */
+  markProbeFailure(id: string, failure: ProbeFailure, reason = ''): void {
+    const health = this.#health.get(id)
+    if (!health) return
+    health.lastProbedAt = this.#now()
+    health.lastProbeFailure = failure
+    health.lastProbeReason = reason
   }
 
   /** 429: exit-level cooldown with exponential backoff (3.2 / 4.6). */
@@ -225,6 +330,13 @@ export class ExitPool {
     if (!health) return 0
     health.consecutiveLimited += 1
     health.state = 'ok'
+    // A 429 is a VERIFIED-ALIVE verdict (the request reached the upstream and
+    // came back metered), so it supersedes any older failure record — a stale
+    // "probe failed" label next to a cooling-but-working exit would be a lie.
+    // The echo-step 429 goes through markProbeFailure AFTER this call, so that
+    // narrower case still records itself.
+    health.lastProbeFailure = ''
+    health.lastProbeReason = ''
     const backoff = Math.min(
       this.#cooldownBase * 2 ** (health.consecutiveLimited - 1),
       this.#cooldownMax,
@@ -236,13 +348,12 @@ export class ExitPool {
   /** Deterministic refusal (upstream RegionError: region blocks are a
    *  property of the exit, not transient noise) — ban the pairing at once. */
   markModelBanned(id: string, model: string): void {
-    this.#bans.set(banKey(id, model), { state: 'banned', bannedAt: this.#now(), consecutiveFailures: this.#banConfirmations })
+    this.#setBan(id, model, { state: 'banned', bannedAt: this.#now(), consecutiveFailures: this.#banConfirmations })
   }
 
   /** 401/403: model-level suspicion; banned after N consecutive (3.2). */
   markModelSignal(id: string, model: string): BanState {
-    const key = banKey(id, model)
-    const current = this.#bans.get(key) ?? { state: 'ok' as BanState, bannedAt: 0, consecutiveFailures: 0 }
+    const current = this.#bans.get(banKey(id, model)) ?? { state: 'ok' as BanState, bannedAt: 0, consecutiveFailures: 0 }
     current.consecutiveFailures += 1
     if (current.consecutiveFailures >= this.#banConfirmations && current.state !== 'banned') {
       current.state = 'banned'
@@ -250,35 +361,31 @@ export class ExitPool {
     } else if (current.state !== 'banned') {
       current.state = 'suspect'
     }
-    this.#bans.set(key, current)
+    this.#setBan(id, model, current)
     return current.state
   }
 
   /** Transport failure / 5xx / probe timeout: dead, with free-source eviction
-   *  after repeated strikes (3.5). Returns true when the node was evicted. */
-  markDeadStrike(id: string): boolean {
+   *  after repeated strikes (3.5). Returns true when the node was evicted.
+   *
+   *  This is the ONLY source-dependent rule in the health model (docs 3.5):
+   *  a dead `free` node is dropped so its slot can be refilled, while a dead
+   *  manual/subscription node is disabled in place and re-probed by
+   *  `PeriodicProber`. The verdict itself — that the link is gone — is uniform. */
+  markDeadStrike(id: string, reason = ''): boolean {
     const node = this.#nodes.get(id)
     const health = this.#health.get(id)
     if (!node || !health) return false
     health.state = 'dead'
     health.inflight = false
     health.deadStrikes += 1
+    health.lastProbeFailure = 'transport'
+    if (reason !== '') health.lastProbeReason = reason
     if (node.source === 'free' && health.deadStrikes >= this.#deadEvictions) {
       this.remove(id)
       return true
     }
     return false
-  }
-
-  /** Death from a mid-flight stream (no retry path): same strike accounting. */
-  markStreamFailure(id: string, kind: '429' | 'model', model?: string): void {
-    if (kind === '429') {
-      this.markLimited(id)
-      this.#countPassive(id, 'limited')
-    } else if (model !== undefined) {
-      this.markModelSignal(id, model)
-      this.#countPassive(id, 'refused')
-    }
   }
 
   /**
@@ -363,6 +470,27 @@ export class ExitPool {
   }
 
   /**
+   * Mark an exit as "just failed this request" so the rotate loop in the same
+   * user turn moves on. A 403 whose ban still needs a second sample, and a 5xx
+   * (which deliberately does not strike the exit dead), both leave
+   * `isUsable()` true — without this the restarted stream re-picked the very
+   * exit that had just failed it (measured: `sub-0 -> sub-0 -> sub-5`).
+   */
+  avoid(id: string): void {
+    if (!this.#nodes.has(id)) return
+    this.#avoidUntil.set(id, this.#now() + this.#avoidMs)
+  }
+
+  /** Exits currently in a rotate-avoid window. */
+  #avoiding(id: string): boolean {
+    const until = this.#avoidUntil.get(id)
+    if (until === undefined) return false
+    if (until > this.#now()) return true
+    this.#avoidUntil.delete(id)
+    return false
+  }
+
+  /**
    * Pick the exit for one upstream request. Pinned wins while usable (3.6);
    * the rotation pool then prefers session stickiness, health, fewer
    * cooldowns and lower latency with a same-tier shuffle. Pure; no IO.
@@ -371,33 +499,47 @@ export class ExitPool {
     if (this.pinnedId !== '' && this.isUsable(this.pinnedId, model)) return this.pinnedId
 
     const last = this.#sessionExit.get(session)
-    if (last !== undefined && this.isUsable(last, model)) return last
+    // Stickiness yields to an in-flight probe as well as to the avoid window:
+    // re-pinning the same exit while it is being probed would hand real
+    // traffic straight back to the exit that is spending the quota.
+    if (last !== undefined && this.isUsable(last, model) && !this.#avoiding(last) && this.#health.get(last)?.inflight !== true) return last
 
     const usable = [...this.#nodes.keys()].filter((id) => this.isUsable(id, model))
     if (usable.length === 0) return null
+    // Prefer exits outside the rotate-avoid window; when EVERY candidate is
+    // avoiding (a single-exit pool mid-rotation) fall back to the full set
+    // rather than returning null and silently going direct.
+    const preferred = usable.filter((id) => !this.#avoiding(id))
+    const candidates = preferred.length > 0 ? preferred : usable
     const health = (id: string) => this.#health.get(id)!
     const node = (id: string) => this.#nodes.get(id)!
-    usable.sort((left, right) => {
+    candidates.sort((left, right) => {
       const a = health(left)
       const b = health(right)
       const stateRank = (h: ExitHealth) => (h.state === 'ok' ? 0 : 1)
       const byState = stateRank(a) - stateRank(b)
       if (byState !== 0) return byState
+      // An exit whose health probe is in flight is DEPRIORITIZED, not banned.
+      // The probe and real traffic share one anonymous quota bucket per exit
+      // IP (§4.1), so preferring an exit that is being probed right now is how
+      // an `ok`-looking exit still answers 429. Depriving it of PRIORITY (last,
+      // after every idle candidate) keeps real traffic off it while probes run
+      // without ever emptying the pool: when every usable exit is being probed,
+      // this ranking still returns one, so traffic never falls through to direct
+      // just because a probe sweep happens to be in progress.
+      const busyRank = (h: ExitHealth) => (h.inflight ? 1 : 0)
+      const byInflight = busyRank(a) - busyRank(b)
+      if (byInflight !== 0) return byInflight
       const byLimited = a.consecutiveLimited - b.consecutiveLimited
       if (byLimited !== 0) return byLimited
-      const byLatency = node(left).latencyMs - node(right).latencyMs
+      const byLatency = latencyRank(node(left).latencyMs) - latencyRank(node(right).latencyMs)
       if (byLatency !== 0) return byLatency
       return Math.random() < 0.5 ? -1 : 1
     })
-    const chosen = usable[0]
+    const chosen = candidates[0]
     if (chosen === undefined) return null
     this.#sessionExit.set(session, chosen)
     return chosen
-  }
-
-  /** Drop the session's sticky exit (cooldown/dead/ban broke it). */
-  breakStickySession(session: string): void {
-    this.#sessionExit.delete(session)
   }
 
   // -- four-state machine (3.5) -------------------------------------------------
@@ -411,19 +553,21 @@ export class ExitPool {
     if (!health || health.state === 'dead') return false
     if (health.cooldownUntil > this.#now()) return false
     // A node with at least one banned pairing and no healthy pairing for any
-    // model it serves is effectively exhausted. Track by distinct models:
-    const nodeModels = new Set<string>()
+    // model it serves is effectively exhausted. Track by distinct models.
+    // Indexed by exit: the previous form walked every ban for every node, so
+    // state()/admissionQuota() were O(nodes x bans) on each refill tick — with
+    // a subscription pool (470 exits, one ban key per probed model) that ran on
+    // every state read.
+    const nodeBans = this.#bansByExit.get(id)
+    if (nodeBans === undefined || nodeBans.size === 0) return true
     let allBanned = true
-    let sawBan = false
-    for (const [key, ban] of this.#bans) {
-      if (!key.startsWith(`${id}\u0000`)) continue
-      const model = key.slice(id.length + 1)
-      nodeModels.add(model)
-      if (ban.state !== 'banned') allBanned = false
-      else sawBan = true
+    for (const ban of nodeBans.values()) {
+      if (ban.state !== 'banned') {
+        allBanned = false
+        break
+      }
     }
-    if (sawBan && nodeModels.size > 0 && allBanned) return false
-    return true
+    return !allBanned
   }
 
   /** Count usable free-source nodes toward the refill thresholds. */

@@ -12,11 +12,14 @@ import { ExitPool, type ExitNode } from '../src/pool/pool.ts'
 import {
   classifyStreamFailure,
   createRotateDelegate,
+  createStreamFailureReporter,
   isRegionBlocked,
   setRotateDelegate,
+  setStreamFailureReporter,
   shouldRotate,
 } from '../src/pool/rotate.ts'
 import { ZenAdapter } from '../src/adapter/zen-adapter.ts'
+import { deriveRequestIDs } from '../src/adapter/ids.ts'
 import type { ModelCatalog } from '../src/adapter/catalog.ts'
 
 function node(overrides: Partial<ExitNode> = {}): ExitNode {
@@ -59,10 +62,31 @@ const harnessOptions = {
   maxTokens: 100,
 } as never
 
+/**
+ * Harness options whose conversation seed is DETERMINISTIC: an empty message
+ * list falls back to a random session id (ids.ts deriveRequestIDs), which makes
+ * the session the adapter uses unpredictable — and the session is the key the
+ * pool binds an exit to, so tests that need a pre-bound session must use this.
+ */
+const seededHarnessOptions = {
+  model: 'big-pickle',
+  messages: [{ role: 'user', content: [{ type: 'text', text: 'deterministic seed' }] }],
+  temperature: 0,
+  maxTokens: 100,
+} as never
+
+/** The deterministic conversation seed behind {@link seededHarnessOptions}. */
+const seededMessages = [{ role: 'user', content: [{ type: 'text', text: 'deterministic seed' }] }]
+
 /** Collect the chunks a stream yields (JSON-stringified for matching). */
 async function collect(adapter: ZenAdapter): Promise<string[]> {
+  return collectWith(adapter, harnessOptions)
+}
+
+/** Collect a stream driven by specific harness options. */
+async function collectWith(adapter: ZenAdapter, options: unknown): Promise<string[]> {
   const out: string[] = []
-  const stream = await adapter.stream(harnessOptions)
+  const stream = await adapter.stream(options as never)
   for (;;) {
     const next = await stream.next()
     if (next.done) break
@@ -320,4 +344,81 @@ test('adapter watchdog: mid-stream silence after delivered content surfaces, nev
     clearTimeout(armed.timer)
     setRotateDelegate(null)
   }
+})
+
+test('mid-stream silence is REPORTED to the pool, not just surfaced', async () => {
+  setRotateDelegate(null)
+  const pool = new ExitPool()
+  pool.add(node({ id: 'a:1', exitIP: '1.1.1.1' }))
+  setRotateDelegate(createRotateDelegate(pool, { maxAttempts: 3 }))
+  setStreamFailureReporter(createStreamFailureReporter(pool, () => {}))
+
+  // The reporter resolves the failed exit through the session binding, so bind
+  // the session the adapter will actually use BEFORE streaming. The seeded
+  // options make that session deterministic (an empty message list would
+  // randomize it and the binding could never line up).
+  const session = deriveRequestIDs(seededMessages).session
+  pool.pick(session, 'big-pickle')
+  assert.equal(pool.exitOfSession(session), 'a:1', 'the session is bound to the exit')
+
+  const armed: { timer?: NodeJS.Timeout } = {}
+  const provider = {
+    streamSimple(): AsyncIterable<ScriptedEvent> {
+      return (async function* () {
+        yield { type: 'start' }
+        yield { type: 'text_delta', delta: 'partial' }
+        await new Promise<void>((resolve) => { armed.timer = setTimeout(resolve, 60_000) })
+      })()
+    },
+  }
+  const adapter = new ZenAdapter(fakeCatalog(), { providerOverride: provider, firstEventMs: 40, bodyIdleMs: 80 })
+  try {
+    await collectWith(adapter, seededHarnessOptions)
+    // The dispatcher's sentinel is disarmed once headers land, so before this
+    // fix the mid-stream mute left the pool with NO footprint at all and the
+    // exit stayed at the front of the pick order.
+    assert.equal(pool.passiveStats('a:1').transport, 1, 'the mid-stream death is recorded as a transport failure')
+    assert.equal(pool.list()[0]!.health.lastProbeFailure, 'transport', 'the failure class is visible')
+  } finally {
+    clearTimeout(armed.timer)
+    setStreamFailureReporter(null)
+    setRotateDelegate(null)
+  }
+})
+
+test('a mid-stream-failed exit is not re-picked for the next request', async () => {
+  setRotateDelegate(null)
+  const pool = new ExitPool()
+  // The failing exit is the FAST one, so it would win every pick.
+  pool.add(node({ id: 'fast:1', exitIP: '1.1.1.1', latencyMs: 50 }))
+  pool.add(node({ id: 'slow:2', exitIP: '2.2.2.2', latencyMs: 900 }))
+  pool.markOk('fast:1')
+  pool.markOk('slow:2')
+  const session = deriveRequestIDs(seededMessages).session
+  assert.equal(pool.pick(session, 'big-pickle'), 'fast:1', 'the fast exit wins before the failure')
+
+  setRotateDelegate(createRotateDelegate(pool, { maxAttempts: 3 }))
+  setStreamFailureReporter(createStreamFailureReporter(pool, () => {}))
+
+  const armed: { timer?: NodeJS.Timeout } = {}
+  const provider = {
+    streamSimple(): AsyncIterable<ScriptedEvent> {
+      return (async function* () {
+        yield { type: 'start' }
+        yield { type: 'text_delta', delta: 'partial' }
+        await new Promise<void>((resolve) => { armed.timer = setTimeout(resolve, 60_000) })
+      })()
+    },
+  }
+  const adapter = new ZenAdapter(fakeCatalog(), { providerOverride: provider, firstEventMs: 40, bodyIdleMs: 80 })
+  try {
+    await collectWith(adapter, seededHarnessOptions)
+  } finally {
+    clearTimeout(armed.timer)
+    setStreamFailureReporter(null)
+    setRotateDelegate(null)
+  }
+  // The whole point: the exit that tore the stream down must not be handed the
+  // very next request just because it still looks fast and healthy.
+  assert.notEqual(pool.pick('sess-2', 'big-pickle'), 'fast:1', 'the silent exit is not re-picked immediately')
 })

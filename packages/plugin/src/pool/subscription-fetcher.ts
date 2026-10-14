@@ -18,9 +18,10 @@
  * `clash-verge/1.6.0` and serves normally for `clash-verge/v2.0`.
  */
 
-import { ExitPool, type ExitNode } from './pool.ts'
+import { ExitPool, type ExitNode, type ExitProtocol } from './pool.ts'
 import { Prober, type ProbeTask } from './prober.ts'
-import { admitCandidate, admitTrusted, type AdmissionDeps } from './admission.ts'
+import { admitTrusted, type AdmissionDeps } from './admission.ts'
+import { applyProbeVerdict } from './probe-verdict.ts'
 import { parseSubscription, type ParsedNode } from './subscription.ts'
 import { DEFAULT_SUBSCRIPTION_USER_AGENT, normalizeSubscriptionUserAgent } from './subscription-defaults.ts'
 import { SingBoxSupervisor, type ConvertedExit } from './singbox.ts'
@@ -69,6 +70,20 @@ export interface SubscriptionOptions {
   logger?: { info(message: string): void; warn(message: string): void }
 }
 
+/** How stale a known exit's last probe must be before a refresh re-smokes it.
+ *  A refresh used to re-smoke EVERY converted exit unconditionally, so a pool
+ *  of a few hundred exits re-enqueued a few hundred anonymous-lane smokes on
+ *  every round. Measured live (2026-10-15): `enqueued` climbed past 2600 with
+ *  only 400 exits in the table and a 6-hour refresh interval, because each
+ *  round re-queued the whole table while the queue drained at ~2.5/s under the
+ *  concurrency cap. Those smokes share the per-exit-IP anonymous quota with real
+ *  traffic, which is what produced OK-looking exits that still answered 429. */
+const RESMOKE_AFTER_MS = 30 * 60_000
+
+/** Hard cap on smokes one refresh round may queue, so no future path can
+ *  rebuild the pile-up this ceiling exists to stop. */
+const MAX_SMOKES_PER_ROUND = 60
+
 export class SubscriptionFetcher {
   readonly #deps: SubscriptionDeps
   #urls: string[] = []
@@ -88,6 +103,11 @@ export class SubscriptionFetcher {
   #timeoutMs: number
   #userAgent: string
   #logger?: SubscriptionOptions['logger']
+  /** Notified after every real admission — the runtime assembly uses it to
+   *  engage routing the moment a subscription pool stops being empty (the
+   *  initial install is skipped exactly then, and a subscription-only pool
+   *  has no refill loop to fire the free-source hook). */
+  #admittedCallbacks: Array<() => void> = []
 
   constructor(deps: SubscriptionDeps, options: SubscriptionOptions = {}) {
     this.#deps = deps
@@ -99,6 +119,21 @@ export class SubscriptionFetcher {
 
   get state(): SubscriptionState {
     return { ...this.#state, running: this.#refreshing !== null, pendingConversion: [...this.#state.pendingConversion] }
+  }
+
+  /** Register a callback fired after every node this round really admits. */
+  onAdmitted(callback: () => void): void {
+    this.#admittedCallbacks.push(callback)
+  }
+
+  #notifyAdmitted(): void {
+    for (const callback of this.#admittedCallbacks) {
+      try {
+        callback()
+      } catch {
+        /* a watcher's failure must never kill the round */
+      }
+    }
   }
 
   /** Configured URL count (status bridge; the URLs themselves never ride out). */
@@ -171,7 +206,7 @@ export class SubscriptionFetcher {
     const urls = [...this.#urls]
     const userAgent = this.#userAgent
     const pending: ParsedNode[] = []
-    const plaintext: Array<{ address: string; protocol: 'http' | 'socks5' }> = []
+    const plaintext: Array<{ address: string; protocol: ExitProtocol }> = []
     let lastError = ''
     for (const url of urls) {
       try {
@@ -179,7 +214,7 @@ export class SubscriptionFetcher {
         if (this.#stopped) return
         const report = parseSubscription(body)
         for (const node of report.nodes) {
-          if (node.type === 'http' || node.type === 'socks5') {
+          if (node.type === 'http' || node.type === 'https' || node.type === 'socks5') {
             plaintext.push({
               address: `${node.server}:${node.port}`,
               protocol: node.type,
@@ -205,31 +240,61 @@ export class SubscriptionFetcher {
     }
     // Encrypted nodes -> sing-box conversion -> local SOCKS5 exits (IP-4).
     // Without a supervisor configured they stay parked as pending.
+    //
+    // The incremental rule below is shared by BOTH the converted and the
+    // plaintext path: re-smoke a node only when it is new or its last verdict
+    // has gone stale. Re-smoking the whole table on every round is what buried
+    // the probe queue (see RESMOKE_AFTER_MS).
+    const now = Date.now()
+    const entries = this.#deps.pool.list()
+    const known = new Set(entries.map((entry) => entry.id))
+    const stale = new Set(entries
+      .filter((entry) => now - entry.health.lastProbedAt >= RESMOKE_AFTER_MS)
+      .map((entry) => entry.id))
     if (pending.length > 0 && this.#deps.supervisor) {
       try {
         const exits = await this.#deps.supervisor.reload(pending)
         if (this.#stopped) return
         const tasks: ProbeTask[] = exits
-          .filter((exit) => !this.#deps.pool.has(exit.address))
+          .filter((exit) => !known.has(exit.address) || stale.has(exit.address))
+          .slice(0, MAX_SMOKES_PER_ROUND)
           .map((exit): ProbeTask => ({
             exitId: exit.address,
             kind: 'subscription-smoke',
             run: async () => {
               if (this.#stopped) return
+              const existing = this.#deps.pool.get(exit.address)
               const verdict = await admitTrusted(this.#deps, {
                 address: exit.address,
                 protocol: exit.protocol,
                 source: 'subscription',
-              })
+              }, existing
+                ? { previous: { exitIP: existing.exitIP, exitLocation: existing.exitLocation, latencyMs: existing.latencyMs, quality: existing.quality } }
+                : {})
               if (!this.#stopped && verdict.admitted && verdict.node) {
-                if (this.#deps.pool.add(verdict.node)) {
-                  this.#deps.pool.markOk(verdict.node.id)
+                const isNew = this.#deps.pool.add({ ...verdict.node, addedAt: existing?.addedAt ?? verdict.node.addedAt })
+                // The verdict layer decides what the probe MEANT. A degraded
+                // fallback is no longer a silent dead end: it carries the
+                // failure class, so a link that is genuinely gone is marked
+                // dead (excluded from rotation, re-probed by PeriodicProber)
+                // while a node that merely refused this probe keeps its health.
+                // Live-observed 2026-10-14: 703 of 726 exits sat at 'unknown'
+                // with no facts because this path never wrote anything on
+                // failure — they looked identical to never-probed nodes.
+                applyProbeVerdict(this.#deps.pool, exit.address, verdict, {
+                  source: 'subscription',
+                  model: this.#deps.smokeModel ?? 'big-pickle',
+                })
+                if (!known.has(exit.address) && isNew) {
                   this.#state.convertedAdmitted += 1
-                  const served = exit.node
-                  this.#state.pendingConversion = this.#state.pendingConversion.filter(
-                    (node) => node !== served,
-                  )
+                  this.#notifyAdmitted()
                 }
+                const served = exit.node
+                // Drop the served node by identity, not by value: this ran
+                // once per converted exit, and filtering 1900+ pending nodes
+                // by value inside every task was quadratic in the round.
+                const at = this.#state.pendingConversion.indexOf(served)
+                if (at >= 0) this.#state.pendingConversion.splice(at, 1)
               }
             },
           }))
@@ -243,23 +308,38 @@ export class SubscriptionFetcher {
     }
     // Plaintext nodes go through the trusted admission smoke (never the
     // hot coarse screen: subscription nodes are paid resources, docs 4.1).
+    // Same incremental rule as the converted path above: a node already
+    // smoked recently keeps its verdict until it goes stale.
     if (this.#stopped) return
     const tasks: ProbeTask[] = plaintext
-      .filter((candidate) => !this.#deps.pool.has(candidate.address))
+      .filter((candidate) => !known.has(candidate.address) || stale.has(candidate.address))
+      .slice(0, MAX_SMOKES_PER_ROUND)
       .map((candidate): ProbeTask => ({
         exitId: candidate.address,
         kind: 'subscription-smoke',
         run: async () => {
           if (this.#stopped) return
+          const existing = this.#deps.pool.get(candidate.address)
           const verdict = await admitTrusted(this.#deps, {
             address: candidate.address,
             protocol: candidate.protocol,
             source: 'subscription',
-          })
+          }, existing
+            ? { previous: { exitIP: existing.exitIP, exitLocation: existing.exitLocation, latencyMs: existing.latencyMs, quality: existing.quality } }
+            : {})
           if (!this.#stopped && verdict.admitted && verdict.node) {
-            if (this.#deps.pool.add(verdict.node)) {
-              this.#deps.pool.markOk(verdict.node.id)
+            const isNew = !existing
+            // add() refreshes the facts; the verdict layer owns the health
+            // write, so a plaintext node whose link died is marked dead here
+            // too (previously it silently stayed 'unknown' forever).
+            this.#deps.pool.add(isNew ? verdict.node : { ...verdict.node, addedAt: existing.addedAt })
+            applyProbeVerdict(this.#deps.pool, verdict.node.id, verdict, {
+              source: 'subscription',
+              model: this.#deps.smokeModel ?? 'big-pickle',
+            })
+            if (isNew) {
               this.#state.plaintextAdmitted += 1
+              this.#notifyAdmitted()
             }
           }
         },

@@ -84,29 +84,33 @@ test('admission: the four-step happy path admits with exit facts and grade', asy
 })
 
 test('admission: fail-fast at each step (echo/geo/latency/models/smoke)', async () => {
-  // step 1-2: non-200 echo
+  // step 1-2: non-200 echo. 5xx is the echo service's fault, never the link's.
   let transport = fakeTransport({ ...okScript(), [ECHO_URL]: { status: 503, body: '' } })
   let result = await admitCandidate(deps(transport), { address: 'h:1', protocol: 'http', source: 'free' })
   assert.ok(!result.admitted)
   assert.match(result.reason!, /echo HTTP 503/)
+  assert.equal(result.failure, 'server-error')
 
-  // step 2: echo without an exit IP
+  // step 2: echo without an exit IP — an unreadable body, not a dead link
   transport = fakeTransport({ ...okScript(), [ECHO_URL]: { status: 200, body: '{"status":"fail"}' } })
   result = await admitCandidate(deps(transport), { address: 'h:1', protocol: 'http', source: 'free' })
   assert.ok(!result.admitted)
   assert.match(result.reason!, /exit IP/)
+  assert.equal(result.failure, 'malformed')
 
-  // step 2: geo-blocked country
+  // step 2: geo-blocked country — policy, the link demonstrably works
   transport = fakeTransport({ ...okScript(), [ECHO_URL]: { status: 200, body: echoBody('5.5.5.5', 'CN') } })
   result = await admitCandidate(deps(transport), { address: 'h:1', protocol: 'http', source: 'free' }, { timeoutMs: 1000 })
   assert.ok(!result.admitted)
   assert.match(result.reason!, /geo-blocked CN/)
+  assert.equal(result.failure, 'geo-blocked')
 
-  // step 3: HTTPS tunnel to the real upstream fails
+  // step 3: HTTPS tunnel to the real upstream fails (403 = refusal, not death)
   transport = fakeTransport({ ...okScript(), [MODELS_URL]: { status: 403, body: '' } })
   result = await admitCandidate(deps(transport), { address: 'h:1', protocol: 'http', source: 'free' }, { timeoutMs: 1000 })
   assert.ok(!result.admitted)
   assert.match(result.reason!, /zen models HTTP 403/)
+  assert.equal(result.failure, 'refused')
 
   // step 4: anonymous-lane smoke 429 -> admitted with `limited` (good exit,
   // quota consumed elsewhere; the caller cools it, docs 4.5)
@@ -121,6 +125,14 @@ test('admission: fail-fast at each step (echo/geo/latency/models/smoke)', async 
   result = await admitCandidate(deps(transport), { address: 'h:1', protocol: 'http', source: 'free' }, { timeoutMs: 1000 })
   assert.ok(!result.admitted)
   assert.match(result.reason!, /zen smoke HTTP 403/)
+  assert.equal(result.failure, 'refused')
+
+  // step 4: an upstream 5xx is the MODEL failing behind a healthy exit — the
+  // class the passive path already refused to strike dead (2026-09-09)
+  transport = fakeTransport({ ...okScript(), [CHAT_URL]: { status: 500, body: '' } })
+  result = await admitCandidate(deps(transport), { address: 'h:1', protocol: 'http', source: 'free' }, { timeoutMs: 1000 })
+  assert.ok(!result.admitted)
+  assert.equal(result.failure, 'server-error')
 
   // the smoke body must satisfy the free-lane gate (issue #56): streaming,
   // bash+read stubs call-disabled, and a canonical ses_* session header
@@ -165,7 +177,107 @@ test('admission: trusted sources are admitted with warnings even on failure', as
   )
   assert.ok(result.admitted)
   assert.equal(result.node?.exitIP, '') // unknown facts, address is the key
+  assert.equal(result.degraded, true, 'an unverified fallback must be flagged degraded')
   assert.ok(warnings.some((line) => line.includes('leased:1')))
+})
+
+test('admission: the trusted fallback carries the failure CLASS, not just "degraded"', async () => {
+  // Without this the caller cannot tell a dead link from a refused probe, which
+  // is exactly how 703 verified-dead subscription exits ended up looking
+  // identical to never-probed ones (live-observed 2026-10-14).
+  const refused = await admitTrusted(
+    { ...deps(fakeTransport({ [ECHO_URL]: { status: 200, body: echoBody('5.5.5.5', 'JP') }, [MODELS_URL]: { status: 403, body: '' } })), logger: { warn: () => {} } },
+    { address: 'sub:1', protocol: 'http', source: 'subscription' },
+  )
+  assert.equal(refused.degraded, true)
+  assert.equal(refused.failure, 'refused', 'a 403 is a refusal, NOT a dead link')
+
+  const dead = await admitTrusted(
+    { ...deps(fakeTransport({ '*': new Error('SOCKS5 connection timeout') })), logger: { warn: () => {} } },
+    { address: '127.0.0.1:30001', protocol: 'socks5', source: 'subscription' },
+  )
+  assert.equal(dead.degraded, true)
+  assert.equal(dead.failure, 'transport', 'a dial timeout IS a dead link')
+})
+
+test('admission: a failed trusted smoke never invents a fast, top-grade exit', async () => {
+  // Live regression (2026-10-13): all 470 subscription nodes failed to convert,
+  // every smoke failed, and the fallback stamped each node
+  // `latencyMs: 0 / quality: 'S'` — which pick() then ranked ahead of every
+  // measured exit. `0` means never-measured and must grade WORST.
+  const transport = fakeTransport({ '*': new Error('connect ECONNREFUSED') })
+  const result = await admitTrusted(
+    { ...deps(transport), logger: { warn: () => {} } },
+    { address: 'sub-dead:1', protocol: 'http', source: 'subscription' },
+  )
+  assert.ok(result.admitted)
+  assert.equal(result.node?.latencyMs, 0)
+  assert.notEqual(result.node?.quality, 'S')
+  assert.equal(result.node?.quality, 'C')
+  assert.equal(result.degraded, true)
+})
+
+test('admission: facts measured in steps 1-2 survive a later step failing', async () => {
+  // Steps 1+2 answered with a REAL exit IP, then step 3 refused. The measured
+  // facts must ride the failure result instead of being dropped, so the trusted
+  // fallback stores a real exit IP rather than a placeholder.
+  const transport = fakeTransport({
+    [ECHO_URL]: { status: 200, body: echoBody('203.0.113.9', 'JP', 'Tokyo') },
+    [MODELS_URL]: { status: 403, body: '' },
+  })
+  const failed = await admitCandidate(deps(transport), { address: 'sub:1', protocol: 'http', source: 'subscription' })
+  assert.equal(failed.admitted, false)
+  assert.equal(failed.reason, 'zen models HTTP 403')
+  assert.equal(failed.facts?.exitIP, '203.0.113.9', 'steps 1+2 facts must survive the step-3 refusal')
+  assert.equal(failed.failure, 'refused', 'the class must survive alongside the facts')
+
+  const trusted = await admitTrusted(
+    { ...deps(transport), logger: { warn: () => {} } },
+    { address: 'sub:1', protocol: 'http', source: 'subscription' },
+  )
+  assert.ok(trusted.admitted)
+  assert.equal(trusted.node?.exitIP, '203.0.113.9', 'the fallback must keep the measured exit IP')
+  assert.equal(trusted.node?.exitLocation, 'JP Tokyo')
+})
+
+test('admission: the trusted fallback prefers previously stored facts over placeholders', async () => {
+  const transport = fakeTransport({ '*': new Error('connect ECONNREFUSED') })
+  const result = await admitTrusted(
+    { ...deps(transport), logger: { warn: () => {} } },
+    { address: 'sub:2', protocol: 'http', source: 'subscription' },
+    { previous: { exitIP: '198.51.100.7', exitLocation: 'DE Frankfurt', latencyMs: 275, quality: 'S' } },
+  )
+  assert.equal(result.node?.exitIP, '198.51.100.7')
+  assert.equal(result.node?.latencyMs, 275)
+  assert.equal(result.node?.quality, 'S')
+})
+
+test('admission: an echo-side transport failure continues to the tunnel instead of striking dead', async () => {
+  // Live symptom (2026-10-14): subscription exits all died with
+  // `Connect Timeout Error (attempted address: ip-api.com:80, timeout: 5000ms)`
+  // and `SOCKS5 connection failed` — the echo endpoint was unreachable THROUGH
+  // them, but that says nothing about whether they reach the real target
+  // (opencode.ai). A healthy exit must not be struck dead because ip-api.com
+  // is blocked/slow for it. The tunnel step decides.
+  //
+  // 1) Echo transport fails but the tunnel + smoke clear: the exit is ADMITTED
+  //    with unknown facts (no geo/exitIP/latency), NOT dead.
+  const transport = fakeTransport({
+    [ECHO_URL]: new Error('Connect Timeout Error (attempted address: ip-api.com:80, timeout: 5000ms)'),
+    [MODELS_URL]: { status: 200, body: '{"data":[]}' },
+    [CHAT_URL]: { status: 200, body: '{"id":"x"}' },
+  })
+  const result = await admitCandidate(deps(transport), { address: 'sub:1', protocol: 'http', source: 'subscription' })
+  assert.equal(result.admitted, true, 'tunnel+smoke cleared: the exit is usable even without echo facts')
+  assert.equal(result.node?.exitIP, '', 'no echo facts to record')
+  assert.equal(result.node?.quality, 'C', 'unmeasured latency is the worst grade, never the best')
+  assert.equal(result.failure, undefined, 'an admitted exit carries no failure class')
+
+  // 2) Echo AND tunnel both fail at the transport level: the link is dead.
+  const deadTransport = fakeTransport({ '*': new Error('SOCKS5 connection timeout') })
+  const dead = await admitCandidate(deps(deadTransport), { address: 'sub:1', protocol: 'http', source: 'subscription' })
+  assert.equal(dead.admitted, false)
+  assert.equal(dead.failure, 'transport', 'echo AND tunnel unreachable = genuinely dead')
 })
 
 test('admission: scheme-carrying manual addresses build a valid agent URI (issue #44)', async () => {

@@ -160,6 +160,29 @@ test('plain address list falls through', () => {
   assert.equal(report.nodes[1]?.type, 'socks5')
 })
 
+// Regression, measured live 2026-10-15: `https://` passed the scheme gate and
+// was then silently dropped — `protocol` kept its `'http'` initial value — so
+// every https proxy in a subscription was dialed as plaintext. The rule table
+// then struck 46 of 118 exits dead on `transport · other side closed`, all of
+// them serving normally.
+test('plain address list: the https scheme survives parsing', () => {
+  const report = parseSubscription('https://203.0.113.7:443\nhttp://1.2.3.4:8080\nsocks5://5.6.7.8:1080')
+  assert.equal(report.nodes.length, 3)
+  assert.equal(report.nodes[0]?.type, 'https', 'https:// must not be downgraded to http')
+  assert.equal(report.nodes[0]?.server, '203.0.113.7')
+  assert.equal(report.nodes[0]?.port, 443)
+  assert.equal(report.nodes[1]?.type, 'http', 'plain http:// must stay http')
+  assert.equal(report.nodes[2]?.type, 'socks5')
+})
+
+test('Clash YAML keeps an https proxy type instead of dropping the node', () => {
+  const report = parseSubscription('proxies:\n  - name: secure\n    type: https\n    server: 1.2.3.4\n    port: 443\n  - name: plain\n    type: http\n    server: 5.6.7.8\n    port: 8080')
+  assert.equal(report.detected, 'clash-yaml')
+  assert.equal(report.nodes.length, 2)
+  assert.equal(report.nodes[0]?.type, 'https')
+  assert.equal(report.nodes[1]?.type, 'http')
+})
+
 test('Clash subscription fixture: 38 anytls nodes parse clean and groups are ignored', () => {
   const fixture = ANYTLS_SUBSCRIPTION
   const report = parseSubscription(fixture)

@@ -109,6 +109,10 @@ export interface PoolStatusView {
     cooldownUntil: number
     consecutiveLimited: number
     bannedModels: Array<{ model: string; state: 'suspect' | 'banned'; bannedAt: number }>
+    /** null = never probed; otherwise why the last probe did not pass. */
+    lastProbeFailure: string | null
+    lastProbeReason: string
+    lastProbedAt: number
     passive: { ok: number; limited: number; refused: number; dead: number; transport: number }
   }>
   prober: { queued: number; inFlight: number; enqueued: number; completed: number }
@@ -484,7 +488,24 @@ function ExitTable(props: { status: PoolStatusView | null; t: IpPoolCardProps['t
     if (exit.state === 'dead') return <span className={styles.stateDead}>{t('stateDead')}</span>
     if (exit.cooling) return <span className={styles.stateCooling}>{t('stateCooling')}</span>
     if (exit.state === 'ok') return <span className={styles.stateOk}>{t('stateOk')}</span>
+    // A probed exit that did not pass is NOT the same as one never probed.
+    // Both sit at state 'unknown', so the failure class is what tells them
+    // apart on screen (live-observed 2026-10-14: 703 verified-dead exits
+    // rendered identically to never-probed ones).
+    if (exit.lastProbeFailure !== null) {
+      return <span className={styles.stateProbeFailed} title={t('probeFailureHint')}>{t('stateProbeFailed')}</span>
+    }
     return <span className={styles.stateUnknown}>{t('stateUnknown')}</span>
+  }
+  /** The classified reason, shown so "probe failed" is actionable. */
+  const failureCell = (exit: PoolStatusView['exits'][number]): ReactNode => {
+    if (exit.lastProbeFailure === null) return <>—</>
+    return (
+      <span className={styles.mono} title={t('probeFailureHint')}>
+        {exit.lastProbeFailure}
+        {exit.lastProbeReason !== '' ? ` · ${exit.lastProbeReason}` : ''}
+      </span>
+    )
   }
   const allBans = status.exits.flatMap((exit) =>
     exit.bannedModels.map((ban) => ({ exitId: exit.id, ...ban })),
@@ -502,6 +523,7 @@ function ExitTable(props: { status: PoolStatusView | null; t: IpPoolCardProps['t
               <th>{t('exitQuality')}</th>
               <th>{t('exitIp')}</th>
               <th>{t('exitState')}</th>
+              <th>{t('exitProbeFailure')}</th>
               <th>{t('exitPassive')}</th>
               <th />
             </tr>
@@ -516,6 +538,7 @@ function ExitTable(props: { status: PoolStatusView | null; t: IpPoolCardProps['t
                 <td>{exit.latencyMs > 0 ? exit.quality : '—'}</td>
                 <td className={styles.mono}>{exit.exitIP || '—'}</td>
                 <td>{stateCell(exit)}</td>
+                <td>{failureCell(exit)}</td>
                 <td className={styles.mono}>
                   {exit.passive.ok > 0 || exit.passive.limited > 0 || exit.passive.refused > 0 || exit.passive.dead > 0 || exit.passive.transport > 0
                     ? `✓${exit.passive.ok} 429:${exit.passive.limited} 401/403:${exit.passive.refused} ✗:${exit.passive.dead + exit.passive.transport}`
@@ -530,7 +553,7 @@ function ExitTable(props: { status: PoolStatusView | null; t: IpPoolCardProps['t
               </tr>
             ))}
             {status.exits.length === 0 && (
-              <tr><td colSpan={9} className={styles.status}>{t('statusUnavailable')}</td></tr>
+              <tr><td colSpan={10} className={styles.status}>{t('statusUnavailable')}</td></tr>
             )}
           </tbody>
         </table>

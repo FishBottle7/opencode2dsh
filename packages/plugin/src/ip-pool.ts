@@ -17,14 +17,15 @@ import type { Opencode2dshConfig } from './config.ts'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
-import { ExitPool, gradeOf, type ExitNode } from './pool/pool.ts'
+import { ExitPool, gradeOf, type ExitNode, type ExitProtocol } from './pool/pool.ts'
 import type { UndiciSeam } from './pool/dispatcher.ts'
 import type { AdmissionDeps } from './pool/admission.ts'
 import { Prober } from './pool/prober.ts'
+import { PeriodicProber } from './pool/periodic-prober.ts'
 import { RefillScheduler } from './pool/refill.ts'
 import { SubscriptionFetcher } from './pool/subscription-fetcher.ts'
 import { SingBoxSupervisor } from './pool/singbox.ts'
-import { createRotateDelegate, setRotateDelegate } from './pool/rotate.ts'
+import { createRotateDelegate, createStreamFailureReporter, setRotateDelegate, setStreamFailureReporter } from './pool/rotate.ts'
 
 /** Data dir shared with the catalog cache (config.ts convention). */
 function dataDir(): string {
@@ -34,7 +35,7 @@ function dataDir(): string {
 /** Parse one manual proxy string into an exit id + protocol, or null. */
 export function parseManualProxy(
   entry: string,
-): { id: string; protocol: 'http' | 'socks5' } | null {
+): { id: string; protocol: ExitProtocol } | null {
   const trimmed = entry.trim()
   if (trimmed === '') return null
   const schemeMatch = /^([a-z0-9+.-]+):\/\//i.exec(trimmed)
@@ -42,7 +43,15 @@ export function parseManualProxy(
   const rest = schemeMatch ? trimmed.slice(schemeMatch[0].length) : trimmed
   if (!/^\[[^\]]+\]|[^:]+:\d{1,5}$/.test(rest)) return null
   if (scheme !== undefined && scheme !== 'http' && scheme !== 'socks5' && scheme !== 'https' && scheme !== 'socks4' && scheme !== 'socks5h') return null
-  const protocol = scheme === 'socks5' || scheme === 'socks4' || scheme === 'socks5h' ? 'socks5' : 'http'
+  // `https` must survive as itself: an https:// manual proxy dialed as
+  // plaintext gets its connection dropped before any status line, which the
+  // rule table reads as a dead link (measured 2026-10-15 — see
+  // dispatcher.exitProxyUri).
+  const protocol: ExitProtocol = scheme === 'socks5' || scheme === 'socks4' || scheme === 'socks5h'
+    ? 'socks5'
+    : scheme === 'https'
+      ? 'https'
+      : 'http'
   return { id: trimmed, protocol }
 }
 
@@ -109,6 +118,8 @@ export interface IpPoolRuntime {
   subscriptions: SubscriptionFetcher | null
   /** Free-source refill loop (null when free.enabled false). */
   refill: RefillScheduler | null
+  /** Periodic health probe loop (docs §4.3; always present while enabled). */
+  periodic: PeriodicProber
   /** Hot-apply one committed settings value onto the live runtime (docs §5.1).
    *  Every knob lands without restart; enabled toggles the dispatcher. */
   reconfigure(next: Opencode2dshConfig): Promise<void>
@@ -197,10 +208,31 @@ export async function startIpPool(
         { ...admissionDeps, prober, supervisor: ensureSupervisor() },
         { logger },
       )
+      // Engage routing the moment a subscription round lands exits. The
+      // free-source hook (refill.onAdmitted below) never fires for a
+      // subscription-only pool, so without this the dispatcher stays
+      // uninstalled and real traffic never routes through the pool — the
+      // exits sit in the table collecting probes but no 真实流量 (live
+      // state 2026-10-16: pool total 38, all subscription, installer off).
+      subscriptions.onAdmitted(() => {
+        if (!installer.enabled && config.ipPool?.enabled !== false && pool.snapshot().total > 0) {
+          installer.install()
+          if (installer.enabled) {
+            logger.info('opencode2dsh: first subscription exits admitted — exit routing engaged')
+          }
+        }
+      })
     }
     subscriptions.setUrls(urls)
     return subscriptions
   }
+
+  /**
+   * Periodic health probe loop, assigned once the piece it drives (probeExit)
+   * exists below. Declared here because applyConfig — defined next and invoked
+   * at start AND on every settings commit — needs to start/stop it.
+   */
+  let periodicRef: PeriodicProber | null = null
 
   /** Apply the config to the live objects (initial start + reconfigure). */
   const applyConfig = (): void => {
@@ -209,6 +241,7 @@ export async function startIpPool(
     admissionDeps.blockedCountries = current.free?.blockedCountries
     admissionDeps.smokeModel = probeModels[0]
     prober.setMaxConcurrent(current.maxConcurrentProbes ?? 3)
+    periodicRef?.setIntervalMs(current.probeIntervalMs ?? 10 * 60_000)
     installer.setProxyHosts?.(current.proxyHosts)
 
     // Free loop on/off + restart on target change (interval fixed 10min).
@@ -228,6 +261,9 @@ export async function startIpPool(
             logger.info('opencode2dsh: first free exits admitted — exit routing engaged')
           }
         }
+        // The periodic prober was created before any exit existed; start its
+        // timer once the table is non-empty (start() is idempotent).
+        if (periodicRef !== null && current.enabled !== false) periodicRef.start()
       })
       refill.start()
     } else if (!wantRefill && refill !== null) {
@@ -242,6 +278,9 @@ export async function startIpPool(
       subscriptions?.stop()
       subscriptions = null
       fetcherActive = false
+      // A disabled pool must not keep probing (each probe spends anonymous-lane
+      // quota, §4.1).
+      if (current.enabled === false) periodicRef?.stop()
       return
     }
     const fetcher = ensureSubscriptions(urls)
@@ -268,6 +307,7 @@ export async function startIpPool(
   const probeAll = async (): Promise<number> => {
     const models = probeModels.length > 0 ? probeModels : ['big-pickle']
     const { admitCandidate, admitTrusted } = await import('./pool/admission.ts')
+    const { applyProbeVerdict } = await import('./pool/probe-verdict.ts')
     const tasks = pool.list().map((entry): import('./pool/prober.ts').ProbeTask => ({
       exitId: entry.id,
       kind: 'probe-all',
@@ -294,12 +334,20 @@ export async function startIpPool(
           if (verdict.admitted && verdict.node) {
             // Refresh the node's facts (admission re-measured them).
             pool.add({ ...entry, ...verdict.node, pinned: entry.pinned })
-            if (verdict.limited) pool.markLimited(entry.id)
-            else pool.markOk(entry.id, model)
-          } else {
-            pool.markDeadStrike(entry.id)
-            break
           }
+          // ONE verdict path for every source (probe-verdict.ts). It derives the
+          // health write from the failure CLASS, so a refused probe no longer
+          // strikes a working exit dead (the old blanket `else markDeadStrike`)
+          // and a genuinely dead link no longer lingers as 'unknown'.
+          const applied = applyProbeVerdict(pool, entry.id, verdict, {
+            source: entry.source,
+            model,
+            pinned: entry.pinned,
+          })
+          if (!verdict.admitted) break
+          // An admitted-but-unverified verdict is no reason to burn the NEXT
+          // model's quota on the same broken link.
+          if (verdict.degraded && applied !== 'limited') break
         }
       },
     }))
@@ -314,6 +362,7 @@ export async function startIpPool(
     run: async () => {
       const models = probeModels.length > 0 ? [...probeModels] : ['big-pickle']
       const { admitCandidate, admitTrusted } = await import('./pool/admission.ts')
+      const { applyProbeVerdict } = await import('./pool/probe-verdict.ts')
       for (const model of models) {
         admissionDeps.smokeModel = model
         const verdict = entry.source === 'free'
@@ -325,12 +374,15 @@ export async function startIpPool(
           }, { pinned: entry.pinned, previous: { exitIP: entry.exitIP, exitLocation: entry.exitLocation, latencyMs: entry.latencyMs, quality: entry.quality } })
         if (verdict.admitted && verdict.node) {
           pool.add({ ...entry, ...verdict.node, pinned: entry.pinned })
-          if (verdict.limited) pool.markLimited(entry.id)
-          else pool.markOk(entry.id, model)
-        } else {
-          pool.markDeadStrike(entry.id)
-          break
         }
+        // Same shared verdict as probeAll / the subscription fetcher.
+        const applied = applyProbeVerdict(pool, entry.id, verdict, {
+          source: entry.source,
+          model,
+          pinned: entry.pinned,
+        })
+        if (!verdict.admitted) break
+        if (verdict.degraded && applied !== 'limited') break
       }
     },
   })
@@ -342,15 +394,35 @@ export async function startIpPool(
     return 1
   }
 
+  // Periodic health probe (docs §4.3): the loop that re-measures cooled-down,
+  // never-probed and dead exits. Without it a subscription node whose smoke
+  // failed at admission kept `latencyMs: 0` forever — the refresh path filters
+  // `!pool.has(address)` and never revisits a node already in the table.
+  const periodic = new PeriodicProber(pool, (exitId) => probeExit(exitId))
+  periodicRef = periodic
+  if (pool.snapshot().total > 0) periodic.start()
+
   // Adapter-layer rotate delegate (docs §3.4/§8.1, IP-7): lets zen-adapter
   // restart a pre-content stream on a fresh exit instead of surfacing the
   // intermediate error to the host's retry budget.
   setRotateDelegate(createRotateDelegate(pool, { maxAttempts: config.ipPool?.maxRotateAttempts ?? 3 }))
 
+  // Mid-stream failure reporting (docs §3.4/§4.2). The dispatcher's sentinel is
+  // disarmed once response headers land, so a body that goes silent from there
+  // on is invisible to it: without this the exit that just tore the stream down
+  // kept its `ok` mark and its (low) latency, so it stayed at the front of the
+  // pick order and the next request could be torn down by the same exit. The
+  // closure only reads the pool, which never changes identity, so one install
+  // covers every reconfigure.
+  setStreamFailureReporter(createStreamFailureReporter(pool, (exitId) => {
+    logger.warn(`opencode2dsh: exit ${exitId} went silent mid-stream; recorded and excluded from this turn's rotation`)
+  }))
+
   return {
     pool,
     installer,
     prober,
+    periodic,
     get subscriptions() { return subscriptions },
     get refill() { return refill },
     async reconfigure(next: Opencode2dshConfig) {
@@ -375,6 +447,9 @@ export async function startIpPool(
       } else if (!enable && installer.enabled) {
         installer.disable()
       }
+      // The periodic loop follows `enabled` and only runs with exits present.
+      if (enable && pool.snapshot().total > 0) periodicRef?.start()
+      else if (!enable) periodicRef?.stop()
       if (wasEnabled !== enable) {
         logger.info(`opencode2dsh: ip pool ${enable ? 'enabled' : 'disabled'} via settings (live)`)
       }
@@ -389,8 +464,10 @@ export async function startIpPool(
     },
     async dispose() {
       setRotateDelegate(null)
+      setStreamFailureReporter(null)
       subscriptions?.stop()
       refill?.stop()
+      periodicRef?.stop()
       installer.dispose()
     },
   }

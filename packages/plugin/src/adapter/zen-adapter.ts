@@ -9,7 +9,7 @@ import { ensureFreeLaneShape, ensureResponsesFreeLaneShape, GATE_TOOL_ALIASES, t
 import { apiForModel, isResponsesModel } from './routing.ts'
 export { apiForModel, isResponsesModel } from './routing.ts'
 import { routingContext, type RoutingContext } from '../pool/dispatcher.ts'
-import { classifyStreamFailure, isRegionBlocked, shouldRotate } from '../pool/rotate.ts'
+import { classifyStreamFailure, isRegionBlocked, reportStreamFailure, shouldRotate } from '../pool/rotate.ts'
 
 /**
  * The TS adapter: registers as a DSH LlmAdapter for the `opencode2dsh` route
@@ -578,7 +578,15 @@ export class ZenAdapter {
           } catch (err) {
             // watchdog or foreign teardown tore the stream down mid-content:
             // the consumer already saw partial content, so surface the
-            // terminal error honestly and stop — never a hang, never a replay
+            // terminal error honestly and stop — never a hang, never a replay.
+            // The dispatcher's sentinel is already disarmed this late (headers
+            // landed long ago), so nothing else would ever tell the pool the
+            // exit died: without this report it kept its `ok` mark and its low
+            // latency, i.e. the front of the next pick, and the same exit could
+            // tear down the next stream too. Reuse the pool's transport
+            // verdict; no rotation — content already went out (§3.4 never
+            // replays a partial stream).
+            reportStreamFailure(ids.session, options.model)
             yield terminalErrorEvent(err instanceof Error ? err.message : String(err), model)
             return
           }

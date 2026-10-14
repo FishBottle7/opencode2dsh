@@ -60,6 +60,25 @@ const getInt = (raw: Record<string, unknown>, key: string): number => {
 }
 const getBool = (raw: Record<string, unknown>, key: string): boolean => raw[key] === true
 
+/**
+ * uTLS fingerprints sing-box accepts (verified against 1.14.2 by driving
+ * `sing-box check` once per value). Anything outside this set is a
+ * v2rayN/Clash spelling, and forwarding it aborted the WHOLE generated config:
+ *
+ *   FATAL[0000] initialize outbound[140]: unknown uTLS fingerprint: unsafe
+ *
+ * `unsafe` is the notable offender: in the v2ray vocabulary it means "do NOT
+ * use uTLS", not a fingerprint name. Because every node shares one config and
+ * one `sing-box check` preflight, two such nodes (measured live: 2 of 470)
+ * kept EVERY encrypted node out of the pool — the settings card read
+ * "470 待转换 · 0 已转换入池". Unknown values are dropped instead of
+ * forwarded: with no `utls` block sing-box uses its own TLS stack, which is
+ * what `unsafe` asked for in the source dialect.
+ */
+const KNOWN_UTLS_FINGERPRINTS = new Set([
+  'chrome', 'firefox', 'edge', 'safari', '360', 'qq', 'ios', 'android', 'random', 'randomized',
+])
+
 function applyTLS(raw: Record<string, unknown>, out: Record<string, unknown>): void {
   const hasTLS =
     getBool(raw, 'tls') ||
@@ -78,8 +97,10 @@ function applyTLS(raw: Record<string, unknown>, out: Record<string, unknown>): v
     const list = alpn.filter((entry): entry is string => typeof entry === 'string')
     if (list.length > 0) tls.alpn = list
   }
-  const fingerprint = getStr(raw, 'client-fingerprint')
-  if (fingerprint !== '') tls.utls = { enabled: true, fingerprint }
+  const fingerprint = getStr(raw, 'client-fingerprint').toLowerCase()
+  if (fingerprint !== '' && KNOWN_UTLS_FINGERPRINTS.has(fingerprint)) {
+    tls.utls = { enabled: true, fingerprint }
+  }
   const reality = raw['reality-opts']
   if (reality && typeof reality === 'object') {
     const opts = reality as Record<string, unknown>
@@ -267,6 +288,15 @@ export function generateConfig(nodes: ParsedNode[], basePort = 30_000): Generate
 
 const STOP_GRACE_MS = 5_000
 
+/** One readable line from a `sing-box check` run (its FATAL line is last). */
+function summarizeCheck(output: string): string {
+  const lines = output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+  return lines[lines.length - 1] ?? ''
+}
+
 function canConnect(port: number, timeoutMs = 1_000): Promise<boolean> {
   return new Promise((resolve) => {
     const socket = createConnection({ host: '127.0.0.1', port })
@@ -327,6 +357,69 @@ export class SingBoxSupervisor {
     return bin
   }
 
+  /**
+   * Atomic write + `sing-box check` preflight. Returns the checker's output so
+   * the caller can tell the user WHY a generated config was rejected (the old
+   * path discarded it and surfaced a bare "config check failed").
+   */
+  async #writeAndCheck(
+    binary: string,
+    config: Record<string, unknown>,
+    configPath: string,
+  ): Promise<{ ok: boolean; output: string }> {
+    const tmp = `${configPath}.tmp`
+    await writeFile(tmp, JSON.stringify(config, null, 2), 'utf8')
+    await rm(configPath, { force: true })
+    await rename(tmp, configPath)
+    return await new Promise<{ ok: boolean; output: string }>((resolve) => {
+      const child = spawn(binary, ['check', '-c', configPath, '-D', this.#dataDir], { stdio: ['ignore', 'pipe', 'pipe'] })
+      let output = ''
+      const collect = (chunk: Buffer): void => {
+        // keep the tail: the fatal line is last, and a pathological config can
+        // emit thousands of lines
+        output = (output + chunk.toString('utf8')).slice(-2_000)
+      }
+      child.stdout?.on('data', collect)
+      child.stderr?.on('data', collect)
+      child.once('error', (err) => resolve({ ok: false, output: err.message }))
+      child.once('exit', (code) => resolve({ ok: code === 0, output }))
+    })
+  }
+
+  /**
+   * Find the node indices that make `sing-box check` fail, by bisecting the
+   * node list. Returns an empty set when the failure is not node-attributable
+   * (a binary/env problem), so the caller keeps the original error instead of
+   * blaming nodes. Cost is O(k log n) checks for k bad nodes — with the
+   * measured shape (a couple of bad nodes among hundreds) that is a handful of
+   * preflights, all local and quota-free.
+   */
+  async #isolateBadNodes(binary: string, nodes: ParsedNode[]): Promise<Set<number>> {
+    const probePath = `${this.#configPath}.probe`
+    const fails = async (indices: number[]): Promise<boolean> => {
+      if (indices.length === 0) return false
+      const subset = indices.map((index) => nodes[index]!)
+      const { config } = generateConfig(subset, this.#options.basePort ?? 30_000)
+      const result = await this.#writeAndCheck(binary, config, probePath)
+      return !result.ok
+    }
+    const bad = new Set<number>()
+    const walk = async (indices: number[]): Promise<void> => {
+      // A single node that fails alone is provably the offender.
+      if (indices.length === 1) {
+        if (await fails(indices)) bad.add(indices[0]!)
+        return
+      }
+      if (!(await fails(indices))) return
+      const mid = Math.floor(indices.length / 2)
+      await walk(indices.slice(0, mid))
+      await walk(indices.slice(mid))
+    }
+    await walk(nodes.map((_node, index) => index))
+    await rm(probePath, { force: true })
+    return bad
+  }
+
   /** Full reload: regenerate the config for the node list and (re)start. */
   async reload(nodes: ParsedNode[]): Promise<ConvertedExit[]> {
     // no tunnel nodes -> stop and clean (GoProxy Reload empty case)
@@ -337,24 +430,30 @@ export class SingBoxSupervisor {
       return []
     }
     const binary = await this.#resolveBinary()
-    const { config, portMap } = generateConfig(nodes, this.#options.basePort ?? 30_000)
-
-    // atomic config write (tmp + rename)
     await mkdir(this.#dataDir, { recursive: true })
-    const tmp = `${this.#configPath}.tmp`
-    await writeFile(tmp, JSON.stringify(config, null, 2), 'utf8')
-    await rm(this.#configPath, { force: true })
-    await rename(tmp, this.#configPath)
+    let usable = nodes
+    let generated = generateConfig(usable, this.#options.basePort ?? 30_000)
+    let checked = await this.#writeAndCheck(binary, generated.config, this.#configPath)
 
-    // preflight: `sing-box check`
-    const checkOk = await new Promise<boolean>((resolve) => {
-      const child = spawn(binary, ['check', '-c', this.#configPath, '-D', this.#dataDir], { stdio: 'ignore' })
-      child.once('error', () => resolve(false))
-      child.once('exit', (code) => resolve(code === 0))
-    })
-    if (!checkOk) {
-      throw new Error('sing-box config check failed (run `sing-box check` on the generated config for details)')
+    // Preflight is per-CONFIG, not per-node: one malformed node aborts every
+    // other node in the batch. Measured live (2026-10-13): a single
+    // `client-fingerprint: unsafe` in 470 nodes yielded 0 converted exits, so
+    // isolate and drop the offenders instead of surrendering the whole batch.
+    if (!checked.ok) {
+      const bad = await this.#isolateBadNodes(binary, usable)
+      if (bad.size > 0) {
+        usable = usable.filter((_node, index) => !bad.has(index))
+        this.#options.logger?.warn(
+          `opencode2dsh: sing-box rejected ${bad.size} node(s); converting the remaining ${usable.length} of ${nodes.length} (${summarizeCheck(checked.output)})`,
+        )
+        generated = generateConfig(usable, this.#options.basePort ?? 30_000)
+        checked = await this.#writeAndCheck(binary, generated.config, this.#configPath)
+      }
     }
+    if (!checked.ok) {
+      throw new Error(`sing-box config check failed: ${summarizeCheck(checked.output) || 'run `sing-box check` on the generated config for details'}`)
+    }
+    const { config, portMap } = generated
 
     await this.stop()
     this.#child = spawn(binary, ['run', '-c', this.#configPath, '-D', this.#dataDir], {
@@ -362,7 +461,7 @@ export class SingBoxSupervisor {
     })
     const child = this.#child
     this.#running = true
-    this.#nodes = nodes
+    this.#nodes = usable
     this.#portMap = portMap
     child.stderr?.on('data', (chunk: Buffer) => {
       const text = chunk.toString('utf8').trim()
@@ -393,7 +492,7 @@ export class SingBoxSupervisor {
     if (!ready) this.#options.logger?.warn('opencode2dsh: sing-box ports not ready in time; some converted nodes may be unreachable')
 
     const exits: ConvertedExit[] = []
-    for (const node of nodes) {
+    for (const node of usable) {
       const port = portMap.get(nodeKeyOf(node))
       if (port === undefined) continue
       exits.push({ address: `127.0.0.1:${port}`, protocol: 'socks5', node })

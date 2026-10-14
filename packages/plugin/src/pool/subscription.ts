@@ -14,6 +14,8 @@
 
 import { parse as parseYaml } from 'yaml'
 
+import type { ExitProtocol } from './pool.ts'
+
 export interface ParsedNode {
   name: string
   /** Normalized type: vmess/vless/trojan/shadowsocks/hysteria2/tuic/anytls/http/socks5 */
@@ -33,7 +35,10 @@ export interface ParseReport {
 
 const SUPPORTED_TYPES = new Set([
   'vmess', 'vless', 'trojan', 'shadowsocks', 'shadowsocksr',
-  'hysteria', 'hysteria2', 'tuic', 'anytls', 'http', 'socks5',
+  // `https` = HTTP proxy over a TLS-wrapped hop. Clash emits it for https://
+  // proxies; dropping it here sent those nodes down the plaintext path (see
+  // parsePlainAddresses for the measured cost).
+  'hysteria', 'hysteria2', 'tuic', 'anytls', 'http', 'https', 'socks5',
 ])
 
 /**
@@ -274,20 +279,31 @@ export function parseProxyLinks(content: string): { nodes: ParsedNode[]; skipped
   return { nodes, skipped }
 }
 
-/** GoProxy parsePlain: bare host:port lines (direct http/socks5 nodes). */
+/**
+ * GoProxy parsePlain: bare host:port lines (direct http/https/socks5 nodes).
+ *
+ * The scheme must SURVIVE parsing, not just pass a whitelist check. `https`
+ * used to be accepted here and then dropped on the floor — `protocol` kept its
+ * `'http'` initial value — so every `https://` exit was dialed as a plaintext
+ * HTTP proxy. That produced the largest single block of misclassified probe
+ * failures measured on 2026-10-15: 46 of 118 exits dead with
+ * `transport · other side closed`, every one of them a working https proxy
+ * that completed a TLS handshake and answered CONNECT 200 when wrapped.
+ */
 export function parsePlainAddresses(content: string): ParsedNode[] {
   const nodes: ParsedNode[] = []
   for (const rawLine of content.split(/\r?\n/)) {
     const line = rawLine.trim()
     if (line === '' || line.startsWith('#')) continue
-    let protocol: 'http' | 'socks5' = 'http'
+    let protocol: ExitProtocol = 'http'
     let address = line
     const scheme = /^([a-z0-9+.-]+):\/\//i.exec(line)
     if (scheme) {
       const name = scheme[1]!.toLowerCase()
       address = line.slice(scheme[0].length)
       if (name === 'socks5' || name === 'socks4' || name === 'socks5h') protocol = 'socks5'
-      else if (name !== 'http' && name !== 'https') continue
+      else if (name === 'https') protocol = 'https'
+      else if (name !== 'http') continue
     }
     const match = /^(\[[^\]]+\]|[^:]+):(\d{1,5})$/.exec(address)
     if (!match) continue

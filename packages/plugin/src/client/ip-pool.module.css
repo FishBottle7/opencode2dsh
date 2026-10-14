@@ -264,6 +264,13 @@
   color: var(--dsw-alias-label-tertiary, #6b7280);
 }
 
+/* Probed-but-failed: the exit answered, it just did not pass this probe.
+   Deliberately distinct from .stateDead (link gone) and .stateUnknown
+   (never probed). */
+.stateProbeFailed {
+  color: var(--dsw-alias-state-warning-primary, #9a6700);
+}
+
 /* -- sections + radios ----------------------------------------------------------- */
 
 .section {

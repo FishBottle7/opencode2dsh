@@ -18,12 +18,18 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 
 import { Agent, ProxyAgent, type Dispatcher } from 'undici'
 
-import type { ExitPool } from './pool.ts'
+import type { ExitPool, ExitProtocol } from './pool.ts'
 
 /** Structural seam over npm undici so tests can inject fakes. */
 export interface UndiciSeam {
   Agent: typeof Agent
-  ProxyAgent: typeof ProxyAgent
+  /**
+   * Structural over `typeof ProxyAgent`: the real constructor takes
+   * `proxyTls`, and https:// exits need it (see httpsProxyOptions) — but the
+   * test fakes accept a single argument, so the wider real signature cannot
+   * be required here without breaking every existing seam double.
+   */
+  ProxyAgent: new (options: { uri: string; clientFactory?: (origin: URL | string, options?: unknown) => unknown; proxyTls?: { rejectUnauthorized?: boolean } }) => Dispatcher
   setGlobalDispatcher(dispatcher: Dispatcher): unknown
   getGlobalDispatcher(): Dispatcher
   /**
@@ -91,10 +97,47 @@ export function isLoopback(host: string): boolean {
   return normalized === 'localhost' || normalized === '127.0.0.1' || normalized === '::1'
 }
 
-/** Map an exit address to a ProxyAgent URI ('h:1' -> 'http://h:1'). */
-export function exitProxyUri(exitId: string, protocol: 'http' | 'socks5'): string {
-  const scheme = protocol === 'socks5' ? 'socks5' : 'http'
+/**
+ * Map an exit address to a ProxyAgent URI ('h:1' -> 'http://h:1').
+ *
+ * `https` MUST survive as its own scheme: undici only wraps CONNECT in TLS
+ * when the proxy URI scheme is `https:` (proxy-agent.js, `forwardConnect =
+ * this[kProxy].protocol === 'https:'`). Downgrading an `https://` proxy to a
+ * plaintext `http://` URI sends a bare CONNECT to a TLS listener, which drops
+ * the connection without ever sending a status line — undici surfaces exactly
+ * that as `SocketError: other side closed` (client-h1.js, onHttpSocketEnd),
+ * and the rule table then correctly but uselessly strikes a healthy exit dead.
+ * Measured live 2026-10-15: 46 of 118 exits failed that way, all on ports
+ * 443/9002/9443; every sampled one completed a TLS handshake and answered
+ * CONNECT 200 once the request was wrapped (certs *.windscribe.com,
+ * *.nodes.gen4.ninja).
+ */
+export function exitProxyUri(exitId: string, protocol: ExitProtocol): string {
+  const scheme = protocol === 'socks5' ? 'socks5' : protocol === 'https' ? 'https' : 'http'
   return PROXY_PROTOCOL_PREFIX.test(exitId) ? exitId : `${scheme}://${exitId}`
+}
+
+/**
+ * ProxyAgent options for an https:// exit, including the one setting that
+ * decides whether it connects at all.
+ *
+ * Measured 2026-10-15 against live subscription exits: a bare
+ * `new ProxyAgent({ uri: 'https://203.0.113.7:443' })` fails EVERY request
+ * with `Secure Proxy Connection failed`. The cause is certificate
+ * verification, not connectivity: these exits are addressed by IP literal, so
+ * there is no hostname a certificate could be issued for, and undici falls
+ * back to `rejectUnauthorized: true` — every handshake is then rejected.
+ * Passing `proxyTls: { rejectUnauthorized: false }` made all sampled exits
+ * serve `http://ip-api.com` with 200.
+ *
+ * Only the PROXY HOP is unverified. The tunneled request still runs through
+ * undici's normal TLS path to the real target, so end-to-end confidentiality
+ * to `opencode.ai` is unchanged; what is given up is authentication of the
+ * proxy's own identity, for which an IP literal offers nothing to check
+ * against anyway. This mirrors what sing-box does for the converted exits.
+ */
+export function httpsProxyOptions(): { proxyTls: { rejectUnauthorized: boolean } } {
+  return { proxyTls: { rejectUnauthorized: false } }
 }
 
 /**
@@ -167,6 +210,7 @@ export class PoolRoutingDispatcher implements RoutingDispatcherSurface {
       const seam = this.#undici
       const agent = new seam.ProxyAgent({
         uri: exitProxyUri(exit.id, exit.protocol),
+        ...(exit.protocol === 'https' ? httpsProxyOptions() : {}),
         clientFactory: (origin: URL | string, opts?: unknown) =>
           new seam.Agent({ ...(opts as object), pipelining: 0 }),
       })

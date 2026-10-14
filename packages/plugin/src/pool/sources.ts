@@ -11,9 +11,11 @@
  * in-memory Map.
  */
 
+import type { ExitProtocol } from './pool.ts'
+
 export interface FreeSource {
   url: string
-  protocol: 'http' | 'socks5'
+  protocol: ExitProtocol
   tier: 'fast' | 'slow'
 }
 
