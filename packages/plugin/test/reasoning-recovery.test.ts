@@ -96,7 +96,9 @@ test('reasoning-only length retries once with Off, streams immediately and aggre
   assert.deepEqual(calls[1]!.context, calls[0]!.context, 'retry uses the original conversation')
   assert.equal(calls[1]!.options.maxTokens, 64)
   assert.equal(calls[1]!.options.headers['x-opencode-session'], calls[0]!.options.headers['x-opencode-session'])
-  assert.notEqual(calls[1]!.options.headers['x-opencode-request'], calls[0]!.options.headers['x-opencode-request'])
+  // The retry re-derives the disguise set; it must not resurrect the header
+  // the free lane 403s (live-probed 2026-10-15).
+  assert.ok(!('x-opencode-request' in calls[1]!.options.headers))
   assert.deepEqual(chunks.filter((c) => c.type === 'block-start').map((c) => c.index), [0, 1])
   assert.deepEqual(chunks.filter((c) => c.type === 'block-end').map((c) => c.index), [0, 1])
   assert.equal(chunks.find((c) => c.type === 'text-delta')?.index, 1)

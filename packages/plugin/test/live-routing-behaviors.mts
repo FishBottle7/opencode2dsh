@@ -92,7 +92,9 @@ log(`   ${![...freshPicks].includes(REAL) ? 'PASS — no new session lands on th
 
 // 4) live wire check: the real request path still works (via whichever exit)
 try {
-  const res = await fetch('https://opencode.ai/zen/v1/models', { headers: { authorization: 'Bearer public' }, signal: AbortSignal.timeout(20_000) })
+  // the models roster still lives on both hosts (2026-10-15), but the shipped
+  // plugin talks to the inference surface — probe what it actually uses
+  const res = await fetch('https://opencode.ai/inference/v1/models', { headers: { authorization: 'Bearer public' }, signal: AbortSignal.timeout(20_000) })
   log(`4) live models fetch through the pool: status ${res.status}`)
 } catch (err) {
   log(`4) live fetch FAILED (expected if routed to the synthetic exit): ${err instanceof Error ? err.message : String(err)}`)

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Free-lane chats stop failing with `403 FreeTierError`. The anonymous chat surface moved to `https://opencode.ai/inference/v1/chat/completions` — `/zen/v1/chat/completions` now answers 403 to *every* request, while `/zen/v1/models` and `/inference/v1/models` both still answer 200 with a byte-identical roster, so the model list kept the plugin looking healthy while every conversation was refused. The move also brought an agent-shape gate: a request is admitted only when it (1) hits the inference path, (2) carries `Authorization: Bearer public`, (3) sends a `User-Agent` starting with `opencode`, (4) advertises `read` in `tools` with a **non-empty** `parameters.properties`, and (5) rides a canonical `ses_*` id on a session header. Ablation against opencode CLI v2.0.29 (2026-10-15, 200 with a real SSE stream re-verified three times) pinned each of those and, just as importantly, three shapes that are refused outright: an `x-opencode-request` header (any value), an `x-opencode-project` starting with `prj_`, and any of `bash`/`shell`/`edit`/`glob`/`grep`/`read`/`write` advertised with an empty parameter object — a stub tool is *worse* than no tool. The plugin therefore drops the `x-opencode-request` header, sends a non-`prj_` project id (`global`), and its gate tool is now the official `read` definition transcribed from the CLI's own request instead of `bash`+`read` stubs; `ensureFreeLaneShape` additionally replaces a hollow gate tool in an outgoing body rather than accepting it as satisfying the gate, and the endpoint constant feeds the catalog, the adapter and the config the plugin writes for the legacy Go agent alike. The 2026-09-18 recipe (empty-schema stubs) and the 2026-10-11 reading of it are both superseded.
+
 ## 0.3.12 (2026-10-14)
 
 ### Fixed

@@ -332,22 +332,38 @@ export async function toPiContext(options: HarnessGenerateOptions): Promise<PiCo
 }
 
 /**
- * The anonymous free-lane gate (~2026-10-09, issue #56; live-probed again
- * 2026-10-11): a chat request passes with HTTP 200 only when ALL hold:
- *   1. a canonical `ses_*` id in a session header (`x-opencode-session`,
- *      `x-session-affinity` and `X-Session-Id` all work — any ONE suffices;
- *      bad-shape ids 403);
- *   2. a streaming body (`stream: true` — non-stream 403s);
- *   3. an agent-shaped `tools` array: `bash`+`read` pass (200), `shell`+1
- *      known name pass (200), but `bash` alone, `shell` alone, and 5 known
- *      names WITHOUT bash/shell all 403. Schemas and descriptions go
- *      uninspected.
- * The `Bearer public` credential and the User-Agent spelling are NOT gates
- * (both pass on /zen/v1; only /inference/openai 401s the Bearer). The shipped
- * recipe stays the 2026-09-18 bash+read pair: minimal, host-named, and valid
- * on both the /zen and /inference lanes.
+ * The anonymous free-lane gate (live-probed 2026-10-15 against opencode
+ * v2.0.29): a chat request passes with HTTP 200 only when ALL hold:
+ *   1. it goes to `/inference/v1/chat/completions` — the console-proxy path
+ *      `/zen/v1/...` now 403s every body (adapter/catalog.ts);
+ *   2. `Authorization: Bearer public` is present;
+ *   3. the User-Agent starts with `opencode` (the adapter always sends the
+ *      official CLI spelling, adapter/ids.ts);
+ *   4. a canonical `ses_*` id rides a session header (`x-opencode-session`,
+ *      `x-session-affinity`, `X-Session-Id` or `x-opencode-session-id` — any
+ *      ONE suffices; bad-shape ids 403);
+ *   5. `tools` advertises `read` with a NON-EMPTY `parameters.properties`.
+ *
+ * The adapter also always streams (`stream: true`), which the previous
+ * surface required; a non-streaming body was not re-probed on the new one.
+ *
+ * Three shapes are refused outright, so they are as load-bearing as the five
+ * requirements above:
+ *   - an `x-opencode-request` header (any value);
+ *   - an `x-opencode-project` starting with `prj_` (adapter/ids.ts);
+ *   - `bash`, `shell`, `edit`, `glob`, `grep`, `read` or `write` advertised
+ *     with an EMPTY parameter object. A stub tool is worse than no tool: an
+ *     otherwise-valid body becomes a 403. Neither the description text nor
+ *     `required`/`additionalProperties` is inspected — the parameter object
+ *     merely has to be non-empty — but the shipped recipe is the official
+ *     definition (below) so a stricter check cannot catch it out.
+ *
+ * History: the 2026-09-18 recipe was `bash`+`read` stubs with empty schemas;
+ * the 2026-10-11 probes read `bash`+`read` as the pass condition. Both are
+ * superseded — `bash` is not in the official roster at all, and an empty
+ * schema on any of those seven names now fails.
  */
-export const FREE_LANE_GATE_TOOL_NAMES = ['bash', 'read'] as const
+export const FREE_LANE_GATE_TOOL_NAMES = ['read'] as const
 
 /**
  * Inbound tool-call names rewritten before the chunk stream leaves the
@@ -363,34 +379,96 @@ export interface FreeLaneGateTool {
   function: { name: string; description: string; parameters: Record<string, unknown> }
 }
 
-export function freeLaneGateTool(name: (typeof FREE_LANE_GATE_TOOL_NAMES)[number]): FreeLaneGateTool {
-  return {
+/**
+ * The gate tool, transcribed from the official CLI v2's own request to the
+ * inference surface (captured 2026-10-15 from `opencode` v2.0.29). The gate
+ * only reads the parameter object, and would accept any non-empty one, but
+ * shipping the real definition keeps the request indistinguishable from the
+ * real client's. `strict: false`, which the official tool carries too, is
+ * omitted: it is not inspected, and the Responses surface (below) takes a
+ * flattened tool shape this field was never probed against.
+ */
+export const FREE_LANE_GATE_TOOLS: Record<(typeof FREE_LANE_GATE_TOOL_NAMES)[number], FreeLaneGateTool> = {
+  read: {
     type: 'function',
     function: {
-      name,
-      description: 'Reserved for the host runtime; do not call it.',
-      parameters: { type: 'object', properties: {} },
+      name: 'read',
+      description:
+        'Read the contents of a file or directory. Supports text files, images, and PDFs. Images and PDFs are presented directly to the model. Each text line is prefixed by its 1-based line number as <line>: <content>. The prefix is for reference and is not part of the file content. Directory entries are returned one per line. Use offset and limit to read large files or directories in sections. Prefer one larger read over many small slices, and use grep to find specific content in large files.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'File or directory to read' },
+          offset: { type: 'integer', minimum: 0, description: 'The line or directory entry to start reading from (1-based)' },
+          limit: {
+            type: 'integer',
+            minimum: 0,
+            description: 'The maximum number of lines or directory entries to read (defaults to and capped at 2000)',
+          },
+        },
+        required: ['path'],
+        additionalProperties: false,
+      },
     },
-  }
+  },
 }
 
-/** Responses uses flat function tools and its Zen gateway accepts auto only. */
+export function freeLaneGateTool(name: (typeof FREE_LANE_GATE_TOOL_NAMES)[number]): FreeLaneGateTool {
+  return FREE_LANE_GATE_TOOLS[name]
+}
+
+/**
+ * A gate-named tool whose parameter object carries no properties. The lane
+ * reads the schema, not just the name (live-probed 2026-10-15): a `read`
+ * with empty `properties` passes the name check and still 403s, and one with
+ * no `parameters` at all 400s. Such copies are dropped so the official
+ * definition can take their place.
+ */
+function isHollowGateTool(
+  tool: unknown,
+  nameOf: (tool: Record<string, unknown>) => string | undefined,
+  parametersOf: (tool: Record<string, unknown>) => unknown,
+): boolean {
+  if (typeof tool !== 'object' || tool === null) return false
+  const record = tool as Record<string, unknown>
+  const name = nameOf(record)
+  if (typeof name !== 'string' || !(FREE_LANE_GATE_TOOL_NAMES as readonly string[]).includes(name)) return false
+  const parameters = parametersOf(record) as { properties?: unknown } | undefined
+  const properties = typeof parameters === 'object' && parameters !== null ? parameters.properties : undefined
+  return typeof properties !== 'object' || properties === null || Object.keys(properties).length === 0
+}
+
+const chatFunction = (tool: Record<string, unknown>) => {
+  const fn = tool.function as { name?: unknown; parameters?: unknown } | undefined
+  return typeof fn === 'object' && fn !== null ? fn : undefined
+}
+
+const chatToolName = (tool: Record<string, unknown>) => {
+  const name = chatFunction(tool)?.name
+  return typeof name === 'string' ? name : undefined
+}
+
+const chatToolParameters = (tool: Record<string, unknown>) => chatFunction(tool)?.parameters
+
+const flatToolName = (tool: Record<string, unknown>) =>
+  tool.type === 'function' && typeof tool.name === 'string' ? tool.name : undefined
+
+const flatToolParameters = (tool: Record<string, unknown>) => tool.parameters
+
+/** Responses uses flat function tools and its lane gateway accepts auto only. */
 export function ensureResponsesFreeLaneShape(payload: unknown): unknown | undefined {
   if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return undefined
   const body = payload as Record<string, unknown>
   if (!Array.isArray(body.input)) return undefined
   const tools = Array.isArray(body.tools) ? body.tools as unknown[] : []
-  const names = new Set(tools.map((tool) => {
-    if (typeof tool !== 'object' || tool === null) return undefined
-    const candidate = tool as { type?: unknown; name?: unknown }
-    return candidate.type === 'function' ? candidate.name : undefined
-  }))
+  const keep = tools.filter((tool) => !isHollowGateTool(tool, flatToolName, flatToolParameters))
+  const names = new Set(keep.map((tool) => flatToolName(tool as Record<string, unknown>)))
   const missing = FREE_LANE_GATE_TOOL_NAMES.filter((name) => !names.has(name))
   const invalidChoice = body.tool_choice !== undefined && body.tool_choice !== 'auto'
-  if (missing.length === 0 && !invalidChoice) return undefined
+  if (missing.length === 0 && !invalidChoice && keep.length === tools.length) return undefined
   return {
     ...body,
-    tools: [...tools, ...missing.map((name) => ({ type: 'function', ...freeLaneGateTool(name).function }))],
+    tools: [...keep, ...missing.map((name) => ({ type: 'function', ...freeLaneGateTool(name).function }))],
     tool_choice: 'auto',
   }
 }
@@ -398,27 +476,28 @@ export function ensureResponsesFreeLaneShape(payload: unknown): unknown | undefi
 /**
  * Rewrite an outgoing chat-completions payload so it satisfies the free-lane
  * agent-shape gate (wired through pi-ai's onPayload). Appends only the gate
- * tools the payload is missing; when the context carried no tools at all,
- * tool_choice 'none' keeps the model from ever calling the injected stubs,
- * while client-provided tool choices are preserved untouched. Returns
- * undefined when the payload already satisfies the gate or is not a
- * chat-completions body (pi-ai keeps the original in that case).
+ * tools the payload is missing — and replaces hollow copies in place, since a
+ * name-only `read` satisfies the name check yet still 403s the lane. When the
+ * context carried no tools at all, tool_choice 'none' keeps the model from
+ * ever calling the injected tool, while client-provided tool choices are
+ * preserved untouched. Returns undefined when the payload already satisfies
+ * the gate or is not a chat-completions body (pi-ai keeps the original in
+ * that case).
+ *
+ * The appended definitions are real (FREE_LANE_GATE_TOOLS), never stubs: an
+ * empty `parameters.properties` on a gate-shaped name is itself a 403.
  */
 export function ensureFreeLaneShape(payload: unknown): unknown | undefined {
   if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return undefined
   const body = payload as Record<string, unknown>
   if (!Array.isArray(body.messages)) return undefined
   const tools = Array.isArray(body.tools) ? (body.tools as unknown[]) : []
-  const names = new Set(
-    tools.map((tool) => {
-      const fn = typeof tool === 'object' && tool !== null ? (tool as { function?: { name?: unknown } }).function : undefined
-      return typeof fn === 'object' && fn !== null ? fn.name : undefined
-    }),
-  )
+  const keep = tools.filter((tool) => !isHollowGateTool(tool, chatToolName, chatToolParameters))
+  const names = new Set(keep.map((tool) => chatToolName(tool as Record<string, unknown>)))
   const missing = FREE_LANE_GATE_TOOL_NAMES.filter((name) => !names.has(name))
-  if (missing.length === 0) return undefined
+  if (missing.length === 0 && keep.length === tools.length) return undefined
   const next: Record<string, unknown> = { ...body }
-  next.tools = [...tools, ...missing.map((name) => freeLaneGateTool(name))]
+  next.tools = [...keep, ...missing.map((name) => freeLaneGateTool(name))]
   if (tools.length === 0) next.tool_choice = 'none'
   return next
 }

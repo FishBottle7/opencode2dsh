@@ -49,7 +49,7 @@ test('writeAgentConfig emits the design.md section 8.3 template', async () => {
     assert.equal(parsed.anonymous, true)
     assert.deepEqual(parsed.zen_keys, [])
     assert.deepEqual(parsed.go_keys, [])
-    assert.equal(parsed.upstream.zen, 'https://opencode.ai/zen')
+    assert.equal(parsed.upstream.zen, 'https://opencode.ai/inference')
     assert.equal(parsed.models.refresh_seconds, 300)
     assert.deepEqual(parsed.proxies, ['direct'])
     // rewrite with new values replaces atomically

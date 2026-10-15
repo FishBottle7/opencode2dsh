@@ -259,7 +259,10 @@ export async function writeAgentConfig(
     anonymous: true,
     zen_keys: [],
     go_keys: [],
-    upstream: { zen: 'https://opencode.ai/zen' },
+    // The free lane moved off the console-proxy path on 2026-10-15: /zen/v1
+    // chat now 403s every body, so the sidecar agent must dial the inference
+    // surface the official CLI v2 uses (adapter/catalog.ts ZEN_BASE_URL).
+    upstream: { zen: 'https://opencode.ai/inference' },
     models: { refresh_seconds: options.refreshSeconds },
     retry: { max_attempts: 2, timeout_seconds: 300 },
     proxies: ['direct'],
