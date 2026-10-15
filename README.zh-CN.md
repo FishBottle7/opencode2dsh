@@ -94,11 +94,11 @@ DSH 会话
 ZenAdapter（注册的 LlmAdapter）
    │  pi-ai openai-completions 流式
    ▼
-https://opencode.ai/zen/v1        ← Authorization: Bearer public
+https://opencode.ai/inference/v1  ← Authorization: Bearer public
    携带与 CLI 同形的请求头：
      user-agent: opencode/…
      x-opencode-client, x-opencode-session, x-session-affinity,
-     X-Session-Id, x-opencode-request, x-opencode-project
+     X-Session-Id, x-opencode-session-id
 ```
 
 - **会话关联**——session/project id 由会话首条用户消息经 SHA-256 派生

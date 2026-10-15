@@ -130,14 +130,18 @@ test('admission: fail-fast at each step (echo/geo/latency/models/smoke)', async 
   const smokeBody = JSON.parse(okTransport.bodies.get(CHAT_URL)!) as {
     stream?: boolean
     tool_choice?: string
-    tools?: Array<{ type: string; function: { name: string } }>
+    tools?: Array<{ type: string; function: { name: string; parameters: { properties: Record<string, unknown> } } }>
   }
   assert.equal(smokeBody.stream, true)
   assert.equal(smokeBody.tool_choice, 'none')
   const smokeToolNames = smokeBody.tools?.map((t) => t.function.name) ?? []
   assert.deepEqual([...smokeToolNames].sort(), ['bash', 'read'])
+  assert.ok(smokeBody.tools?.every((tool) => Object.keys(tool.function.parameters.properties).length > 0))
   const smokeHeaders = okTransport.headers.get(CHAT_URL)!
   assert.match(smokeHeaders['x-opencode-session'] ?? '', /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/, 'canonical session header')
+  assert.equal(smokeHeaders['x-opencode-session-id'], smokeHeaders['x-opencode-session'])
+  assert.equal(smokeHeaders['x-opencode-request'], undefined)
+  assert.equal(smokeHeaders['x-opencode-project'], undefined)
 
   // transport errors surface as reasons (timeout / reset)
   transport = fakeTransport({ '*': new Error('connect ECONNREFUSED') })

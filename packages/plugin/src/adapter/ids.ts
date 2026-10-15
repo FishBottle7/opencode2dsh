@@ -173,17 +173,18 @@ export function opencodeUserAgent(): string {
 }
 
 /**
- * The full disguise header set sent with every upstream request
- * (design.md 2.4; gateway.go newUpstreamRequest:640-669).
+ * Session headers shared by the native adapter and admission probes.
+ * Since 2026-10-14/15 the inference lane needs x-opencode-session-id too.
+ * Do not send the legacy req_<hex>/prj_<hex> synthetic headers: live tests
+ * returned FreeTierError when either was present, and 200 with both omitted.
  */
 export function disguiseHeaders(ids: RequestIDs): Record<string, string> {
   return {
     'user-agent': opencodeUserAgent(),
     'x-opencode-client': 'cli',
     'x-opencode-session': ids.session,
+    'x-opencode-session-id': ids.session,
     'x-session-affinity': ids.session,
     'X-Session-Id': ids.session,
-    'x-opencode-request': ids.request,
-    'x-opencode-project': ids.project,
   }
 }

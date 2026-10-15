@@ -332,20 +332,12 @@ export async function toPiContext(options: HarnessGenerateOptions): Promise<PiCo
 }
 
 /**
- * The anonymous free-lane gate (~2026-10-09, issue #56; live-probed again
- * 2026-10-11): a chat request passes with HTTP 200 only when ALL hold:
- *   1. a canonical `ses_*` id in a session header (`x-opencode-session`,
- *      `x-session-affinity` and `X-Session-Id` all work — any ONE suffices;
- *      bad-shape ids 403);
- *   2. a streaming body (`stream: true` — non-stream 403s);
- *   3. an agent-shaped `tools` array: `bash`+`read` pass (200), `shell`+1
- *      known name pass (200), but `bash` alone, `shell` alone, and 5 known
- *      names WITHOUT bash/shell all 403. Schemas and descriptions go
- *      uninspected.
- * The `Bearer public` credential and the User-Agent spelling are NOT gates
- * (both pass on /zen/v1; only /inference/openai 401s the Bearer). The shipped
- * recipe stays the 2026-09-18 bash+read pair: minimal, host-named, and valid
- * on both the /zen and /inference lanes.
+ * Anonymous-lane request shape, re-verified 2026-10-15 (issue #72).
+ * The /inference/v1 lane accepts streaming chat with bash/read declarations
+ * carrying non-empty parameter schemas. Keep real host schemas intact and
+ * add an optional placeholder property only to otherwise empty gate slots.
+ * Headers are supplied by disguiseHeaders; the full server policy is not
+ * public, so this describes the tested recipe rather than an exhaustive gate.
  */
 export const FREE_LANE_GATE_TOOL_NAMES = ['bash', 'read'] as const
 
@@ -363,13 +355,38 @@ export interface FreeLaneGateTool {
   function: { name: string; description: string; parameters: Record<string, unknown> }
 }
 
+function gateParameters(schema: unknown): Record<string, unknown> {
+  const record = typeof schema === 'object' && schema !== null && !Array.isArray(schema)
+    ? schema as Record<string, unknown> : {}
+  const properties = record.properties
+  if (typeof properties === 'object' && properties !== null && !Array.isArray(properties) && Object.keys(properties).length > 0) return record
+  return {
+    ...record,
+    type: 'object',
+    properties: { input: { type: 'string', description: 'Reserved for the host runtime; do not call this placeholder tool.' } },
+  }
+}
+
+function withGateParameters(tool: unknown, flat: boolean): unknown {
+  if (typeof tool !== 'object' || tool === null || Array.isArray(tool)) return tool
+  const record = tool as Record<string, unknown>
+  if (record.type !== 'function') return tool
+  const candidate = flat ? record : record.function
+  if (typeof candidate !== 'object' || candidate === null || Array.isArray(candidate)) return tool
+  const fn = candidate as Record<string, unknown>
+  if (!FREE_LANE_GATE_TOOL_NAMES.some((name) => name === fn.name)) return tool
+  const parameters = gateParameters(fn.parameters)
+  if (parameters === fn.parameters) return tool
+  return flat ? { ...record, parameters } : { ...record, function: { ...fn, parameters } }
+}
+
 export function freeLaneGateTool(name: (typeof FREE_LANE_GATE_TOOL_NAMES)[number]): FreeLaneGateTool {
   return {
     type: 'function',
     function: {
       name,
       description: 'Reserved for the host runtime; do not call it.',
-      parameters: { type: 'object', properties: {} },
+      parameters: gateParameters(undefined),
     },
   }
 }
@@ -379,7 +396,8 @@ export function ensureResponsesFreeLaneShape(payload: unknown): unknown | undefi
   if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return undefined
   const body = payload as Record<string, unknown>
   if (!Array.isArray(body.input)) return undefined
-  const tools = Array.isArray(body.tools) ? body.tools as unknown[] : []
+  const original = Array.isArray(body.tools) ? body.tools as unknown[] : []
+  const tools = original.map((tool) => withGateParameters(tool, true))
   const names = new Set(tools.map((tool) => {
     if (typeof tool !== 'object' || tool === null) return undefined
     const candidate = tool as { type?: unknown; name?: unknown }
@@ -387,7 +405,8 @@ export function ensureResponsesFreeLaneShape(payload: unknown): unknown | undefi
   }))
   const missing = FREE_LANE_GATE_TOOL_NAMES.filter((name) => !names.has(name))
   const invalidChoice = body.tool_choice !== undefined && body.tool_choice !== 'auto'
-  if (missing.length === 0 && !invalidChoice) return undefined
+  const changed = tools.some((tool, index) => tool !== original[index])
+  if (missing.length === 0 && !invalidChoice && !changed) return undefined
   return {
     ...body,
     tools: [...tools, ...missing.map((name) => ({ type: 'function', ...freeLaneGateTool(name).function }))],
@@ -408,7 +427,8 @@ export function ensureFreeLaneShape(payload: unknown): unknown | undefined {
   if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return undefined
   const body = payload as Record<string, unknown>
   if (!Array.isArray(body.messages)) return undefined
-  const tools = Array.isArray(body.tools) ? (body.tools as unknown[]) : []
+  const original = Array.isArray(body.tools) ? (body.tools as unknown[]) : []
+  const tools = original.map((tool) => withGateParameters(tool, false))
   const names = new Set(
     tools.map((tool) => {
       const fn = typeof tool === 'object' && tool !== null ? (tool as { function?: { name?: unknown } }).function : undefined
@@ -416,9 +436,10 @@ export function ensureFreeLaneShape(payload: unknown): unknown | undefined {
     }),
   )
   const missing = FREE_LANE_GATE_TOOL_NAMES.filter((name) => !names.has(name))
-  if (missing.length === 0) return undefined
+  const changed = tools.some((tool, index) => tool !== original[index])
+  if (missing.length === 0 && !changed) return undefined
   const next: Record<string, unknown> = { ...body }
   next.tools = [...tools, ...missing.map((name) => freeLaneGateTool(name))]
-  if (tools.length === 0) next.tool_choice = 'none'
+  if (original.length === 0) next.tool_choice = 'none'
   return next
 }

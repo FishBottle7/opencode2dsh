@@ -459,8 +459,8 @@ test('ensureFreeLaneShape leaves satisfying and non-chat payloads untouched', ()
     model: 'm',
     messages: [],
     tools: [
-      { type: 'function', function: { name: 'bash', description: 'x', parameters: {} } },
-      { type: 'function', function: { name: 'read', description: 'x', parameters: {} } },
+      { type: 'function', function: { name: 'bash', description: 'x', parameters: { type: 'object', properties: { command: { type: 'string' } } } } },
+      { type: 'function', function: { name: 'read', description: 'x', parameters: { type: 'object', properties: { filePath: { type: 'string' } } } } },
     ],
   }
   assert.equal(ensureFreeLaneShape(both), undefined)

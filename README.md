@@ -99,11 +99,11 @@ ZenAdapter (registered LlmAdapter)
    │  pi-ai openai-completions stream (chat models)
    │  pi-ai openai-responses stream (`muse-spark-*`, Responses-only on Zen)
    ▼
-https://opencode.ai/zen/v1        ← Authorization: Bearer public
+https://opencode.ai/inference/v1  ← Authorization: Bearer public
    with CLI-identical headers:
      user-agent: opencode/…
      x-opencode-client, x-opencode-session, x-session-affinity,
-     X-Session-Id, x-opencode-request, x-opencode-project
+     X-Session-Id, x-opencode-session-id
 ```
 
 - **Session correlation** — session/project ids are SHA-256 derived from the

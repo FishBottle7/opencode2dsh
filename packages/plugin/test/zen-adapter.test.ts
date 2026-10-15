@@ -248,12 +248,12 @@ function capturingProvider() {
   return { provider, captured }
 }
 
-/** A body that already satisfies the free-lane gate recipe (issue #56). */
+/** A body that already satisfies the current non-empty-schema recipe (#72). */
 const gateBody = {
   model: 'big-pickle',
   messages: [{ role: 'user', content: 'hi' }],
   stream: true,
-  tools: ['bash', 'read'].map((name) => ({ type: 'function', function: { name, description: 'd', parameters: {} } })),
+  tools: ['bash', 'read'].map((name) => ({ type: 'function', function: { name, description: 'd', parameters: { type: 'object', properties: { input: { type: 'string' } } } } })),
 }
 
 async function runStream(catalogReasoning: boolean, effort?: string): Promise<Array<{ onPayload?: (payload: unknown) => unknown }>> {

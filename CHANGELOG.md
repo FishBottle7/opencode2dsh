@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Restore native anonymous-lane requests after the new `403 FreeTierError` reports (#72): use `/inference/v1`, include `x-opencode-session-id`, give empty `bash`/`read` declarations a parameter property, and omit legacy synthetic request/project headers. Preserve real host schemas, tool choices, and stable session IDs. See `docs/free-lane-20261015.md` for the measured scope and upstream references.
+
 ## 0.3.12 (2026-10-14)
 
 ### Fixed
