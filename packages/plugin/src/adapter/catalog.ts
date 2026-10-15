@@ -7,14 +7,29 @@ import { opencodeUserAgent } from './ids.ts'
  * Port of agent/internal/catalog (opencode2api models.go + model_metadata.go,
  * trimmed to the single anonymous Zen lane) plus the S3 static fallback:
  *
- *   S1  GET {zen}/v1/models            live catalog (in-sale ids, free or paid)
+ *   S1  GET {lane}/v1/models           live catalog (in-sale ids, free or paid)
  *   S2  GET https://models.dev/api.json  pricing metadata -> free decision
  *   S3  compile-time verified ids       last-resort bootstrap list
  *
  * /v1/models-equivalent exposure = S1 ∩ S2-allowed (or S3 while S1 is pending).
  */
 
-export const ZEN_BASE_URL = 'https://opencode.ai/zen'
+/**
+ * The anonymous free lane's base URL.
+ *
+ * Moved off the console-proxy path on 2026-10-15: `/zen/v1/chat/completions`
+ * now answers 403 FreeTierError ("free tier can only be used from within
+ * OpenCode") for *every* body, while the inference surface the official CLI v2
+ * uses (`packages/ai/src/providers/opencode.ts`: baseURL
+ * `https://opencode.ai/inference/v1`) answers 200 with the same disguise set.
+ * Live-probed 2026-10-15 against both surfaces with the shipped headers:
+ *   GET  /inference/v1/models          200 (byte-identical roster to /zen)
+ *   POST /inference/v1/chat/completions 200 (streaming)
+ *   POST /zen/v1/chat/completions       403
+ * The `ZEN_` spelling is kept so this stays a value change; see
+ * docs/design.md for the lane's former name.
+ */
+export const ZEN_BASE_URL = 'https://opencode.ai/inference'
 
 /**
  * Free-lane blocklist (issue #56 live matrix, 2026-10-10): models the live

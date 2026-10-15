@@ -41,7 +41,7 @@ opencode2dsh 是一个 **DSH cordis 插件**：它在 DSH 进程旁拉起一台*
         └──────────────────┬──────────────────────────┘
                            │ HTTPS
                            ▼
-              https://opencode.ai/zen/v1/...
+              https://opencode.ai/inference/v1/...
               (Authorization: Bearer public
                + x-opencode-client: cli 等)
 ```
@@ -102,7 +102,7 @@ DSH                opencode2dsh-agent (Go)                opencode.ai/zen
  │                       │ Route() → {Tier:zen, Anonymous:true}│
  │                       │ newUpstreamRequest()                │
  │                       │───────────────────────────────────►│
- │                       │ POST https://opencode.ai/zen/v1/chat/completions
+ │                       │ POST https://opencode.ai/inference/v1/chat/completions
  │                       │ Content-Type: application/json
  │                       │ Accept: application/json, text/event-stream
  │                       │ User-Agent: opencode/1.18.31 (<goos> <goarch>; <goversion>)
@@ -112,8 +112,8 @@ DSH                opencode2dsh-agent (Go)                opencode.ai/zen
  │                       │   14base62 = sha256("ses\0"+signal) 派生（会话亲和）
  │                       │ x-session-affinity: <同上>
  │                       │ X-Session-Id: <同上>
- │                       │ x-opencode-request: req_<32hex>
- │                       │ x-opencode-project: prj_<24hex>
+ │                       │ x-opencode-request: req_<32hex>   ← 2026-10-15 起不发（发即 403，§3.5）
+ │                       │ x-opencode-project: prj_<24hex>   ← 2026-10-15 起改非 prj_ 值（prj_ 前缀即 403）
  │                       │ Authorization: Bearer public        ← 匿名凭证
  │                       │                                    │
  │                       │      ◄──── 200 text/event-stream ──│
@@ -145,6 +145,7 @@ DSH                opencode2dsh-agent (Go)                opencode.ai/zen
 2. **模型白名单**：OpenCode 服务端在模型 schema 上有 `allowAnonymous` 标记（opencode 仓库 `packages/console/core/src/model.ts:28`），仅带标记的模型能从 `Bearer public` 命中；客户端侧无法枚举该标记，只能靠 models.dev 成本数据 + 名称启发式**逼近**（§4）。
 3. **计费语义**：匿名请求的账单来源标记为 `anonymous`，不产生扣费。opencode2dsh 不配置任何认证 key，因此 `doUpstream` 的认证回退分支（gateway.go:390-410）恒为空 —— 匿名失败就是失败，不做付费降级。
 4. **限流**：OpenCode 对匿名请求按**出口 IP** 限流，阈值在平台侧 Secret 配置，公开仓库不可见。表现为 401/403/429 或 5xx。opencode2dsh 的应对见 §9；**必须诚实表述为「匿名配额受上游限流」，任何多 IP 轮换能力默认关闭且仅限自部署场景**（§9.2）。
+5. **端点迁移与 agent-shape 门（2026-10-15 实测，opencode CLI v2.0.29 逐项消融）**：免费通道的 chat 面已迁到 `https://opencode.ai/inference/v1/chat/completions`；`/zen/v1/chat/completions` 任何请求都回 `403 FreeTierError`（而 `/zen/v1/models` 与 `/inference/v1/models` 同时 200，两个名单逐字节一致，所以只靠模型列表探测看不出这次迁移）。同时通道会检查「像不像官方 CLI 的 agent 请求」，放行需**同时**满足五条：① 上面的 inference 端点；② `Authorization: Bearer public`；③ `User-Agent` 以 `opencode` 开头；④ body 里 `tools` 含 `read` 且其 `parameters.properties` **非空**；⑤ 至少一个规范 `ses_*` id 走 session 头（§2.4 的派生公式不变）。以下三种形态**任何一条**都会 403：带 `x-opencode-request` 头（任意值）、`x-opencode-project` 以 `prj_` 开头、把 `bash`/`shell`/`edit`/`glob`/`grep`/`read`/`write` 中的任一个以**空** `properties` 广播（占位 stub 比不广播更糟）。插件的对应改动见 CHANGELOG「Unreleased」。
 
 ## 4. 免费模型列表策略
 
@@ -206,7 +207,7 @@ opencode2dsh 的 Go 部分命名 `opencode2dsh-agent`，Go module 采用 `cmd/ag
 | 方法/路径 | 行为 | 对应上游 |
 | --- | --- | --- |
 | `GET /v1/models` | 本地鉴权后返回免费模型清单（§4） | S1/S2/S3 合并 |
-| `POST /v1/chat/completions` | 本地鉴权 → 匿名转发（流式/非流式均支持） | `POST https://opencode.ai/zen/v1/chat/completions` |
+| `POST /v1/chat/completions` | 本地鉴权 → 匿名转发（流式/非流式均支持） | `POST https://opencode.ai/inference/v1/chat/completions`（2026-10-15 起；`/zen` 同路径 403，见 §3.5） |
 | `GET /healthz` | 无需鉴权；`{"status","ready","version","models":{...},"anonymous":true}`；模型目录 pending/stale/empty、无健康出口时降级（移植 gateway.go:108-168） | — |
 
 `/v1/responses`、`/v1/messages` 不注册（对应 gateway.go:102-103 两行不移植）。
@@ -260,7 +261,7 @@ cordis 插件 service 工厂
   "server_keys": ["<random token>"],
   "anonymous": true,
   "zen_keys": [], "go_keys": [],          // 恒空：opencode2dsh 不做认证通道
-  "upstream": { "zen": "https://opencode.ai/zen" },
+  "upstream": { "zen": "https://opencode.ai/inference" },   // 2026-10-15 起插件写 inference 面
   "models": { "refresh_seconds": 300 },
   "retry": { "max_attempts": 2, "timeout_seconds": 300 },
   "proxies": ["direct"],                   // 多代理仅当用户显式配置

@@ -122,22 +122,29 @@ test('admission: fail-fast at each step (echo/geo/latency/models/smoke)', async 
   assert.ok(!result.admitted)
   assert.match(result.reason!, /zen smoke HTTP 403/)
 
-  // the smoke body must satisfy the free-lane gate (issue #56): streaming,
-  // bash+read stubs call-disabled, and a canonical ses_* session header
+  // the smoke body must satisfy the free-lane gate (re-probed 2026-10-15):
+  // streaming, the official `read` tool with a real schema (an empty-schema
+  // stub on a gate-shaped name is itself a 403), and a canonical ses_* header
   const okTransport = fakeTransport(okScript())
   const okResult = await admitCandidate(deps(okTransport), { address: 'h:1', protocol: 'http', source: 'free' }, { timeoutMs: 1000 })
   assert.ok(okResult.admitted)
   const smokeBody = JSON.parse(okTransport.bodies.get(CHAT_URL)!) as {
     stream?: boolean
     tool_choice?: string
-    tools?: Array<{ type: string; function: { name: string } }>
+    tools?: Array<{ type: string; function: { name: string; parameters?: { properties?: Record<string, unknown> } } }>
   }
   assert.equal(smokeBody.stream, true)
   assert.equal(smokeBody.tool_choice, 'none')
   const smokeToolNames = smokeBody.tools?.map((t) => t.function.name) ?? []
-  assert.deepEqual([...smokeToolNames].sort(), ['bash', 'read'])
+  assert.deepEqual([...smokeToolNames].sort(), ['read'])
+  const readTool = smokeBody.tools?.find((t) => t.function.name === 'read')
+  assert.ok(readTool, 'gate tool present')
+  assert.ok(Object.keys(readTool!.function.parameters?.properties ?? {}).length > 0, 'read carries a non-empty schema')
   const smokeHeaders = okTransport.headers.get(CHAT_URL)!
   assert.match(smokeHeaders['x-opencode-session'] ?? '', /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/, 'canonical session header')
+  // both are 403 triggers on the lane (live-probed 2026-10-15)
+  assert.ok(!('x-opencode-request' in smokeHeaders))
+  assert.ok(!String(smokeHeaders['x-opencode-project'] ?? '').startsWith('prj_'))
 
   // transport errors surface as reasons (timeout / reset)
   transport = fakeTransport({ '*': new Error('connect ECONNREFUSED') })

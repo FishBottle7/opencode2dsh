@@ -1,20 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { canonicalSessionID, conversationSeed, deriveRequestIDs, disguiseHeaders, invertedTimestampHex, opencodeUserAgent, randomID, stableID } from '../src/adapter/ids.ts'
-
-test('stableID is deterministic and sha256-truncated', () => {
-  const first = stableID('ses', 'hello')
-  const second = stableID('ses', 'hello')
-  assert.equal(first, second)
-  assert.ok(first.startsWith('ses_'))
-  const hex = first.slice('ses_'.length)
-  assert.equal(hex.length, 24, '12 bytes hex')
-  const expected = createHash('sha256').update('ses\x00hello').digest().subarray(0, 12).toString('hex')
-  assert.equal(hex, expected)
-  assert.notEqual(stableID('ses', 'world'), first)
-  assert.notEqual(stableID('prj', 'hello'), first, 'prefix is part of the hash input')
-})
+import { canonicalSessionID, conversationSeed, DEFAULT_PROJECT_ID, deriveRequestIDs, disguiseHeaders, invertedTimestampHex, opencodeUserAgent, randomID } from '../src/adapter/ids.ts'
 
 test('randomID differs per call with the requested size', () => {
   const a = randomID('req', 16)
@@ -176,7 +163,7 @@ test('conversationSeed uses the first user turn and skips non-user messages', ()
   assert.equal(conversationSeed([{ role: 'user', content: null }]), '', 'null content is skipped')
 })
 
-test('deriveRequestIDs keeps the session stable across turns and randomizes requests', () => {
+test('deriveRequestIDs keeps the session stable across turns and reports the project id', () => {
   const turnOne = [{ role: 'user', content: 'hello' }]
   const turnTwo = [
     { role: 'user', content: 'hello' },
@@ -186,9 +173,11 @@ test('deriveRequestIDs keeps the session stable across turns and randomizes requ
   const first = deriveRequestIDs(turnOne)
   const second = deriveRequestIDs(turnTwo)
   assert.equal(first.session, second.session)
-  assert.notEqual(first.request, second.request)
   assert.equal(first.project, second.project)
-  assert.ok(first.project.startsWith('prj_'))
+  // The lane 403s the adapter's own `prj_*` spelling, so the brand default
+  // (project-id.ts) is what goes upstream.
+  assert.equal(first.project, DEFAULT_PROJECT_ID)
+  assert.ok(!first.project.startsWith('prj_'))
   assert.equal(first.parentSession, '')
   // fallback: no user content at all still yields usable ids
   const empty = deriveRequestIDs([{ role: 'system', content: 'only system' }])
@@ -204,8 +193,11 @@ test('disguiseHeaders carries the CLI-identical correlation set', () => {
   assert.equal(headers['x-opencode-session'], ids.session)
   assert.equal(headers['x-session-affinity'], ids.session)
   assert.equal(headers['X-Session-Id'], ids.session)
-  assert.equal(headers['x-opencode-request'], ids.request)
   assert.equal(headers['x-opencode-project'], ids.project)
+  // Both are 403 triggers on the free lane (live-probed 2026-10-15): the
+  // request header is refused outright, and so is a `prj_`-spelled project.
+  assert.ok(!('x-opencode-request' in headers))
+  assert.ok(!headers['x-opencode-project'].startsWith('prj_'))
   assert.ok(headers['user-agent'].startsWith('opencode/'))
   assert.ok(headers['user-agent'].includes(process.platform))
 })

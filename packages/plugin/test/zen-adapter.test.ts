@@ -3,6 +3,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { ModelCatalog } from '../src/adapter/catalog.ts'
 import { isResponsesModel, PROVIDER_ID, reasoningEfforts, reasoningEffortWire, WATCHDOG_FIRST_MESSAGE, ZenAdapter } from '../src/adapter/zen-adapter.ts'
+import { freeLaneGateTool } from '../src/adapter/messages.ts'
 import { Config, resolveConfig } from '../src/config.ts'
 
 /**
@@ -253,7 +254,9 @@ const gateBody = {
   model: 'big-pickle',
   messages: [{ role: 'user', content: 'hi' }],
   stream: true,
-  tools: ['bash', 'read'].map((name) => ({ type: 'function', function: { name, description: 'd', parameters: {} } })),
+  // the gate reads the parameter object (live-probed 2026-10-15), so the
+  // satisfying body carries the official `read`, not a name-only stub
+  tools: [freeLaneGateTool('read')],
 }
 
 async function runStream(catalogReasoning: boolean, effort?: string): Promise<Array<{ onPayload?: (payload: unknown) => unknown }>> {
@@ -294,7 +297,7 @@ test('stream keeps the free-lane gate rewrite alongside the effort injection', a
   assert.equal(shaped.reasoning_effort, 'none')
   assert.deepEqual(
     (shaped.tools as Array<{ function: { name: string } }>).map((t) => t.function.name).sort(),
-    ['bash', 'read'],
+    ['read'],
   )
   assert.equal(shaped.tool_choice, 'none')
 
@@ -480,7 +483,7 @@ test('Responses streams pass a valid reasoning option and sanitize the payload',
   assert.deepEqual(payload.reasoning, { effort: 'high' })
   assert.equal(payload.reasoning_effort, undefined)
   assert.equal(payload.tool_choice, 'auto')
-  assert.deepEqual((payload.tools as Array<{ name: string }>).map((tool) => tool.name), ['bash', 'read'])
+  assert.deepEqual((payload.tools as Array<{ name: string }>).map((tool) => tool.name), ['read'])
 })
 
 test('the wire request carries the canonical session the free-lane gate requires (issue #56)', async () => {
@@ -514,8 +517,8 @@ test('the wire request carries the canonical session the free-lane gate requires
 })
 
 test('the tool-name alias seam passes through names unchanged on the shipped recipe', async () => {
-  // GATE_TOOL_ALIASES is empty today (bash+read are host-named); the seam in
-  // toStreamChunks exists for a future gate spelling that forces an alias.
+  // GATE_TOOL_ALIASES is empty today (the injected `read` is host-named); the
+  // seam in toStreamChunks exists for a future gate spelling that forces an alias.
   const provider = {
     streamSimple(_model: unknown, _context: unknown, _options: unknown): AsyncIterable<{ type: string }> {
       return (async function* () {

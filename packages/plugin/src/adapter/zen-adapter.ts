@@ -193,16 +193,19 @@ function terminalErrorEvent(errorMessage: string, model: Model<Api>): PiEvent {
 }
 
 /**
- * Responses-only models on Zen (issue #7): `muse-spark-*` return a bare 500
- * on `POST /zen/v1/chat/completions` but 200 on `POST /zen/v1/responses`
+ * Responses-only models (issue #7): `muse-spark-*` return a bare 500 on
+ * `POST .../v1/chat/completions` but 200 on `POST .../v1/responses`
  * (opencode #44659/#44847, DSH #3957). Route by model id; extend this list
- * if Zen moves more models (candidates: gpt-5.6-luna, grok-4.6).
+ * if the lane moves more models (candidates: gpt-5.6-luna, grok-4.6).
  *
- * Issue #56 (2026-10-09): the gate added a canonical-session-header half on
- * BOTH surfaces (adapter/messages.ts has the probed matrix); the official CLI
- * v2 also calls /inference/openai directly for chat, but /zen/v1 stays the
- * lane of record for this adapter — it answers 200 with the recipe and keeps
- * `Bearer public` valid, which the inference surface 401s.
+ * Lane history: the console-proxy path (`/zen/v1`) was the lane of record
+ * until it began answering 403 FreeTierError for every chat body (first
+ * observed 2026-10-15). The adapter now dials the inference surface the
+ * official CLI v2 uses (`https://opencode.ai/inference/v1`,
+ * `packages/ai/src/providers/opencode.ts`), which answers 200 with the same
+ * disguise set and keeps `Bearer public` valid (adapter/catalog.ts
+ * ZEN_BASE_URL). The Responses surface moves with the lane: the official
+ * provider serves both protocols from the same baseURL.
  */
 
 

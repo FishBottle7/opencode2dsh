@@ -20,7 +20,7 @@ import type { Dispatcher } from 'undici'
 
 import { ZEN_BASE_URL } from '../adapter/catalog.ts'
 import { FREE_LANE_GATE_TOOL_NAMES, freeLaneGateTool } from '../adapter/messages.ts'
-import { canonicalSessionID, disguiseHeaders, opencodeUserAgent, randomID, stableID } from '../adapter/ids.ts'
+import { canonicalSessionID, DEFAULT_PROJECT_ID, disguiseHeaders, opencodeUserAgent } from '../adapter/ids.ts'
 import { gradeOf, type ExitNode, type ExitPool } from './pool.ts'
 import { exitProxyUri } from './dispatcher.ts'
 
@@ -203,8 +203,7 @@ export async function admitCandidate(
   // drew 403 FreeTierError on the free lane like every other foreign shape.
   const probeHeaders = disguiseHeaders({
     session: canonicalSessionID(`admission:${candidate.address}`),
-    request: randomID('req', 16),
-    project: stableID('prj', 'opencode2dsh:default-project'),
+    project: DEFAULT_PROJECT_ID,
     parentSession: '',
   })
 
@@ -255,8 +254,7 @@ export async function admitCandidate(
         'content-type': 'application/json',
         ...disguiseHeaders({
           session: canonicalSessionID('opencode2dsh:admission-smoke'),
-          request: randomID('req', 16),
-          project: stableID('prj', 'opencode2dsh:admission'),
+          project: DEFAULT_PROJECT_ID,
           parentSession: '',
         }),
         ...probeHeaders,

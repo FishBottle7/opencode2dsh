@@ -429,15 +429,17 @@ test('tools pass through and empty tool lists are omitted', async () => {
   assert.equal(withoutTools.tools, undefined)
 })
 
-test('ensureFreeLaneShape injects gate tools into toolless chat bodies', () => {
+test('ensureFreeLaneShape injects the gate tool into toolless chat bodies', () => {
   const payload = { model: 'm', stream: true, messages: [{ role: 'user', content: 'ping' }] }
   const next = ensureFreeLaneShape(payload) as Record<string, unknown>
   assert.notEqual(next, undefined)
   assert.deepEqual(next.messages, payload.messages, 'messages untouched')
-  const tools = next.tools as Array<{ type: string; function: { name: string } }>
-  // the shipped recipe (issue #56 verified): bash+read, minimal and host-named
-  assert.deepEqual(tools.map((t) => t.function.name).sort(), ['bash', 'read'])
-  assert.equal(next.tool_choice, 'none', 'injected-only stubs are call-disabled')
+  const tools = next.tools as Array<{ type: string; function: { name: string; parameters: { properties: Record<string, unknown> } } }>
+  // the shipped recipe (re-probed 2026-10-15): the official `read` — the
+  // lane reads the schema, so a name-only stub would 403
+  assert.deepEqual(tools.map((t) => t.function.name), ['read'])
+  assert.ok(Object.keys(tools[0]!.function.parameters.properties).length > 0, 'real schema, not a stub')
+  assert.equal(next.tool_choice, 'none', 'injected-only tool is call-disabled')
 })
 
 test('ensureFreeLaneShape appends only missing gate tools and keeps tool_choice', () => {
@@ -449,21 +451,41 @@ test('ensureFreeLaneShape appends only missing gate tools and keeps tool_choice'
   }
   const next = ensureFreeLaneShape(payload) as Record<string, unknown>
   const tools = next.tools as Array<{ type: string; function: { name: string } }>
-  assert.equal(tools.length, 3, 'existing tool kept, both gate tools appended')
-  assert.deepEqual(tools.map((t) => t.function.name).sort(), ['bash', 'read', 'webfetch'])
+  assert.equal(tools.length, 2, 'existing tool kept, gate tool appended')
+  assert.deepEqual(tools.map((t) => t.function.name).sort(), ['read', 'webfetch'])
   assert.equal(next.tool_choice, 'auto', 'client choice preserved')
 })
 
-test('ensureFreeLaneShape leaves satisfying and non-chat payloads untouched', () => {
-  const both = {
+test('ensureFreeLaneShape replaces a hollow gate tool with the official definition', () => {
+  // a name-only `read` passes the name check but still 403s the lane
+  // (live-probed 2026-10-15) — the shaper must not wave it through
+  const payload = {
     model: 'm',
-    messages: [],
+    messages: [{ role: 'user', content: 'ping' }],
     tools: [
       { type: 'function', function: { name: 'bash', description: 'x', parameters: {} } },
       { type: 'function', function: { name: 'read', description: 'x', parameters: {} } },
     ],
   }
-  assert.equal(ensureFreeLaneShape(both), undefined)
+  const next = ensureFreeLaneShape(payload) as Record<string, unknown>
+  assert.notEqual(next, undefined, 'hollow read is not satisfying')
+  const tools = next.tools as Array<{ function: { name: string; parameters: { properties: Record<string, unknown> } } }>
+  assert.deepEqual(tools.map((t) => t.function.name).sort(), ['bash', 'read'])
+  const read = tools.find((t) => t.function.name === 'read')!
+  assert.ok(Object.keys(read.function.parameters.properties).length > 0, 'read re-injected with a real schema')
+  assert.equal(next.tool_choice, undefined, 'client had tools, so no choice is forced')
+})
+
+test('ensureFreeLaneShape leaves satisfying and non-chat payloads untouched', () => {
+  const satisfied = {
+    model: 'm',
+    messages: [],
+    tools: [
+      { type: 'function', function: { name: 'bash', description: 'x', parameters: { type: 'object', properties: { command: { type: 'string' } } } } },
+      { type: 'function', function: { name: 'read', description: 'x', parameters: { type: 'object', properties: { path: { type: 'string' } } } } },
+    ],
+  }
+  assert.equal(ensureFreeLaneShape(satisfied), undefined)
   assert.equal(ensureFreeLaneShape({ tools: [] }), undefined, 'no messages = not a chat body')
   assert.equal(ensureFreeLaneShape(null), undefined)
   assert.equal(ensureFreeLaneShape('text'), undefined)

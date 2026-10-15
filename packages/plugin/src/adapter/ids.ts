@@ -2,23 +2,26 @@ import { createHash, randomBytes } from 'node:crypto'
 
 /**
  * Port of agent/internal/ids (opencode2api ids.go, verbatim semantics):
- * stable session/project ids derived from the conversation's first user turn,
- * and a per-request random id. The upstream sees CLI-identical correlation
+ * stable session ids derived from the conversation's first user turn, plus the
+ * project id the upstream expects. The upstream sees CLI-identical correlation
  * headers built from these (zen-adapter.ts).
  */
 
 export interface RequestIDs {
   session: string
-  request: string
   project: string
   parentSession: string
 }
 
-/** sha256("prefix\0value") truncated to 12 bytes: stable, non-reversible. */
-export function stableID(prefix: string, value: string): string {
-  const sum = createHash('sha256').update(prefix + '\x00' + value).digest()
-  return `${prefix}_${sum.subarray(0, 12).toString('hex')}`
-}
+/**
+ * The project id sent upstream. Official clients derive a per-workspace
+ * 40-hex id and the lane accepts the brand default too, but it refuses this
+ * adapter's own `prj_*` spelling outright (live-probed 2026-10-15: `prj_*`
+ * answers 403 FreeTierError while `global`, a 40-hex id, an arbitrary token
+ * and an empty value all answer 200). The brand default is the honest choice:
+ * this adapter has no workspace identity to report.
+ */
+export const DEFAULT_PROJECT_ID = 'global'
 
 export function randomID(prefix: string, size: number): string {
   return `${prefix}_${randomBytes(size).toString('hex')}`
@@ -55,8 +58,7 @@ export function deriveRequestIDs(messages: Array<{ role: string; content: unknow
   if (signal === '' || signal === '{}') signal = randomID('fallback', 16)
   return {
     session: canonicalSessionID(signal),
-    request: randomID('req', 16),
-    project: stableID('prj', 'opencode2dsh:default-project'),
+    project: DEFAULT_PROJECT_ID,
     parentSession: '',
   }
 }
@@ -68,7 +70,7 @@ export function deriveRequestIDs(messages: Array<{ role: string; content: unknow
  * only be used from within OpenCode") — the plain User-Agent gate stopped
  * being sufficient (upstream fix: jasonxu114514/opencode2api 8185202).
  * Live-probed 2026-09-18: the gate has a second, body-shape half (streaming
- * + bash/read tools, adapter/messages.ts); both must pass.
+ * + an agent-shaped `tools` array, adapter/messages.ts); both must pass.
  *
  * Issue #62 (2026-10-13): matching that SHAPE stopped being sufficient. The
  * 12 hex characters are not an arbitrary blob — they encode a real
@@ -173,8 +175,13 @@ export function opencodeUserAgent(): string {
 }
 
 /**
- * The full disguise header set sent with every upstream request
- * (design.md 2.4; gateway.go newUpstreamRequest:640-669).
+ * The correlation header set sent with every upstream request.
+ *
+ * `x-opencode-request` is deliberately absent: since 2026-10-15 the free lane
+ * answers 403 FreeTierError for any request carrying it, and the official CLI
+ * v2 does not send one either (compiled `session/model-request.ts` in the
+ * released binary has no such header). `x-opencode-project` must keep
+ * {@link DEFAULT_PROJECT_ID}'s non-`prj_` spelling for the same reason.
  */
 export function disguiseHeaders(ids: RequestIDs): Record<string, string> {
   return {
@@ -183,7 +190,6 @@ export function disguiseHeaders(ids: RequestIDs): Record<string, string> {
     'x-opencode-session': ids.session,
     'x-session-affinity': ids.session,
     'X-Session-Id': ids.session,
-    'x-opencode-request': ids.request,
     'x-opencode-project': ids.project,
   }
 }
