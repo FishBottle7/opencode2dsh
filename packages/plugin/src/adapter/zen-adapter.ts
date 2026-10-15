@@ -1,4 +1,4 @@
-import { createProvider, type Api, type Context, type Model } from '@earendil-works/pi-ai'
+import { createModels, createProvider, type Api, type Context, type Model } from '@earendil-works/pi-ai'
 import * as openaiCompletions from '@earendil-works/pi-ai/api/openai-completions'
 import * as openaiResponses from '@earendil-works/pi-ai/api/openai-responses'
 
@@ -289,6 +289,23 @@ export class ZenAdapter {
   readonly #catalog: CatalogLike
   readonly #provider: { streamSimple(model: unknown, context: unknown, options: unknown): unknown }
   readonly #responsesProvider: { streamSimple(model: unknown, context: unknown, options: unknown): unknown } | null
+  /**
+   * `Models` wrappers around the two raw providers, used for the actual call.
+   *
+   * pi-ai reads a request's tools from the leading system message's `toolsAdded`
+   * field, not from `context.tools` (dist/utils/transcript.js:6-27,195-203;
+   * dist/api/openai-completions.js:598-599). Only the `Models` entry points fold
+   * `context.tools` into that message (dist/models.js:382,393). Calling a raw
+   * provider therefore drops every caller tool silently — the model is left
+   * holding only the injected gate stubs and reports that the host's tools do
+   * not exist. Since 0.86.0 that fold is the only supported path; on <= 0.85.1
+   * the raw provider still read `context.tools` directly, which is why this
+   * stayed hidden while the declared range (`^0.82.1`) resolved to 0.82.1 in a
+   * standalone install. A DSH profile hoists one pi-ai for every plugin, so it
+   * can resolve 0.87.x and take the broken path.
+   */
+  readonly #models: { streamSimple(model: unknown, context: unknown, options: unknown): unknown } | null
+  readonly #responsesModels: { streamSimple(model: unknown, context: unknown, options: unknown): unknown } | null
   readonly #firstEventMs: number
   readonly #bodyIdleMs: number
   readonly #responsesBodyIdleMs: number
@@ -309,6 +326,10 @@ export class ZenAdapter {
     if (options.providerOverride !== undefined) {
       this.#provider = options.providerOverride as never
       this.#responsesProvider = null
+      // A test double has no `Models` wrapper to build; the override is called
+      // directly, exactly as before.
+      this.#models = null
+      this.#responsesModels = null
       return
     }
     const baseUrl = `${(options.zenBaseUrl ?? ZEN_BASE_URL).replace(/\/+$/, '')}/v1`
@@ -334,6 +355,14 @@ export class ZenAdapter {
       models: [],
       api: openaiResponses,
     })
+    // Wrap each provider so pi-ai folds `context.tools` into the transcript
+    // before serializing the request (see the field comment above).
+    const models = createModels()
+    models.setProvider(this.#provider as never)
+    this.#models = models as never
+    const responsesModels = createModels()
+    responsesModels.setProvider(this.#responsesProvider as never)
+    this.#responsesModels = responsesModels as never
   }
 
   providerInfo(provider: string): { id: string; name: string } {
@@ -722,10 +751,13 @@ export class ZenAdapter {
             return { ...((shaped ?? payload) as Record<string, unknown>), reasoning_effort: effortWire }
           }
     // Responses-only models (muse-spark-*) must hit /responses, not /chat/completions.
-    const provider = isResponsesModel(model.id) && this.#responsesProvider
-      ? this.#responsesProvider
-      : this.#provider
-    return provider.streamSimple(model, context as unknown as Context, {
+    // Call the `Models` wrapper, never the raw provider: only the wrapper folds
+    // `context.tools` into the transcript, which is where pi-ai reads tools from
+    // since 0.86.0. A raw provider call drops the caller's whole toolset.
+    const transport = isResponsesModel(model.id) && this.#responsesModels
+      ? this.#responsesModels
+      : this.#models ?? (isResponsesModel(model.id) && this.#responsesProvider ? this.#responsesProvider : this.#provider)
+    return transport.streamSimple(model, context as unknown as Context, {
       apiKey: ANONYMOUS_KEY,
       sessionId: ids.session,
       headers: disguiseHeaders(ids),

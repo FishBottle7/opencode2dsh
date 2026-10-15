@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- The adapter now sends the caller's tools (#77). `ZenAdapter` built its transports with `createProvider()` and called `provider.streamSimple()` directly, but since pi-ai 0.86.0 a request's tools are read from the leading system message's `toolsAdded` field rather than from `context.tools`, and only the `Models` entry points perform that fold. Calling a raw provider therefore dropped **every** tool the harness supplied: the model received only the injected gate stubs and reported that `pwsh`/`read`/`grep` did not exist, and models that still tried to act emitted their tool-call syntax as literal text. The adapter now calls a `Models` wrapper over each provider. The failure was invisible in a standalone install because the declared range (`^0.82.1`) resolves to 0.82.1, where a raw provider still honored `context.tools`; a DSH profile hoists one pi-ai for every plugin in the profile, so it can resolve 0.87.x and take the broken path. Covered by `test/adapter-tools.test.ts`, which drives the adapter's real construction path and asserts on the bytes that leave.
+
 ## 0.3.12 (2026-10-14)
 
 ### Fixed
