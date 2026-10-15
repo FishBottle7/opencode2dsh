@@ -363,13 +363,51 @@ export interface FreeLaneGateTool {
   function: { name: string; description: string; parameters: Record<string, unknown> }
 }
 
+/**
+ * The lane refuses an official tool name whose `parameters.properties` is empty
+ * (#75, #78), so the injected pair carries the CLI's own definitions rather than
+ * a placeholder. The gate inspects presence, not shape; the schema is here so the
+ * tool also stays callable if the model reaches for it.
+ */
+const GATE_TOOL_SCHEMAS: Record<
+  (typeof FREE_LANE_GATE_TOOL_NAMES)[number],
+  { description: string; parameters: Record<string, unknown> }
+> = {
+  bash: {
+    description: 'Run a shell command in the project workspace.',
+    parameters: {
+      type: 'object',
+      properties: {
+        command: { type: 'string', description: 'The command to run.' },
+        description: { type: 'string', description: 'What the command does.' },
+      },
+      required: ['command'],
+      additionalProperties: false,
+    },
+  },
+  read: {
+    description: 'Read a file from the filesystem.',
+    parameters: {
+      type: 'object',
+      properties: {
+        filePath: { type: 'string', description: 'Absolute path of the file to read.' },
+        offset: { type: 'integer', description: 'Line number to start reading from.' },
+        limit: { type: 'integer', description: 'Maximum number of lines to read.' },
+      },
+      required: ['filePath'],
+      additionalProperties: false,
+    },
+  },
+}
+
 export function freeLaneGateTool(name: (typeof FREE_LANE_GATE_TOOL_NAMES)[number]): FreeLaneGateTool {
+  const schema = GATE_TOOL_SCHEMAS[name]
   return {
     type: 'function',
     function: {
       name,
-      description: 'Reserved for the host runtime; do not call it.',
-      parameters: { type: 'object', properties: {} },
+      description: schema.description,
+      parameters: schema.parameters,
     },
   }
 }
@@ -380,17 +418,26 @@ export function ensureResponsesFreeLaneShape(payload: unknown): unknown | undefi
   const body = payload as Record<string, unknown>
   if (!Array.isArray(body.input)) return undefined
   const tools = Array.isArray(body.tools) ? body.tools as unknown[] : []
-  const names = new Set(tools.map((tool) => {
-    if (typeof tool !== 'object' || tool === null) return undefined
-    const candidate = tool as { type?: unknown; name?: unknown }
-    return candidate.type === 'function' ? candidate.name : undefined
-  }))
-  const missing = FREE_LANE_GATE_TOOL_NAMES.filter((name) => !names.has(name))
+  // An empty-schema shell of a gate name does not satisfy the gate: it is
+  // replaced, not trusted (#75, #78).
+  const gateSchemaOk = (tool: unknown, name: string): boolean => {
+    if (typeof tool !== 'object' || tool === null) return false
+    const candidate = tool as { type?: unknown; name?: unknown; parameters?: { properties?: unknown } }
+    if (candidate.type !== 'function' || candidate.name !== name) return false
+    const properties = candidate.parameters?.properties
+    return typeof properties === 'object' && properties !== null && Object.keys(properties).length > 0
+  }
+  const missing = FREE_LANE_GATE_TOOL_NAMES.filter((name) => !tools.some((tool) => gateSchemaOk(tool, name)))
   const invalidChoice = body.tool_choice !== undefined && body.tool_choice !== 'auto'
   if (missing.length === 0 && !invalidChoice) return undefined
+  const kept = tools.filter((tool) => {
+    const candidate = typeof tool === 'object' && tool !== null ? (tool as { name?: unknown }) : undefined
+    const name = typeof candidate?.name === 'string' ? candidate.name : undefined
+    return !(name !== undefined && (missing as readonly string[]).includes(name) && !gateSchemaOk(tool, name))
+  })
   return {
     ...body,
-    tools: [...tools, ...missing.map((name) => ({ type: 'function', ...freeLaneGateTool(name).function }))],
+    tools: [...kept, ...missing.map((name) => ({ type: 'function', ...freeLaneGateTool(name).function }))],
     tool_choice: 'auto',
   }
 }
@@ -409,16 +456,24 @@ export function ensureFreeLaneShape(payload: unknown): unknown | undefined {
   const body = payload as Record<string, unknown>
   if (!Array.isArray(body.messages)) return undefined
   const tools = Array.isArray(body.tools) ? (body.tools as unknown[]) : []
-  const names = new Set(
-    tools.map((tool) => {
-      const fn = typeof tool === 'object' && tool !== null ? (tool as { function?: { name?: unknown } }).function : undefined
-      return typeof fn === 'object' && fn !== null ? fn.name : undefined
-    }),
-  )
-  const missing = FREE_LANE_GATE_TOOL_NAMES.filter((name) => !names.has(name))
+  // Same rule on the nested chat shape (#75, #78).
+  const gateSchemaOk = (tool: unknown, name: string): boolean => {
+    const fn = typeof tool === 'object' && tool !== null
+      ? (tool as { function?: { name?: unknown; parameters?: { properties?: unknown } } }).function
+      : undefined
+    if (typeof fn !== 'object' || fn === null || fn.name !== name) return false
+    const properties = fn.parameters?.properties
+    return typeof properties === 'object' && properties !== null && Object.keys(properties).length > 0
+  }
+  const missing = FREE_LANE_GATE_TOOL_NAMES.filter((name) => !tools.some((tool) => gateSchemaOk(tool, name)))
   if (missing.length === 0) return undefined
+  const kept = tools.filter((tool) => {
+    const fn = typeof tool === 'object' && tool !== null ? (tool as { function?: { name?: unknown } }).function : undefined
+    const name = typeof fn?.name === 'string' ? fn.name : undefined
+    return !(name !== undefined && (missing as readonly string[]).includes(name) && !gateSchemaOk(tool, name))
+  })
   const next: Record<string, unknown> = { ...body }
-  next.tools = [...tools, ...missing.map((name) => freeLaneGateTool(name))]
+  next.tools = [...kept, ...missing.map((name) => freeLaneGateTool(name))]
   if (tools.length === 0) next.tool_choice = 'none'
   return next
 }

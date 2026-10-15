@@ -285,6 +285,22 @@ export function normalizeResponsesPayload(payload: unknown, requestedEffort?: st
   return next
 }
 
+/**
+ * Sibling anonymous-lane host for a configured base URL: `/inference` <-> `/zen`.
+ * A base URL carrying neither segment (a custom mirror) falls back to
+ * `/inference`, the host the official CLI uses (see #75).
+ */
+function siblingZenBaseUrl(baseUrl: string): string | null {
+  const trimmed = baseUrl.replace(/\/+$/, '')
+  const sibling = trimmed.includes('/inference')
+    ? trimmed.replace('/inference', '/zen')
+    : trimmed.includes('/zen')
+      ? trimmed.replace('/zen', '/inference')
+      : 'https://opencode.ai/inference'
+  const candidate = `${sibling}/v1`
+  return candidate === `${trimmed}/v1` ? null : candidate
+}
+
 export class ZenAdapter {
   readonly #catalog: CatalogLike
   readonly #provider: { streamSimple(model: unknown, context: unknown, options: unknown): unknown }
@@ -292,6 +308,8 @@ export class ZenAdapter {
   readonly #firstEventMs: number
   readonly #bodyIdleMs: number
   readonly #responsesBodyIdleMs: number
+  /** Sibling host for one replay of a refused attempt; null when there is none. */
+  readonly #siblingBaseUrl: string | null
 
   constructor(catalog: CatalogLike, options: {
     zenBaseUrl?: string
@@ -306,6 +324,7 @@ export class ZenAdapter {
     this.#firstEventMs = options.firstEventMs ?? DEFAULT_FIRST_EVENT_MS
     this.#bodyIdleMs = options.bodyIdleMs ?? DEFAULT_BODY_IDLE_MS
     this.#responsesBodyIdleMs = options.responsesBodyIdleMs ?? RESPONSES_BODY_IDLE_MS
+    this.#siblingBaseUrl = siblingZenBaseUrl(options.zenBaseUrl ?? ZEN_BASE_URL)
     if (options.providerOverride !== undefined) {
       this.#provider = options.providerOverride as never
       this.#responsesProvider = null
@@ -533,7 +552,7 @@ export class ZenAdapter {
     const rotateStory: string[] = []
     for (let attempt = 0; ; attempt += 1) {
       const events = routingContext.run(contextStore, () =>
-        self.#eventsFor(options, context, ids, model),
+        self.#eventsFor(options, context, ids, model, attempt),
       ) as AsyncIterable<PiEvent>
       let deliveredContent = false
       let preContentFailure: { message: string } | null = null
@@ -655,9 +674,13 @@ export class ZenAdapter {
       const failureMessage = (preContentFailure as { message: string }).message
       const failure = classifyStreamFailure(failureMessage)
       const deterministic = isRegionBlocked(failureMessage)
+      // One pool-less replay on the sibling host when the lane refuses before any
+      // content has reached the user; the pool delegate is otherwise the only thing
+      // that can make this true.
       const rotate = failure !== null
         && attempt < MAX_ROTATES
-        && shouldRotate(failure, options.model, ids.session, attempt + 1, deterministic)
+        && (shouldRotate(failure, options.model, ids.session, attempt + 1, deterministic)
+          || (failure === 'refused' && attempt < 1))
       rotateStory.push(`#${attempt + 1} ${failure ?? 'unknown'}: ${failureMessage.slice(0, 80)}`)
       if (!rotate) {
         // last resort: rewrite the terminal error to tell the whole story
@@ -691,6 +714,7 @@ export class ZenAdapter {
     context: PiContext,
     ids: ReturnType<typeof deriveRequestIDs>,
     model: ReturnType<typeof toPiModel>,
+    attempt = 0,
   ): unknown {
     // Structural boundary: PiContext (own types, unit-tested) -> pi-ai Context.
     const isResponses = model.api === 'openai-responses'
@@ -721,11 +745,19 @@ export class ZenAdapter {
             if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return shaped
             return { ...((shaped ?? payload) as Record<string, unknown>), reasoning_effort: effortWire }
           }
+    // pi-ai reads the request URL from the model, not from the provider
+    // (dist/api/openai-completions.js: `baseURL: model.baseUrl`): a second provider
+    // moves nothing, so the sibling replay swaps the model's baseUrl instead.
+    const requestModel = attempt % 2 === 1
+      && this.#siblingBaseUrl !== null
+      && model.baseUrl !== this.#siblingBaseUrl
+      ? { ...model, baseUrl: this.#siblingBaseUrl }
+      : model
     // Responses-only models (muse-spark-*) must hit /responses, not /chat/completions.
     const provider = isResponsesModel(model.id) && this.#responsesProvider
       ? this.#responsesProvider
       : this.#provider
-    return provider.streamSimple(model, context as unknown as Context, {
+    return provider.streamSimple(requestModel, context as unknown as Context, {
       apiKey: ANONYMOUS_KEY,
       sessionId: ids.session,
       headers: disguiseHeaders(ids),

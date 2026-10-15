@@ -455,18 +455,36 @@ test('ensureFreeLaneShape appends only missing gate tools and keeps tool_choice'
 })
 
 test('ensureFreeLaneShape leaves satisfying and non-chat payloads untouched', () => {
+  const parameters = { type: 'object', properties: { value: { type: 'string' } } }
   const both = {
     model: 'm',
     messages: [],
     tools: [
-      { type: 'function', function: { name: 'bash', description: 'x', parameters: {} } },
-      { type: 'function', function: { name: 'read', description: 'x', parameters: {} } },
+      { type: 'function', function: { name: 'bash', description: 'x', parameters } },
+      { type: 'function', function: { name: 'read', description: 'x', parameters } },
     ],
   }
   assert.equal(ensureFreeLaneShape(both), undefined)
   assert.equal(ensureFreeLaneShape({ tools: [] }), undefined, 'no messages = not a chat body')
   assert.equal(ensureFreeLaneShape(null), undefined)
   assert.equal(ensureFreeLaneShape('text'), undefined)
+})
+
+test('an empty-schema gate shell is replaced, not counted as satisfied', () => {
+  // #75 and #78: the lane refuses bash/read with an empty parameters.properties, so a
+  // caller-supplied shell must not be mistaken for a satisfied gate.
+  const shell = (name: string) => ({ type: 'function', function: { name, description: 'shell', parameters: {} } })
+  const next = ensureFreeLaneShape({ model: 'm', messages: [], tools: [shell('bash'), shell('read')] }) as {
+    tools: Array<{ function: { name: string; parameters: { properties?: Record<string, unknown> } } }>
+  }
+  assert.ok(next, 'the payload is rewritten')
+  assert.deepEqual(next.tools.map((tool) => tool.function.name).sort(), ['bash', 'read'])
+  for (const tool of next.tools) {
+    assert.ok(
+      Object.keys(tool.function.parameters.properties ?? {}).length > 0,
+      `${tool.function.name} carries a real schema`,
+    )
+  }
 })
 test('assistant history preserves the Responses API for muse-spark models', async () => {
   const context = await toPiContext(

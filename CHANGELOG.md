@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Free-lane chats no longer end on a transient `403 FreeTierError`. The lane refuses a request shape it accepted minutes earlier, so an attempt refused before any content is replayed once on the sibling host (`/inference` <-> `/zen`), inside the existing rotation cap. pi-ai takes the request URL from the model rather than the provider (`dist/api/openai-completions.js`: `baseURL: model.baseUrl`), so the replay swaps the model's base URL; a second provider moves nothing.
+- The free-lane request follows the gate measured in #74, #75 and #78: `ZEN_BASE_URL` is `/inference`, `x-opencode-request` is no longer sent (any value is refused), `x-opencode-project` carries `global` rather than a `prj_` id, `x-opencode-session-id` repeats the session id, and the injected `bash`/`read` gate tools carry real schemas — an empty-schema shell of a gate name is replaced instead of counted as satisfied. The legacy sidecar's `upstream.zen` follows.
+
 ## 0.3.12 (2026-10-14)
 
 ### Fixed

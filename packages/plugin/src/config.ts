@@ -259,7 +259,7 @@ export async function writeAgentConfig(
     anonymous: true,
     zen_keys: [],
     go_keys: [],
-    upstream: { zen: 'https://opencode.ai/zen' },
+    upstream: { zen: 'https://opencode.ai/inference' },
     models: { refresh_seconds: options.refreshSeconds },
     retry: { max_attempts: 2, timeout_seconds: 300 },
     proxies: ['direct'],

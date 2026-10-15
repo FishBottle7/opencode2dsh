@@ -14,7 +14,7 @@ import { opencodeUserAgent } from './ids.ts'
  * /v1/models-equivalent exposure = S1 ∩ S2-allowed (or S3 while S1 is pending).
  */
 
-export const ZEN_BASE_URL = 'https://opencode.ai/zen'
+export const ZEN_BASE_URL = 'https://opencode.ai/inference'
 
 /**
  * Free-lane blocklist (issue #56 live matrix, 2026-10-10): models the live

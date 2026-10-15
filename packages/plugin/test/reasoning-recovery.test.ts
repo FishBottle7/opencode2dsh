@@ -96,7 +96,10 @@ test('reasoning-only length retries once with Off, streams immediately and aggre
   assert.deepEqual(calls[1]!.context, calls[0]!.context, 'retry uses the original conversation')
   assert.equal(calls[1]!.options.maxTokens, 64)
   assert.equal(calls[1]!.options.headers['x-opencode-session'], calls[0]!.options.headers['x-opencode-session'])
-  assert.notEqual(calls[1]!.options.headers['x-opencode-request'], calls[0]!.options.headers['x-opencode-request'])
+  assert.equal(calls[1]!.options.headers['x-opencode-session-id'], calls[0]!.options.headers['x-opencode-session-id'])
+  // The synthesized request header is gone (#75); the session id is the correlation
+  // the free lane keeps, and the retry reuses it so prompt-cache affinity survives.
+  assert.equal(calls[1]!.options.headers['x-opencode-request'], undefined)
   assert.deepEqual(chunks.filter((c) => c.type === 'block-start').map((c) => c.index), [0, 1])
   assert.deepEqual(chunks.filter((c) => c.type === 'block-end').map((c) => c.index), [0, 1])
   assert.equal(chunks.find((c) => c.type === 'text-delta')?.index, 1)
@@ -185,15 +188,19 @@ test('cancellation after the first request prevents recovery and preserves its u
 
 test('retry failures keep their actual finish reason and account for the failed first attempt', async () => {
   for (const stopReason of ['error', 'aborted'] as const) {
+    const refused: PiEvent[] = [{ type: 'error', error: message({ stopReason, content: [], errorMessage: '403 invalid API key',
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 },
+    }) }]
     const { adapter, calls } = scripted([
       [...thinking(), { type: 'done', message: message() }],
-      [{ type: 'error', error: message({ stopReason, content: [], errorMessage: '403 invalid API key',
-        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 },
-      }) }],
+      refused,
+      // A 403 before content is refused, so the adapter replays it once on the
+      // sibling host; that attempt fails the same way and the error surfaces.
+      refused,
     ])
     const controller = new AbortController()
     const chunks = await collect(adapter, { ...options, signal: controller.signal })
-    assert.equal(calls.length, 2)
+    assert.equal(calls.length, 3)
     assert.equal(calls[1]!.options.signal, controller.signal)
     const finish = chunks.at(-1)
     assert.equal(finish?.type, 'finish')

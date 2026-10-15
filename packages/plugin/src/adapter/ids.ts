@@ -175,15 +175,20 @@ export function opencodeUserAgent(): string {
 /**
  * The full disguise header set sent with every upstream request
  * (design.md 2.4; gateway.go newUpstreamRequest:640-669).
+ *
+ * `x-opencode-request` is never sent — any value is refused (#75). The project
+ * header carries `global` rather than a `prj_` id, which is refused too (#75).
+ * `x-opencode-session-id` repeats the session id, required once the User-Agent
+ * claims an opencode release above 1.18.33 (#74, #78).
  */
 export function disguiseHeaders(ids: RequestIDs): Record<string, string> {
   return {
     'user-agent': opencodeUserAgent(),
     'x-opencode-client': 'cli',
     'x-opencode-session': ids.session,
+    'x-opencode-session-id': ids.session,
     'x-session-affinity': ids.session,
     'X-Session-Id': ids.session,
-    'x-opencode-request': ids.request,
-    'x-opencode-project': ids.project,
+    'x-opencode-project': 'global',
   }
 }

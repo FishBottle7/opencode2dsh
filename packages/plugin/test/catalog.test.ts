@@ -4,7 +4,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import assert from 'node:assert/strict'
 import { opencodeUserAgent } from '../src/adapter/ids.ts'
-import { decodeModelsDev, decide, fetchZenModels, FREE_LANE_BLOCKLIST, isFreeModel, ModelCatalog, staticFreeModels } from '../src/adapter/catalog.ts'
+import { decodeModelsDev, decide, fetchZenModels, FREE_LANE_BLOCKLIST, isFreeModel, ModelCatalog, staticFreeModels, ZEN_BASE_URL } from '../src/adapter/catalog.ts'
+
+/** The live models endpoint, derived from the adapter's own base URL so an endpoint
+ *  move cannot leave a silently dead literal behind (#75). */
+const ZEN_MODELS_URL = `${ZEN_BASE_URL.replace(/\/+$/, '')}/v1/models`
 
 function price(input?: number, output?: number, deprecated = false, reasoning = false) {
   return { input, output, deprecated, reasoning }
@@ -138,7 +142,7 @@ test('decodeModelsDev extracts the reasoning flag and declared effort ladders', 
 test('ModelCatalog.reasoningCapability reads the parsed metadata', async () => {
   const catalog = new ModelCatalog({
     fetchImpl: fakeFetch({
-      'https://opencode.ai/zen/v1/models': zenBody,
+      [ZEN_MODELS_URL]: zenBody,
       'https://models.dev/api.json': {
         opencode: {
           models: {
@@ -192,7 +196,7 @@ test('decodeModelsDev extracts the declared context/output limits', () => {
 test('ModelCatalog.limits speaks only when the metadata declares them', async () => {
   const catalog = new ModelCatalog({
     fetchImpl: fakeFetch({
-      'https://opencode.ai/zen/v1/models': zenBody,
+      [ZEN_MODELS_URL]: zenBody,
       'https://models.dev/api.json': {
         opencode: {
           models: {
@@ -247,7 +251,7 @@ test('decodeModelsDev extracts the declared input modalities', () => {
 test('ModelCatalog.modalities speaks only when the metadata declares them', async () => {
   const catalog = new ModelCatalog({
     fetchImpl: fakeFetch({
-      'https://opencode.ai/zen/v1/models': zenBody,
+      [ZEN_MODELS_URL]: zenBody,
       'https://models.dev/api.json': {
         opencode: {
           models: {
@@ -323,21 +327,21 @@ test('start() fast-retries while the live catalog is empty, then settles into th
 
 test('fetchZenModels sends the anonymous CLI disguise and parses ids', async () => {
   const capture: { url?: string; init?: RequestInit } = {}
-  const ids = await fetchZenModels('https://opencode.ai/zen/', fakeFetch({ 'https://opencode.ai/zen/v1/models': zenBody }, capture), opencodeUserAgent())
+  const ids = await fetchZenModels(`${ZEN_BASE_URL}/`, fakeFetch({ [ZEN_MODELS_URL]: zenBody }, capture), opencodeUserAgent())
   assert.deepEqual(ids, ['qwen-free', 'paid-model', 'ghost-free', 'legacy-free'])
-  assert.equal(capture.url, 'https://opencode.ai/zen/v1/models')
+  assert.equal(capture.url, ZEN_MODELS_URL)
   const headers = new Headers(capture.init?.headers)
   assert.equal(headers.get('authorization'), 'Bearer public')
   assert.equal(headers.get('x-opencode-client'), 'cli')
   assert.ok(headers.get('user-agent')?.startsWith('opencode/'))
   await assert.rejects(
-    fetchZenModels('https://opencode.ai/zen', fakeFetch({ 'https://opencode.ai/zen/v1/models': { data: [] } }), opencodeUserAgent()),
+    fetchZenModels(ZEN_BASE_URL, fakeFetch({ [ZEN_MODELS_URL]: { data: [] } }), opencodeUserAgent()),
     /empty list/,
   )
 })
 
 test('ModelCatalog intersects the live catalog with free decisions', async () => {
-  const catalog = new ModelCatalog({ fetchImpl: fakeFetch({ 'https://opencode.ai/zen/v1/models': zenBody, 'https://models.dev/api.json': metadataBody }) })
+  const catalog = new ModelCatalog({ fetchImpl: fakeFetch({ [ZEN_MODELS_URL]: zenBody, 'https://models.dev/api.json': metadataBody }) })
   try {
     await catalog.refreshOnce()
     // ghost-free (paid metadata) and legacy-free (deprecated metadata) are both
@@ -472,7 +476,7 @@ test('S3 vouch survives a stale deprecated flag but not a paid verdict', async (
   // upstream — a compile-time verified id keeps its vouch until delisted.
   const deprecatedFlagged = new ModelCatalog({
     fetchImpl: fakeFetch({
-      'https://opencode.ai/zen/v1/models': { data: [{ id: 'mimo-v2.6-flash-free' }] },
+      [ZEN_MODELS_URL]: { data: [{ id: 'mimo-v2.6-flash-free' }] },
       'https://models.dev/api.json': {
         opencode: { models: { 'mimo-v2.6-flash-free': { status: 'deprecated', cost: { input: 0, output: 0 } } } },
       },
@@ -490,7 +494,7 @@ test('S3 vouch survives a stale deprecated flag but not a paid verdict', async (
   // model the metadata knows is paid.
   const paidVerdict = new ModelCatalog({
     fetchImpl: fakeFetch({
-      'https://opencode.ai/zen/v1/models': { data: [{ id: 'big-pickle' }] },
+      [ZEN_MODELS_URL]: { data: [{ id: 'big-pickle' }] },
       'https://models.dev/api.json': {
         opencode: { models: { 'big-pickle': { cost: { input: 3, output: 4 } } } },
       },
@@ -515,7 +519,7 @@ test('blocklist: issue #56 dead models are denied before any metadata or S3 vouc
   }
   const catalog = new ModelCatalog({
     fetchImpl: fakeFetch({
-      'https://opencode.ai/zen/v1/models': { data: [...FREE_LANE_BLOCKLIST].map((id) => ({ id })) },
+      [ZEN_MODELS_URL]: { data: [...FREE_LANE_BLOCKLIST].map((id) => ({ id })) },
       'https://models.dev/api.json': allFree,
     }),
   })
@@ -546,7 +550,7 @@ test('local overrides win over models.dev fields (issue #56 mimo context window)
   // 1048576 (the MiMo card / official CLI value), other fields pass through.
   const catalog = new ModelCatalog({
     fetchImpl: fakeFetch({
-      'https://opencode.ai/zen/v1/models': { data: [{ id: 'mimo-v2.6-flash-free' }] },
+      [ZEN_MODELS_URL]: { data: [{ id: 'mimo-v2.6-flash-free' }] },
       'https://models.dev/api.json': {
         opencode: {
           models: {
@@ -567,7 +571,7 @@ test('local overrides win over models.dev fields (issue #56 mimo context window)
     // a model the override table does not know keeps the feed's answer
     const plain = new ModelCatalog({
       fetchImpl: fakeFetch({
-        'https://opencode.ai/zen/v1/models': { data: [{ id: 'qwen-free' }] },
+        [ZEN_MODELS_URL]: { data: [{ id: 'qwen-free' }] },
         'https://models.dev/api.json': { opencode: { models: { 'qwen-free': { cost: { input: 0, output: 0 }, limit: { context: 131072 } } } } },
       }),
     })
