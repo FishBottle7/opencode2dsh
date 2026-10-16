@@ -15,8 +15,22 @@
 import { readFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { basename, dirname, resolve as resolvePath, sep } from 'node:path'
-import { transform } from 'lightningcss'
 import type { UserConfig } from 'tsdown'
+
+// lightningcss native binding vs the wasm fallback: hardened node runtimes
+// (platform-signed binaries) refuse every third-party .node addon (AMFI
+// "different Team IDs"), so pick the wasm build when the native one cannot
+// load. Same transform API, no behavioral difference for this config. The two
+// packages' types are structurally close but not identical, so the loader is
+// typed loosely and only `transform` is consumed.
+type CssTransform = typeof import('lightningcss').transform
+async function loadCssTransform(): Promise<CssTransform> {
+  try {
+    return (await import('lightningcss')).transform
+  } catch {
+    return (await import('lightningcss-wasm')).transform as unknown as CssTransform
+  }
+}
 
 const ID = '@opencode2dsh/dsh-plugin'
 
@@ -89,6 +103,7 @@ const config: UserConfig = {
       const fileId = virtualId.slice(CSS_VIRTUAL_PREFIX.length, -CSS_VIRTUAL_SUFFIX.length)
       this.addWatchFile(fileId)
       const source = await readFile(fileId)
+      const transform = await loadCssTransform()
       const { code, exports: cssExports } = transform({
         filename: fileId,
         code: source,

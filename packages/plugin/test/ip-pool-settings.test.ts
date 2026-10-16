@@ -314,7 +314,10 @@ test('routes carry the exact paths and POST-only method guard', async () => {
 
 test('models handler lists S3 static rows plus live catalog through the seam', async () => {
   const handlers = makeBridgeHandlers(() => null, () => ({ pinnedStrict: false, proxyHosts: [] }), {
-    listLiveModels: () => ['muse-spark-1.3-contributor-free', 'big-pickle', 'brand-new-model'],
+    // 2026-10-16 adaptive probe: muse ids moved into staticFreeModels (verified
+    // on the responses lane from this host), so the live-only example must not
+    // be a muse id — any live id absent from S3 appends unverified.
+    listLiveModels: () => ['jev-1.13-free', 'big-pickle', 'brand-new-model'],
   })
   const result = await handlers.models()
   assert.equal(result.ok, true)
@@ -323,7 +326,7 @@ test('models handler lists S3 static rows plus live catalog through the seam', a
   assert.deepEqual(value.models.slice(0, staticFreeModels.length).map((row) => row.verified), staticFreeModels.map(() => true))
   // big-pickle deduped (already static), live-only rows appended unverified
   const ids = value.models.map((row) => row.id)
-  assert.equal(ids.indexOf('muse-spark-1.3-contributor-free') >= staticFreeModels.length, true, 'live-only row appended after statics')
+  assert.equal(ids.indexOf('jev-1.13-free') >= staticFreeModels.length, true, 'live-only row appended after statics')
   assert.equal(ids.lastIndexOf('big-pickle'), ids.indexOf('big-pickle'), 'no duplicate big-pickle')
   assert.equal(value.models.find((row) => row.id === 'brand-new-model')?.verified, false)
 })

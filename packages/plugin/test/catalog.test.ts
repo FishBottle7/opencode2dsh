@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import assert from 'node:assert/strict'
 import { opencodeUserAgent } from '../src/adapter/ids.ts'
-import { decodeModelsDev, decide, fetchZenModels, FREE_LANE_BLOCKLIST, isFreeModel, ModelCatalog, staticFreeModels } from '../src/adapter/catalog.ts'
+import { decodeModelsDev, decide, fetchZenModels, FREE_LANE_BLOCKLIST, FREE_LANE_PROBE_SET, isFreeModel, ModelCatalog, staticFreeModels, ZEN_BASE_URL } from '../src/adapter/catalog.ts'
 
 function price(input?: number, output?: number, deprecated = false, reasoning = false) {
   return { input, output, deprecated, reasoning }
@@ -285,8 +285,10 @@ function fakeFetch(routes: Record<string, unknown>, capture: { url?: string; ini
 }
 
 const zenBody = { data: [{ id: 'qwen-free' }, { id: 'paid-model' }, { id: 'ghost-free' }, { id: 'legacy-free' }] }
-/** The pending-catalog bootstrap list: S3 minus the issue #56 blocklist. */
-const bootstrapList = staticFreeModels.filter((id) => !FREE_LANE_BLOCKLIST.has(id))
+/** The pending-catalog bootstrap list: S3 minus the never-serve blocklist, minus
+ * the probe set (vantage-point ids stay hidden until this host's own probe
+ * answers pass — the conservative issue #56 default (2026-10-16 adaptive probe). */
+const bootstrapList = staticFreeModels.filter((id) => !FREE_LANE_BLOCKLIST.has(id) && !FREE_LANE_PROBE_SET.has(id))
 const metadataBody = {
   opencode: {
     models: {
@@ -626,5 +628,41 @@ test('stale-while-revalidate: a fresh disk cache serves capability reads while t
     catalog.stop()
     releaseFetch!()
     await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('adaptive probe: a pass exposes the muse ids, a refusal keeps them hidden', async () => {
+  // 2026-10-16: the issue #56 matrix was one vantage point. The catalog now
+  // re-verifies the probe set from this host's exit and flips visibility on
+  // the verdict — muse on Taiwan egress answers 200, so it must appear.
+  const catalog = new ModelCatalog({
+    fetchImpl: fakeFetch({
+      // Derived from the adapter's own base URL: #80 moves it /zen -> /inference,
+      // and a hardcoded literal here would silently stop matching the fetch.
+      [`${ZEN_BASE_URL.replace(/\/+$/, '')}/v1/models`]: { data: [...FREE_LANE_PROBE_SET].map((id) => ({ id })) },
+    }),
+    probeDisabled: true, // no background timer; drive the round manually
+    probeImpl: async (model, api) => {
+      assert.equal(api, 'openai-responses', 'muse ids speak the Responses lane')
+      return model.includes('1.3') ? 'pass' : 'refused'
+    },
+  })
+  try {
+    await catalog.refreshOnce()
+    // before any probe round the conservative default hides everything
+    assert.equal(catalog.list().length, 0)
+    await catalog.probeOnce()
+    assert.deepEqual(catalog.list(), ['muse-spark-1.3-contributor-free'])
+    assert.deepEqual(catalog.decision('muse-spark-1.3-contributor-free'), { allowed: true, source: 'name_free', known: false })
+    assert.equal(catalog.decision('muse-spark-1.2-contributor-free').allowed, false, 'refused probe stays hidden')
+    assert.ok(!FREE_LANE_BLOCKLIST.has('muse-spark-1.3-contributor-free'), 'the never-serve blocklist shrunk to protocol-level denials')
+    assert.deepEqual(catalog.probeVerdicts(), {
+      'exo-free': 'error',
+      'ling-3.0-flash-fin-free': 'error',
+      'muse-spark-1.2-contributor-free': 'refused',
+      'muse-spark-1.3-contributor-free': 'pass',
+    }, 'verdicts are exposed for healthz')
+  } finally {
+    catalog.stop()
   }
 })

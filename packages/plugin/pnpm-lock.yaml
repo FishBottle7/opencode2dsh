@@ -57,6 +57,9 @@ importers:
       '@deepseek-ai/dsh-settings':
         specifier: ^0.1.1-rc.2
         version: 0.1.1-rc.2(@deepseek-ai/cordis@4.0.4)(@deepseek-ai/dsh-brand@0.1.7-rc.2(@deepseek-ai/cordis@4.0.4))(@deepseek-ai/dsh-invariants@0.1.1-rc.2(@deepseek-ai/cordis@4.0.4))(@deepseek-ai/schemastery@3.18.4)
+      '@rolldown/binding-wasm32-wasi':
+        specifier: 1.0.0-beta.45
+        version: 1.0.0-beta.45(@emnapi/core@1.11.3)(@emnapi/runtime@1.11.3)
       '@types/node':
         specifier: ^24.0.0
         version: 24.13.3
@@ -66,6 +69,9 @@ importers:
       lightningcss:
         specifier: 1.32.0
         version: 1.32.0
+      lightningcss-wasm:
+        specifier: ^1.33.0
+        version: 1.33.0
       react:
         specifier: ^18.3.1
         version: 18.3.1
@@ -1239,6 +1245,12 @@ packages:
     cpu: [x64]
     os: [linux]
     libc: [musl]
+
+  lightningcss-wasm@1.33.0:
+    resolution: {integrity: sha512-OLAtqEyInBSVWjPrTjpLzcZUMUHO0q+2PFBXKr86nxZOu0P38givj/ZMtRaZ0d38pMTb9wQx+LtaLtHclv+sEA==}
+    engines: {node: '>= 12.0.0'}
+    bundledDependencies:
+      - napi-wasm
 
   lightningcss-win32-arm64-msvc@1.32.0:
     resolution: {integrity: sha512-8SbC8BR40pS6baCM8sbtYDSwEVQd4JlFTOlaD3gWGHfThTcABnNDBda6eTZeqbofalIJhFx0qKzgHJmcPTnGdw==}
@@ -2483,17 +2495,14 @@ snapshots:
     dependencies:
       '@emnapi/wasi-threads': 1.2.3
       tslib: 2.8.1
-    optional: true
 
   '@emnapi/runtime@1.11.3':
     dependencies:
       tslib: 2.8.1
-    optional: true
 
   '@emnapi/wasi-threads@1.2.3':
     dependencies:
       tslib: 2.8.1
-    optional: true
 
   '@google/genai@1.52.0':
     dependencies:
@@ -2537,7 +2546,6 @@ snapshots:
       '@emnapi/core': 1.11.3
       '@emnapi/runtime': 1.11.3
       '@tybys/wasm-util': 0.10.3
-    optional: true
 
   '@opentelemetry/api@1.9.0': {}
 
@@ -2605,7 +2613,6 @@ snapshots:
     transitivePeerDependencies:
       - '@emnapi/core'
       - '@emnapi/runtime'
-    optional: true
 
   '@rolldown/binding-win32-arm64-msvc@1.0.0-beta.45':
     optional: true
@@ -2676,7 +2683,6 @@ snapshots:
   '@tybys/wasm-util@0.10.3':
     dependencies:
       tslib: 2.8.1
-    optional: true
 
   '@types/node@24.13.3':
     dependencies:
@@ -2864,6 +2870,8 @@ snapshots:
 
   lightningcss-linux-x64-musl@1.32.0:
     optional: true
+
+  lightningcss-wasm@1.33.0: {}
 
   lightningcss-win32-arm64-msvc@1.32.0:
     optional: true

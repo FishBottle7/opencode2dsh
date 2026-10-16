@@ -1,7 +1,9 @@
 import { readFile, rename, rm, writeFile, mkdir } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
-import { opencodeUserAgent } from './ids.ts'
+import { deriveRequestIDs, disguiseHeaders, opencodeUserAgent } from './ids.ts'
+import { FREE_LANE_GATE_TOOL_NAMES, freeLaneGateTool } from './messages.ts'
+import { apiForModel } from './routing.ts'
 
 /**
  * Port of agent/internal/catalog (opencode2api models.go + model_metadata.go,
@@ -18,21 +20,44 @@ export const ZEN_BASE_URL = 'https://opencode.ai/zen'
 
 /**
  * Free-lane blocklist (issue #56 live matrix, 2026-10-10): models the live
- * chat lane can never serve. The Zen catalog still lists them, so S1 alone
- * exposes dead ids — one exclusion reason per model:
+ * chat lane has refused to serve from at least one vantage point. The Zen
+ * catalog still lists them, so S1 alone would expose ids that are dead from
+ * the reporter's network — one exclusion reason per model at the time of
+ * writing:
  *   exo-free                             410 ModelDeprecated (upstream delisted)
  *   jev-1.13-free                        400 ModelProtocolUnsupported (SystemOne-only)
  *   ling-3.0-flash-fin-free              400 "Model is unavailable" (upstream-side)
  *   muse-spark-1.*-contributor-free      403 RegionError, chat and responses alike
- * Remove an entry only after a live probe of the chat lane answers 200/429.
+ *
+ * The blocklist is a VANTAGE-POINT claim, not a law of physics: issue #56's
+ * matrix was measured from one egress, and the same ids answer HTTP 200 from
+ * other networks (2026-10-16, Taiwan egress: both muse ids stream 200 on
+ * /zen/v1/responses with the faithful adapter shape). `FREE_LANE_BLOCKLIST`
+ * below therefore names only the models that can NEVER serve — a protocol
+ * mismatch no amount of retrying fixes. Everything else moves to
+ * `FREE_LANE_PROBE_SET` and is re-verified per egress by the catalog's
+ * adaptive probe (see ModelCatalog.#probeRound): a model that answers
+ * 200/429 is exposed, one that answers the recorded refusal status is kept
+ * hidden, and a probe that errors is left hidden until the next round.
  */
 export const FREE_LANE_BLOCKLIST: ReadonlySet<string> = new Set([
+  'jev-1.13-free', // 400 ModelProtocolUnsupported on chat AND responses — SystemOne-only
+])
+
+/** Blocklist candidates re-checked per egress by the adaptive probe.
+ * Seeded from the issue #56 matrix minus the never-serve protocol id. */
+export const FREE_LANE_PROBE_SET: ReadonlySet<string> = new Set([
   'exo-free',
-  'jev-1.13-free',
   'ling-3.0-flash-fin-free',
   'muse-spark-1.2-contributor-free',
   'muse-spark-1.3-contributor-free',
 ])
+
+/** Probe verdicts per model, surviving one catalog instance (per host boot). */
+export type ProbeVerdict = 'pass' | 'refused' | 'error'
+
+/** Probe cadence: first round right after warm()'s window, then every 30min. */
+export const PROBE_INTERVAL_MS = 30 * 60 * 1000
 
 /** Previously verified models still in the public roster (checked 2026-10-13).
  * New ids arrive through the live directory, which republishes the picker. */
@@ -40,6 +65,8 @@ export const staticFreeModels: string[] = [
   'big-pickle', // verified 2026-08-28: anonymous chat 200 (non-stream + stream)
   'mimo-v2.6-flash-free', // verified 2026-10-03: anonymous chat 200 (stream, adapter path); successor of mimo-v2.5-free
   'nemotron-3.5-lightning-free', // verified 2026-09-01: anonymous chat 200
+  'muse-spark-1.2-contributor-free', // verified 2026-10-16: /zen/v1/responses 200 (Taiwan egress; see FREE_LANE_PROBE_SET)
+  'muse-spark-1.3-contributor-free', // verified 2026-10-16: /zen/v1/responses 200 (Taiwan egress; see FREE_LANE_PROBE_SET)
 ]
 
 /** Exposed by /v1/models but without a verified anonymous chat yet. */
@@ -250,6 +277,12 @@ export interface CatalogOptions {
   onRefresh?: (status: CatalogSnapshot, lastError: string) => void
   /** Delay between startup retries while the live catalog is empty (default 15s). */
   startupRetryMs?: number
+  /** Disable the adaptive probe round (tests; default runs it). */
+  probeDisabled?: boolean
+  /** Probe cadence override in ms (tests use a small value). */
+  probeIntervalMs?: number
+  /** Probe implementation override (tests inject a canned verdict source). */
+  probeImpl?: (model: string, api: 'openai-responses' | 'openai-completions') => Promise<ProbeVerdict>
 }
 
 const METADATA_REFRESH_MS = 24 * 60 * 60 * 1000
@@ -284,6 +317,13 @@ export class ModelCatalog {
   #startupRetryMs: number
   /** In-flight refresh round (deduped so warm() shares start()'s first fetch). */
   #refreshing: Promise<void> | null = null
+  #probeDisabled: boolean
+  #probeIntervalMs: number
+  #probeImpl: (model: string, api: 'openai-responses' | 'openai-completions') => Promise<ProbeVerdict>
+  /** Adaptive-probe state: pass = exposed, refused/error = hidden this boot. */
+  #probeVerdicts: Map<string, ProbeVerdict> = new Map()
+  #probeTimer: NodeJS.Timeout | null = null
+  #probing: Promise<void> | null = null
 
   constructor(options: CatalogOptions = {}) {
     this.#refreshSeconds = options.refreshSeconds ?? 300
@@ -294,6 +334,9 @@ export class ModelCatalog {
     this.#now = options.now ?? Date.now
     this.#onRefresh = options.onRefresh
     this.#startupRetryMs = options.startupRetryMs ?? 15_000
+    this.#probeDisabled = options.probeDisabled ?? false
+    this.#probeIntervalMs = options.probeIntervalMs ?? PROBE_INTERVAL_MS
+    this.#probeImpl = options.probeImpl ?? defaultProbeImpl(this.#zenBaseUrl, this.#fetch)
   }
 
   /**
@@ -315,6 +358,12 @@ export class ModelCatalog {
       void this.refreshOnce()
     }, this.#refreshSeconds * 1000)
     this.#timer.unref?.()
+    // First adaptive-probe round: after warm()'s 4s window so a real catalog
+    // is in place (probe results decide picker visibility for the probe set).
+    if (!this.#probeDisabled) {
+      const probeTimer = setTimeout(() => void this.probeOnce(), 5_000)
+      probeTimer.unref?.()
+    }
   }
 
   stop(): void {
@@ -322,6 +371,10 @@ export class ModelCatalog {
     if (this.#timer) {
       clearInterval(this.#timer)
       this.#timer = null
+    }
+    if (this.#probeTimer) {
+      clearTimeout(this.#probeTimer)
+      this.#probeTimer = null
     }
   }
 
@@ -429,6 +482,13 @@ export class ModelCatalog {
     // delisted / 400 unavailable / 403 region) — deny before any metadata or
     // S3 vouch, so a stale cache or the bootstrap list cannot resurrect it.
     if (FREE_LANE_BLOCKLIST.has(model)) return { allowed: false, source: 'local_blocklist', known: true }
+    // Vantage-point blocklist entries (FREE_LANE_PROBE_SET): hidden until this
+    // host's own probe answers pass. Before the first probe round completes
+    // the seeded default is 'refused' (issue #56's verdict) — conservative,
+    // never worse than the shipped blocklist.
+    if (FREE_LANE_PROBE_SET.has(model) && this.#probeVerdicts.get(model) !== 'pass') {
+      return { allowed: false, source: 'probe_pending', known: false }
+    }
     const metadata = decide(model, this.#prices, this.#pricesReady)
     // The S3 vouch only covers ids metadata cannot speak for. A metadata
     // verdict of deprecated is Known, but S3 entries are compile-time verified
@@ -446,12 +506,63 @@ export class ModelCatalog {
 
   /** ids exposed to DSH: S1 ∩ allowed, or S3 while the live catalog is pending. */
   list(): string[] {
-    if (this.#zen.size === 0) return this.#zenFailed ? [] : staticFreeModels.filter((model) => !FREE_LANE_BLOCKLIST.has(model))
+    if (this.#zen.size === 0) return this.#zenFailed ? [] : staticFreeModels.filter((model) => this.decision(model).allowed)
     const out: string[] = []
     for (const model of this.#zen) {
       if (this.decision(model).allowed) out.push(model)
     }
     return out.sort()
+  }
+
+  /**
+   * Adaptive vantage-point probe (2026-10-16): models the issue #56 live
+   * matrix refused from one egress answer 200 from others; this host's own
+   * exit is the only verdict that matters, so probe those ids directly and
+   * expose them when the lane answers 200/429.
+   *
+   * One round: probe every FREE_LANE_PROBE_SET id that is still in the live
+   * Zen catalog, store the verdict, schedule the next round. A probe uses a
+   * 1-token streaming request on the lane the model actually speaks
+   * (apiForModel: muse → Responses, everything else → chat), with the
+   * adapter's canonical session id and disguise headers so a pass here is
+   * exactly what a real turn would send. Verdicts are per boot; refused
+   * models are retried on the next round, so an upstream unblock or a
+   * threshold flip is picked up without a host restart.
+   */
+  async #probeRound(): Promise<void> {
+    if (this.#stopped) return
+    const ids = [...FREE_LANE_PROBE_SET].filter((id) => this.#zen.has(id))
+    if (ids.length === 0) return
+    const nextRound = () => {
+      if (this.#stopped || this.#probeDisabled) return
+      this.#probeTimer = setTimeout(() => void this.probeOnce(), this.#probeIntervalMs)
+      this.#probeTimer.unref?.()
+    }
+    for (const model of ids) {
+      const api = apiForModel(model)
+      const verdict = await this.#probeImpl(model, api).catch(() => 'error' as ProbeVerdict)
+      this.#probeVerdicts.set(model, verdict)
+    }
+    this.#onRefresh?.(this.snapshot(), this.#lastError)
+    nextRound()
+  }
+
+  /** Public entry: run one probe round, deduped like refreshOnce(). Manual
+   * calls always run (tests drive the round this way); probeDisabled only
+   * suppresses the scheduled timers so a disabled catalog never probes on
+   * its own. */
+  probeOnce(): Promise<void> {
+    if (this.#probing === null) {
+      this.#probing = this.#probeRound().finally(() => {
+        this.#probing = null
+      })
+    }
+    return this.#probing
+  }
+
+  /** Current adaptive-probe verdicts (healthz/observability). */
+  probeVerdicts(): Record<string, ProbeVerdict> {
+    return Object.fromEntries(this.#probeVerdicts)
   }
 
   /**
@@ -571,4 +682,82 @@ async function loadMetadataCache(path: string, now: () => number = Date.now): Pr
 /** Default cache location next to the agent data dir (config.ts convention). */
 export function defaultCachePath(dataDir: string): string {
   return join(dataDir, 'agent-config.json.models.dev.json')
+}
+
+// ---------------------------------------------------------------------------
+// Adaptive vantage-point probe
+// ---------------------------------------------------------------------------
+
+const PROBE_TIMEOUT_MS = 15_000
+
+/**
+ * The probe speaks the same wire shape the adapter uses for a real turn:
+ * canonical ses_ id + disguise headers + gate tools + streaming, 1 output
+ * token. Verdict mapping mirrors the catalog philosophy (design.md): any
+ * status the gate itself issues on a healthy lane (200, or the free-lane
+ * throttle 429) counts as pass; the recorded refusal statuses count as
+ * refused; transport/API errors count as error (hidden until next round).
+ */
+export function defaultProbeImpl(
+  zenBaseUrl: string,
+  fetchImpl: typeof fetch,
+): (model: string, api: 'openai-responses' | 'openai-completions') => Promise<ProbeVerdict> {
+  const base = zenBaseUrl.replace(/\/+$/, '')
+  return async (model, api) => {
+    const ids = deriveRequestIDs([{ role: 'user', content: 'probe' }])
+    const headers: Record<string, string> = {
+      ...disguiseHeaders(ids),
+      'content-type': 'application/json',
+    }
+    let url: string
+    let body: unknown
+    if (api === 'openai-responses') {
+      url = `${base}/v1/responses`
+      body = {
+        model,
+        input: [{ role: 'user', content: [{ type: 'input_text', text: 'probe' }] }],
+        stream: true,
+        max_output_tokens: 16,
+        tools: FREE_LANE_GATE_TOOL_NAMES.map((name) => ({ type: 'function', ...freeLaneGateTool(name).function })),
+        tool_choice: 'auto',
+      }
+    } else {
+      url = `${base}/v1/chat/completions`
+      body = {
+        model,
+        messages: [{ role: 'user', content: 'probe', timestamp: 0 }],
+        stream: true,
+        max_tokens: 8,
+        tools: FREE_LANE_GATE_TOOL_NAMES.map((name) => freeLaneGateTool(name)),
+        tool_choice: 'none',
+      }
+    }
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS)
+    try {
+      const response = await fetchImpl(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      })
+      // Drain a little of the body so the upstream sees a real stream
+      // consumer, then discard: a probe must not charge quota or hold sockets.
+      if (response.body) {
+        const reader = response.body.getReader()
+        try {
+          await reader.read()
+        } finally {
+          reader.cancel().catch(() => {})
+        }
+      }
+      if (response.status === 200 || response.status === 429) return 'pass'
+      if (response.status === 403 || response.status === 400 || response.status === 410) return 'refused'
+      return 'error'
+    } catch {
+      return 'error'
+    } finally {
+      clearTimeout(timer)
+    }
+  }
 }
