@@ -541,6 +541,55 @@ test('blocklist: issue #56 dead models are denied before any metadata or S3 vouc
   }
 })
 
+test('the deepseek-v4.1 free lane keeps its full context window (issue #81)', async () => {
+  // models.dev puts the free and paid twins of one canonical model in different
+  // limit buckets: deepseek-v4.1-flash-free declares 200000 while
+  // deepseek-v4.1-flash declares 1000000. Needle probes of the free lane recall
+  // at 1,011,668 prompt tokens, so the override speaks 1048576 and leaves every
+  // other declared field alone.
+  const catalog = new ModelCatalog({
+    fetchImpl: fakeFetch({
+      'https://opencode.ai/zen/v1/models': { data: [{ id: 'deepseek-v4.1-flash-free' }] },
+      'https://models.dev/api.json': {
+        opencode: {
+          models: {
+            'deepseek-v4.1-flash-free': {
+              cost: { input: 0, output: 0 },
+              limit: { context: 200000, output: 32000 },
+              modalities: { input: ['text'] },
+            },
+          },
+        },
+      },
+    }),
+  })
+  try {
+    await catalog.refreshOnce()
+    assert.deepEqual(catalog.limits('deepseek-v4.1-flash-free'), { contextWindow: 1048576, maxOutput: 32000 })
+    // the override only touches `contextWindow`; nothing else is invented
+    assert.deepEqual(catalog.modalities('deepseek-v4.1-flash-free'), ['text'])
+    assert.equal(catalog.decision('deepseek-v4.1-flash-free').allowed, true)
+    // the same 200000 bucket claims other models too; with no live evidence for
+    // them, the feed still speaks unchanged (no blanket widening)
+    const control = new ModelCatalog({
+      fetchImpl: fakeFetch({
+        'https://opencode.ai/zen/v1/models': { data: [{ id: 'glm-5.3-flash-free' }] },
+        'https://models.dev/api.json': {
+          opencode: { models: { 'glm-5.3-flash-free': { cost: { input: 0, output: 0 }, limit: { context: 200000, output: 32000 } } } },
+        },
+      }),
+    })
+    try {
+      await control.refreshOnce()
+      assert.deepEqual(control.limits('glm-5.3-flash-free'), { contextWindow: 200000, maxOutput: 32000 })
+    } finally {
+      control.stop()
+    }
+  } finally {
+    catalog.stop()
+  }
+})
+
 test('local overrides win over models.dev fields (issue #56 mimo context window)', async () => {
   // models.dev declares 200000 for mimo-v2.6-flash-free; the override speaks
   // 1048576 (the MiMo card / official CLI value), other fields pass through.

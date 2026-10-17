@@ -106,14 +106,24 @@ export function decide(model: string, prices: Map<string, ModelPrice>, ready: bo
 }
 
 /**
- * models.dev fields the plugin knowingly overrides (issue #56 metadata note):
- * the feed declares `mimo-v2.6-flash-free` with `limit.context: 200000`, while
- * the MiMo V2.6 Flash model card and the official OpenCode CLI config use
- * 1048576. Checked BEFORE the metadata in `limits()`/`reasoningCapability()`/
+ * models.dev fields the plugin knowingly overrides (issue #56 metadata note).
+ * Checked BEFORE the metadata in `limits()`/`reasoningCapability()`/
  * `modalities()` — a fixed feed deletes its entry here.
+ *
+ * Both entries are free/paid twins of one canonical model where the feed gives
+ * the free lane a smaller window than the paid one:
+ *
+ * - `mimo-v2.6-flash-free`: declares `limit.context: 200000`, while the MiMo
+ *   V2.6 Flash model card and the official OpenCode CLI config use 1048576.
+ * - `deepseek-v4.1-flash-free`: declares `limit.context: 200000` while its paid
+ *   twin `deepseek-v4.1-flash` (same canonical id
+ *   `deepseek/deepseek-v4.1-flash`) declares 1000000. Needle-in-a-haystack
+ *   probes of the live free lane (2026-10-16) recall correctly at
+ *   1,011,668 prompt tokens, so the window is at least that (#81).
  */
 const LOCAL_MODEL_OVERRIDES: Readonly<Record<string, Partial<ModelPrice>>> = {
   'mimo-v2.6-flash-free': { contextWindow: 1048576 },
+  'deepseek-v4.1-flash-free': { contextWindow: 1048576 },
 }
 
 /** Shallow per-field override: declared fields win, the rest pass through. */
