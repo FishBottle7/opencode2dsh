@@ -13,6 +13,7 @@ import {
   routingContext,
 } from '../src/pool/dispatcher.ts'
 import { RoutingInstaller } from '../src/pool/installer.ts'
+import { classifyStreamFailure } from '../src/pool/rotate.ts'
 
 function node(overrides: Partial<ExitNode> = {}): ExitNode {
   return {
@@ -341,6 +342,100 @@ test('dispatcher passive signal: 403 marks the model, transport errors strike de
   })
   assert.equal(pool.passiveStats('a:1').transport, 1)
   assert.equal(pool.isUsable('a:1', 'other'), false, 'transport failure strikes the exit dead')
+})
+
+test('dispatcher forwards a real transport error once, in one piece', () => {
+  // `onResponseError` used to call the transport classifier before forwarding,
+  // and that classifier also *injects* a synthesized error into the handler —
+  // because when the exit is a blackhole nothing else ever comes. On a real
+  // transport failure undici has already reported to us, so the handler got
+  // two calls: first the fabricated `exit response silence`, then the genuine
+  // `connect ECONNREFUSED …`, which lands on an already-settled promise and is
+  // dropped. The fabricated message matches none of classifyStreamFailure's
+  // patterns, so `rotate` stayed false for exactly the failure the rotation
+  // loop exists to cover.
+  const pool = new ExitPool()
+  pool.add(node({ id: 'a:1', exitIP: '1.1.1.1', latencyMs: 10 }))
+  pool.markOk('a:1')
+  const real = new Error('connect ECONNREFUSED 10.255.255.1:9999')
+  const undici = {
+    Agent: class { constructor() { return { dispatch: () => true, close: () => Promise.resolve(), destroy: () => Promise.resolve() } } },
+    ProxyAgent: class {
+      constructor() {
+        return {
+          dispatch(_o: unknown, handler: { onResponseError?: (c: unknown, e: Error) => void }): boolean {
+            handler.onResponseError?.({} as never, real)
+            return true
+          },
+          close: () => Promise.resolve(),
+          destroy: () => Promise.resolve(),
+        }
+      }
+    },
+    setGlobalDispatcher: () => undefined,
+    getGlobalDispatcher: () => ({ dispatch: () => true }),
+  }
+  const seen: Error[] = []
+  const router = new PoolRoutingDispatcher({ pool, undici: undici as never, proxyHosts: ['opencode.ai'] })
+  routingContext.run({ model: 'm', session: 's' }, () => {
+    router.dispatch({ origin: 'https://opencode.ai/x' } as never, {
+      onResponseError: (_controller: unknown, error: Error) => {
+        seen.push(error)
+      },
+    } as never)
+  })
+  // the passive signal is unchanged
+  assert.equal(pool.passiveStats('a:1').transport, 1)
+  assert.equal(pool.isUsable('a:1', 'other'), false)
+  // but the handler sees the real thing, exactly once
+  assert.equal(seen.length, 1, 'no synthesized racer ahead of the genuine error')
+  assert.equal(seen[0], real)
+  // and it still classifies, so the adapter asks the pool to rotate
+  assert.equal(classifyStreamFailure(seen[0]?.message ?? ''), 'transport')
+})
+
+test('dispatcher still synthesizes the error when the exit is a blackhole', () => {
+  // The sentinel injection is the only thing that wakes a request whose exit
+  // never hands undici a single callback — keep it (live repro: 10.255.255.1
+  // blackhole, seen:[] callbacks).
+  const pool = new ExitPool()
+  pool.add(node({ id: 'a:1', exitIP: '1.1.1.1', latencyMs: 10 }))
+  pool.markOk('a:1')
+  const undici = {
+    Agent: class { constructor() { return { dispatch: () => true, close: () => Promise.resolve(), destroy: () => Promise.resolve() } } },
+    ProxyAgent: class {
+      constructor() {
+        return {
+          // answers nothing at all — no headers, no onResponseError
+          dispatch(): boolean {
+            return true
+          },
+          close: () => Promise.resolve(),
+          destroy: () => Promise.resolve(),
+        }
+      }
+    },
+    setGlobalDispatcher: () => undefined,
+    getGlobalDispatcher: () => ({ dispatch: () => true }),
+  }
+  const seen: Error[] = []
+  const router = new PoolRoutingDispatcher({ pool, undici: undici as never, proxyHosts: ['opencode.ai'], sentinelMs: 20 })
+  routingContext.run({ model: 'm', session: 's' }, () => {
+    router.dispatch({ origin: 'https://opencode.ai/x' } as never, {
+      onResponseError: (_controller: unknown, error: Error) => {
+        seen.push(error)
+      },
+    } as never)
+  })
+  return new Promise<void>((resolve) => {
+    setTimeout(() => {
+      assert.equal(seen.length, 1, 'the silent exit still gets its synthesized response-error')
+      assert.match(seen[0]?.message ?? '', /exit response silence/)
+      assert.equal(pool.passiveStats('a:1').transport, 1)
+      assert.equal(pool.isUsable('a:1', 'other'), false)
+      resolve()
+    }, 80)
+  })
 })
 
 // -- R1 coexistence: defer when a foreign dispatcher owns the global slot ------
