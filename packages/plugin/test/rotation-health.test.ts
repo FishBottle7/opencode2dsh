@@ -344,3 +344,47 @@ test('PeriodicProber: the tick interval is seeded at construction and observable
   prober.setIntervalMs(5 * 60_000)
   assert.equal(prober.stats.intervalMs, 300_000, 'a settings commit still hot-applies to the same object')
 })
+
+// -- urgent: the starvation fast-path (issue #106) ----------------------------
+
+test('urgent: a just-killed exit is re-probed without the 30-min dead gate, rate-limited', async () => {
+  // The issue-106 shape: a shared cause (tunnel crash / local outage) struck
+  // every exit dead moments ago. Routine select() honors DEAD_RETRY_MS and
+  // finds nothing to do; the pool has no usable exit, so real traffic is
+  // failing over direct — recovery cannot wait out the backoff gate.
+  const p = pool()
+  p.add(node({ id: 'sub:1', source: 'subscription', exitIP: '1.1.1.1', latencyMs: 100 }))
+  p.markOk('sub:1')
+  p.recordPassiveTransport('sub:1')
+  assert.equal(p.list()[0]!.health.state, 'dead')
+  assert.equal(p.pick('s', 'm'), null, 'the pool is starved')
+
+  const queued: string[] = []
+  const prober = new PeriodicProber(p, async (id) => { queued.push(id) }, { now })
+  assert.equal(prober.select().filter((c) => c.reason === 'dead-retry').length, 0,
+    'routine rounds keep the gate')
+  await prober.urgent()
+  assert.deepEqual(queued, ['sub:1'], 'urgent ignores the gate — the exit just died')
+  // the urgent cooldown is the quota guard: a burst of failing requests must
+  // not fan out into a burst of smokes
+  await prober.urgent()
+  assert.equal(queued.length, 1)
+  clock += 5 * 60_000 + 1
+  await prober.urgent()
+  assert.equal(queued.length, 2)
+})
+
+test('urgent: skips 429-cooled exits (waiting is their recovery) and spends nothing while stopped', async () => {
+  const p = pool()
+  p.add(node({ id: 'cooled:1', source: 'subscription', exitIP: '2.2.2.2', latencyMs: 100 }))
+  p.markOk('cooled:1')
+  p.markLimited('cooled:1') // 60s base cooldown, clock has not moved
+  const queued: string[] = []
+  const prober = new PeriodicProber(p, async (id) => { queued.push(id) }, { now })
+  await prober.urgent()
+  assert.deepEqual(queued, [], 'probing a 429-cooling exit answers 429 and extends its backoff')
+  prober.stop()
+  clock += 10 * 60_000
+  await prober.urgent()
+  assert.equal(queued.length, 0, 'a disabled pool spends no probe quota')
+})

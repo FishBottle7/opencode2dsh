@@ -685,3 +685,35 @@ test('dispatcher sentinel: window (b) is looser than (a) — a slow LLM TTFB beh
   assert.deepEqual(pool.passiveStats('ttfb:1'), { ok: 1, limited: 0, refused: 0, dead: 0, transport: 0 }, 'slow TTFB behind a live tunnel classified ok, never struck')
   assert.equal(pool.isUsable('ttfb:1', 'm'), true)
 })
+
+// Regression, issue #106: a pool that is non-empty but fully degraded must
+// tell the runtime it is starving, so the prober's urgent round can revive
+// dead exits without a manual "probe" click. An EMPTY pool stays silent —
+// there is nothing to recover and no traffic to protect.
+test('dispatcher: pick()->null on a non-empty pool fires onStarved; an empty pool does not', () => {
+  const p = new ExitPool()
+  const { seam, hops } = fakeSeam()
+  let starved = 0
+  const router = new PoolRoutingDispatcher({
+    pool: p,
+    undici: seam as never,
+    proxyHosts: ['opencode.ai'],
+    onStarved: () => { starved += 1 },
+  })
+  routingContext.run({ model: 'm', session: 's1' }, () => {
+    router.dispatch({ origin: 'https://opencode.ai/x' } as never, {} as never)
+  })
+  assert.equal(starved, 0, 'an empty pool has nothing to recover')
+  assert.deepEqual(hops, ['direct'])
+
+  // one transport strike from real traffic is enough to empty a single-exit
+  // pool (markDeadStrike) — exactly the collapse the issue reported
+  p.add(node({ id: 'd:1', exitIP: '1.1.1.1' }))
+  p.markOk('d:1')
+  p.recordPassiveTransport('d:1')
+  routingContext.run({ model: 'm', session: 's2' }, () => {
+    router.dispatch({ origin: 'https://opencode.ai/x' } as never, {} as never)
+  })
+  assert.equal(starved, 1, 'the starved request handed the runtime its signal')
+  assert.deepEqual(hops, ['direct', 'direct'], 'starvation still falls back direct, never fails closed')
+})

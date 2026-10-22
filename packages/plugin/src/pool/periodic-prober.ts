@@ -76,6 +76,8 @@ export interface PeriodicProbeOptions {
   maxPerRound?: number
   /** Clock seam for tests. */
   now?: () => number
+  /** Cooldown between two urgent rounds (quota guard, default 5min). */
+  urgentCooldownMs?: number
 }
 
 /** Which exits a round should revisit, in priority order (docs §4.3). */
@@ -103,6 +105,10 @@ export class PeriodicProber {
   #stopped = false
   #lastRunAt = 0
   #lastQueued = 0
+  /** Timestamp of the last URGENT round (its own quota guard). */
+  #lastUrgentAt = 0
+  /** Cooldown between two urgent rounds (quota guard). */
+  #urgentCooldownMs: number
   /** Rotating start offset into the due dead-retry list, so consecutive rounds
    *  cover different slices instead of re-probing the same head forever. */
   #deadCursor = 0
@@ -120,6 +126,7 @@ export class PeriodicProber {
     this.#enqueue = enqueue
     this.#intervalMs = options.intervalMs ?? DEFAULT_PROBE_INTERVAL_MS
     this.#maxPerRound = options.maxPerRound ?? 20
+    this.#urgentCooldownMs = options.urgentCooldownMs ?? 5 * 60_000
     this.#now = options.now ?? Date.now
   }
 
@@ -172,8 +179,13 @@ export class PeriodicProber {
    * history behind both rules lives on `#selectableDeadRetries` and on those two
    * constants; a second copy here is how the two descriptions end up drifting
    * apart.
+   *
+   * @param options.ignoreDeadGate - include dead exits regardless of the
+   *        DEAD_RETRY_MS backoff. ONLY for the starvation path (`urgent`):
+   *        the gate exists to keep routine rounds cheap, but when the pool has
+   *        nothing usable left, waiting it out IS the outage (issue #106).
    */
-  select(now = this.#now()): ProbeCandidate[] {
+  select(now = this.#now(), options: { ignoreDeadGate?: boolean } = {}): ProbeCandidate[] {
     const cooled: LiveCandidate[] = []
     const neverProbed: LiveCandidate[] = []
     const stale: LiveCandidate[] = []
@@ -185,8 +197,11 @@ export class PeriodicProber {
       if (health.state === 'dead') {
         // dead retry (docs §4.6 deadRetryMs): dead exits get another chance;
         // manual/subscription ones are disable-only and would otherwise never
-        // come back.
-        if (now - health.lastProbedAt >= DEAD_RETRY_MS) deadDue.push(entry.id)
+        // come back. `urgent` bypasses the gate: it runs when the pool has no
+        // usable exit left, and the gate's quota math inverts at that point.
+        if (options.ignoreDeadGate === true || now - health.lastProbedAt >= DEAD_RETRY_MS) {
+          deadDue.push(entry.id)
+        }
         continue
       }
       if (health.cooldownUntil > now) continue // still cooling: probing now wastes quota
@@ -282,10 +297,43 @@ export class PeriodicProber {
 
   /** One round; skipped while the previous one is still draining. */
   async tick(): Promise<void> {
+    await this.#round(false)
+  }
+
+  /**
+   * Starvation fast-path (issue #106): one round that IGNORES the
+   * DEAD_RETRY_MS backoff, triggered by the dispatcher when a proxied request
+   * finds the pool non-empty but with no usable exit (`pick() -> null`).
+   *
+   * Layering with #107's verify-on-death: the verifier is the FIRST opinion on
+   * a single death (one re-probe per death episode); this is the fallback for
+   * when the whole table is down — a shared cause (sing-box crash, local
+   * outage) killed every exit, the verifier's probes die through the same
+   * broken tunnel, and nothing would retry for 30 minutes. Every urgent round
+   * re-sweeps the dead table for a recovery the moment it happens.
+   *
+   * Quota guard: cooled exits are still excluded (probing a 429-cooling exit
+   * answers 429 and extends its backoff — waiting there is correct), the
+   * per-round cap and the reserved-share math still apply, and consecutive
+   * urgent rounds are spaced by urgentCooldownMs (default 5min) so a genuinely
+   * all-dead pool burns at most ~20 smokes per 5 minutes instead of one per
+   * failing request.
+   */
+  async urgent(): Promise<void> {
+    if (this.#stopped) return
+    if (this.#running) return
+    const now = this.#now()
+    if (now - this.#lastUrgentAt < this.#urgentCooldownMs) return
+    this.#lastUrgentAt = now
+    await this.#round(true)
+  }
+
+  /** Shared round body; `ignoreDeadGate` passes through to select(). */
+  async #round(ignoreDeadGate: boolean): Promise<void> {
     if (this.#running || this.#stopped) return
     this.#running = true
     try {
-      const candidates = this.select()
+      const candidates = this.select(this.#now(), { ignoreDeadGate })
       this.#lastRunAt = this.#now()
       this.#lastQueued = candidates.length
       // Enqueue the whole round at once (issue #106). `#enqueue` resolves only
