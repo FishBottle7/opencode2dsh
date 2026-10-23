@@ -404,7 +404,15 @@ export async function startIpPool(
   // never-probed and dead exits. Without it a subscription node whose smoke
   // failed at admission kept `latencyMs: 0` forever — the refresh path filters
   // `!pool.has(address)` and never revisits a node already in the table.
-  const periodic = new PeriodicProber(pool, (exitId) => probeExit(exitId))
+  //
+  // The interval is seeded HERE, not only through applyConfig(): applyConfig()
+  // runs above, before this object exists, so its `periodicRef?.setIntervalMs`
+  // was a silent no-op at boot and a configured `probeIntervalMs` only took
+  // effect after the next settings save — the loop always ticked at the 10min
+  // default meanwhile (issue #106). Later settings commits still hot-apply.
+  const periodic = new PeriodicProber(pool, (exitId) => probeExit(exitId), {
+    intervalMs: config.ipPool?.probeIntervalMs ?? 10 * 60_000,
+  })
   periodicRef = periodic
   if (pool.snapshot().total > 0) periodic.start()
 

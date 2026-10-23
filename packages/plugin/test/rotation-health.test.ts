@@ -331,3 +331,17 @@ test('PeriodicProber.tick: the round is enqueued concurrently, not one probe at 
   await round
   assert.equal(prober.stats.lastQueued, 3)
 })
+
+test('PeriodicProber: the tick interval is seeded at construction and observable (#106)', () => {
+  // ip-pool.ts constructs this loop AFTER applyConfig() has already run, so the
+  // configured probeIntervalMs used to be dropped on the floor at boot (only a
+  // later settings save could apply it). The interval is now a construction
+  // option and rides `stats` so the settings card can show what is really
+  // running.
+  const clock = tickClock()
+  const p = new ExitPool({ now: clock.now })
+  const prober = new PeriodicProber(p, async () => {}, { now: clock.now, intervalMs: 2 * 60_000 })
+  assert.equal(prober.stats.intervalMs, 120_000, 'a seeded interval is not silently replaced by the 10min default')
+  prober.setIntervalMs(5 * 60_000)
+  assert.equal(prober.stats.intervalMs, 300_000, 'a settings commit still hot-applies to the same object')
+})

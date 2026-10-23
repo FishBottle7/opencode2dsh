@@ -111,8 +111,13 @@ export class PeriodicProber {
     this.#now = options.now ?? Date.now
   }
 
-  get stats(): { running: boolean; lastRunAt: number; lastQueued: number } {
-    return { running: this.#running, lastRunAt: this.#lastRunAt, lastQueued: this.#lastQueued }
+  get stats(): { running: boolean; lastRunAt: number; lastQueued: number; intervalMs: number } {
+    return {
+      running: this.#running,
+      lastRunAt: this.#lastRunAt,
+      lastQueued: this.#lastQueued,
+      intervalMs: this.#intervalMs,
+    }
   }
 
   /** Live re-apply of the tick interval (settings page, §5.1). */
