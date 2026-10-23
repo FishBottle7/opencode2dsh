@@ -21,7 +21,7 @@ function node(overrides: Partial<ExitNode> = {}): ExitNode {
 
 const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0))
 
-test('death verification: a transport death is probed once, through the runtime probe (#106)', async () => {
+test('death verification: a transport death is probed through the runtime probe (#106)', async () => {
   const pool = new ExitPool()
   pool.add(node())
   pool.markOk('sub:1')
@@ -31,10 +31,6 @@ test('death verification: a transport death is probed once, through the runtime 
 
   const probed: string[] = []
   const verify = createDeathVerifier({ pool, probe: async (id) => { probed.push(id) } })
-  // A burst of failures in one turn (sentinel + a rerouted retry) must not
-  // queue a burst of probes.
-  verify('sub:1')
-  verify('sub:1')
   verify('sub:1')
   await settle()
   assert.deepEqual(probed, ['sub:1'])

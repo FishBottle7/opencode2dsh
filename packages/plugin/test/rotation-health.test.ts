@@ -296,19 +296,18 @@ test('PeriodicProber.select: a probed-but-unmeasured exit backs off instead of h
 test('PeriodicProber.select: live buckets rotate, so no exit hoards the round (#106)', () => {
   const clock = tickClock()
   const p = new ExitPool({ now: clock.now })
-  for (let i = 0; i < 25; i += 1) {
+  for (let i = 0; i < 5; i += 1) {
     p.add(node({ id: `n-${i}`, source: 'subscription', exitIP: `9.9.9.${i}`, latencyMs: 0 }))
   }
-  const prober = new PeriodicProber(p, async () => {}, { now: clock.now })
+  const prober = new PeriodicProber(p, async () => {}, { now: clock.now, maxPerRound: 3 })
 
   // Selection is a pure read, so two rounds without probing in between show
   // exactly what a stalled prober would do: same head of the list, forever.
   const first = prober.select().map((c) => c.id)
   const second = prober.select().map((c) => c.id)
-  assert.equal(first.length, 20)
-  assert.equal(second.length, 20)
-  assert.equal(second[0], 'n-20', 'the next round starts where the previous one stopped')
-  assert.equal(new Set([...first, ...second]).size, 25, 'two rounds cover the whole bucket')
+  assert.deepEqual(first, ['n-0', 'n-1', 'n-2'])
+  assert.deepEqual(second, ['n-3', 'n-4', 'n-0'], 'the next round starts where the previous one stopped')
+  assert.equal(new Set([...first, ...second]).size, 5, 'two rounds cover the whole bucket')
 })
 
 test('PeriodicProber.tick: the round is enqueued concurrently, not one probe at a time (#106)', async () => {
