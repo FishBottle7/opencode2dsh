@@ -14,6 +14,7 @@
 
 import type { IpPoolRuntime } from '../ip-pool.ts'
 import type { PoolState, ExitSource, ProbeFailure } from '../pool/pool.ts'
+import { DEFAULT_PROBE_INTERVAL_MS } from '../pool/periodic-prober.ts'
 
 /** Bridge route prefix (same-origin, loopback-only). */
 export const IP_POOL_BRIDGE_PREFIX = '/api/opencode2dsh/ip-pool'
@@ -61,6 +62,23 @@ export interface ProberView {
   completed: number
 }
 
+/**
+ * The periodic (automatic) health-probe loop (issue #106).
+ *
+ * The card used to show only the shared queue counters, which look identical
+ * whether the queue is drained because the loop is working or because it never
+ * started — so a user with dead exits had no way to tell "automatic probing is
+ * running" from "nothing but my own button ever probes". `lastRunAt` (0 = never)
+ * plus the effective `intervalMs` make that state visible, and `intervalMs` also
+ * proves that the configured probeIntervalMs is what the loop actually uses.
+ */
+export interface PeriodicView {
+  running: boolean
+  lastRunAt: number
+  lastQueued: number
+  intervalMs: number
+}
+
 export interface RefillView {
   admitted: number
   rejected: number
@@ -97,6 +115,7 @@ export interface PoolStatusView {
   proxyHosts: string[]
   exits: ExitRowView[]
   prober: ProberView
+  periodic: PeriodicView
   refill: RefillView | null
   subscription: SubscriptionView | null
   at: number
@@ -153,6 +172,9 @@ export function buildStatusView(
     prober: runtime
       ? runtime.prober.stats
       : { queued: 0, inFlight: 0, enqueued: 0, completed: 0 },
+    periodic: runtime
+      ? runtime.periodic.stats
+      : { running: false, lastRunAt: 0, lastQueued: 0, intervalMs: DEFAULT_PROBE_INTERVAL_MS },
     refill: runtime?.refill
       ? { ...runtime.refill.lastRound, progress: runtime.refill.progress }
       : null,

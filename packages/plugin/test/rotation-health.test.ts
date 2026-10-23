@@ -231,3 +231,116 @@ test('PeriodicProber.select: cooled/never-probed beat dead-retries when the roun
   assert.ok(reasons.includes('never-probed'), 'a live unmeasured exit is not starved by dead retries')
   assert.equal(reasons.filter((r) => r === 'dead-retry').length <= 2, true)
 })
+
+// -- issue #106: a dead exit must never wait behind the unmeasured queue -------
+
+/** A fresh clock, so #106 tests never depend on another test's time travel. */
+function tickClock(start = 30_000_000): { now: () => number; advance: (ms: number) => void } {
+  let at = start
+  return { now: () => at, advance: (ms: number) => { at += ms } }
+}
+
+test('PeriodicProber.select: dead retries keep a reserved share when the unmeasured queue saturates (#106)', () => {
+  // Issue #106 field report: exits were struck dead by real traffic and stayed
+  // dead until the user pressed the manual probe button. Root cause (before
+  // this fix): dead retries came LAST in the priority order and were then cut
+  // by the per-round cap, so a pool with >= maxPerRound unmeasured exits never
+  // ran a single dead retry — the queue starved it every round, forever.
+  const clock = tickClock()
+  const p = new ExitPool({ now: clock.now })
+  // 25 admitted-but-unmeasured subscription exits: their echo endpoint was
+  // blocked at admission, so latencyMs stays 0 (admission.ts keeps the node).
+  for (let i = 0; i < 25; i += 1) {
+    p.add(node({ id: `n-${i}`, source: 'subscription', exitIP: `9.9.9.${i}`, latencyMs: 0 }))
+  }
+  // Three exits real traffic just struck dead.
+  for (let i = 0; i < 3; i += 1) {
+    p.add(node({ id: `dead-${i}`, source: 'subscription', exitIP: `1.1.1.${i}`, latencyMs: 0 }))
+    p.recordPassiveTransport(`dead-${i}`)
+  }
+  const prober = new PeriodicProber(p, async () => {}, { now: clock.now })
+  clock.advance(31 * 60_000) // past the dead-retry gate
+
+  for (let round = 1; round <= 3; round += 1) {
+    const reasons = prober.select().map((c) => c.reason)
+    assert.equal(
+      reasons.filter((r) => r === 'dead-retry').length,
+      3,
+      `round ${round}: every due dead exit gets a retry even while 25 unmeasured exits compete`,
+    )
+    assert.ok(reasons.includes('never-probed'), `round ${round}: the live queue still gets the rest of the round`)
+    clock.advance(10 * 60_000)
+  }
+})
+
+test('PeriodicProber.select: a probed-but-unmeasured exit backs off instead of hoarding a slot (#106)', () => {
+  const clock = tickClock()
+  const p = new ExitPool({ now: clock.now })
+  p.add(node({ id: 'echo-blocked:1', source: 'subscription', exitIP: '1.1.1.1', latencyMs: 0 }))
+  const prober = new PeriodicProber(p, async () => {}, { now: clock.now })
+
+  assert.deepEqual(prober.select().map((c) => c.id), ['echo-blocked:1'], 'a genuinely new exit is due at once')
+
+  // The probe ran and failed at the echo step. `echo-unavailable` deliberately
+  // leaves health alone (probe-verdict.ts), so the node stays `unknown` with
+  // latencyMs 0 — i.e. it matches the unmeasured bucket again.
+  p.markProbeFailure('echo-blocked:1', 'echo-unavailable', 'probe timed out after 8000ms')
+  assert.deepEqual(prober.select(), [], 'a just-probed unmeasured exit must not be re-picked every round')
+
+  clock.advance(29 * 60_000)
+  assert.deepEqual(prober.select(), [], 'the backoff is not over yet')
+  clock.advance(1 * 60_000)
+  assert.deepEqual(prober.select().map((c) => c.id), ['echo-blocked:1'], 'it returns once the backoff expires')
+})
+
+test('PeriodicProber.select: live buckets rotate, so no exit hoards the round (#106)', () => {
+  const clock = tickClock()
+  const p = new ExitPool({ now: clock.now })
+  for (let i = 0; i < 5; i += 1) {
+    p.add(node({ id: `n-${i}`, source: 'subscription', exitIP: `9.9.9.${i}`, latencyMs: 0 }))
+  }
+  const prober = new PeriodicProber(p, async () => {}, { now: clock.now, maxPerRound: 3 })
+
+  // Selection is a pure read, so two rounds without probing in between show
+  // exactly what a stalled prober would do: same head of the list, forever.
+  const first = prober.select().map((c) => c.id)
+  const second = prober.select().map((c) => c.id)
+  assert.deepEqual(first, ['n-0', 'n-1', 'n-2'])
+  assert.deepEqual(second, ['n-3', 'n-4', 'n-0'], 'the next round starts where the previous one stopped')
+  assert.equal(new Set([...first, ...second]).size, 5, 'two rounds cover the whole bucket')
+})
+
+test('PeriodicProber.tick: the round is enqueued concurrently, not one probe at a time (#106)', async () => {
+  const clock = tickClock()
+  const p = new ExitPool({ now: clock.now })
+  for (let i = 0; i < 3; i += 1) p.add(node({ id: `n-${i}`, source: 'free', exitIP: `10.0.0.${i}`, latencyMs: 0 }))
+
+  const started: string[] = []
+  const open: Array<() => void> = []
+  const prober = new PeriodicProber(p, (id) => new Promise<void>((resolve) => {
+    started.push(id)
+    open.push(resolve)
+  }), { now: clock.now, maxPerRound: 3 })
+
+  const round = prober.tick()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  // A serial round would have exactly one probe started and block forever.
+  assert.deepEqual(started, ['n-0', 'n-1', 'n-2'], 'the whole round is handed to the Prober at once')
+  for (const resolve of open) resolve()
+  await round
+  assert.equal(prober.stats.lastQueued, 3)
+})
+
+test('PeriodicProber: the tick interval is seeded at construction and observable (#106)', () => {
+  // ip-pool.ts constructs this loop AFTER applyConfig() has already run, so the
+  // configured probeIntervalMs used to be dropped on the floor at boot (only a
+  // later settings save could apply it). The interval is now a construction
+  // option and rides `stats` so the settings card can show what is really
+  // running.
+  const clock = tickClock()
+  const p = new ExitPool({ now: clock.now })
+  const prober = new PeriodicProber(p, async () => {}, { now: clock.now, intervalMs: 2 * 60_000 })
+  assert.equal(prober.stats.intervalMs, 120_000, 'a seeded interval is not silently replaced by the 10min default')
+  prober.setIntervalMs(5 * 60_000)
+  assert.equal(prober.stats.intervalMs, 300_000, 'a settings commit still hot-applies to the same object')
+})

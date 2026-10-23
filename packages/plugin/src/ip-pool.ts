@@ -21,11 +21,12 @@ import { ExitPool, gradeOf, type ExitNode, type ExitProtocol } from './pool/pool
 import type { UndiciSeam } from './pool/dispatcher.ts'
 import type { AdmissionDeps } from './pool/admission.ts'
 import { Prober } from './pool/prober.ts'
-import { PeriodicProber } from './pool/periodic-prober.ts'
+import { DEFAULT_PROBE_INTERVAL_MS, PeriodicProber } from './pool/periodic-prober.ts'
 import { RefillScheduler } from './pool/refill.ts'
 import { SubscriptionFetcher } from './pool/subscription-fetcher.ts'
 import { SingBoxSupervisor } from './pool/singbox.ts'
 import { createRotateDelegate, createStreamFailureReporter, setRotateDelegate, setStreamFailureReporter } from './pool/rotate.ts'
+import { createDeathVerifier } from './pool/death-verify.ts'
 
 /** Data dir shared with the catalog cache (config.ts convention). */
 function dataDir(): string {
@@ -247,7 +248,7 @@ export async function startIpPool(
     admissionDeps.blockedCountries = current.free?.blockedCountries
     admissionDeps.smokeModel = probeModels[0]
     prober.setMaxConcurrent(current.maxConcurrentProbes ?? 3)
-    periodicRef?.setIntervalMs(current.probeIntervalMs ?? 10 * 60_000)
+    periodicRef?.setIntervalMs(current.probeIntervalMs ?? DEFAULT_PROBE_INTERVAL_MS)
     installer.setProxyHosts?.(current.proxyHosts)
 
     // Free loop on/off + restart on target change (interval fixed 10min).
@@ -400,11 +401,33 @@ export async function startIpPool(
     return 1
   }
 
+  // Verify-on-death (issue #106). A transport failure marks an exit dead on the
+  // FIRST strike (§4.2), and the only route back used to be the periodic loop,
+  // whose dead-retry gate is 30 minutes and whose round is capped at 20 — so a
+  // transient blip took a working exit out of rotation for up to half an hour,
+  // and users read that as "the pool never re-checks anything unless I press
+  // probe". The hook re-probes the exit immediately through the same Prober
+  // queue and the same verdict path, so the exit is back as soon as a probe
+  // passes and stays dead (with a fresh timestamp) when it genuinely is.
+  const verifyDeath = createDeathVerifier({ pool, probe: probeExit, logger })
+  // The dispatcher may already be installed (non-empty pool at boot), and the
+  // installer rebuilds it on every enable flip, so the hook is pushed through
+  // the installer rather than only handed to the constructor.
+  installer.setTransportDeathObserver(verifyDeath)
+
   // Periodic health probe (docs §4.3): the loop that re-measures cooled-down,
   // never-probed and dead exits. Without it a subscription node whose smoke
   // failed at admission kept `latencyMs: 0` forever — the refresh path filters
   // `!pool.has(address)` and never revisits a node already in the table.
-  const periodic = new PeriodicProber(pool, (exitId) => probeExit(exitId))
+  //
+  // The interval is seeded HERE, not only through applyConfig(): applyConfig()
+  // runs above, before this object exists, so its `periodicRef?.setIntervalMs`
+  // was a silent no-op at boot and a configured `probeIntervalMs` only took
+  // effect after the next settings save — the loop always ticked at the 10min
+  // default meanwhile (issue #106). Later settings commits still hot-apply.
+  const periodic = new PeriodicProber(pool, (exitId) => probeExit(exitId), {
+    intervalMs: config.ipPool?.probeIntervalMs,
+  })
   periodicRef = periodic
   if (pool.snapshot().total > 0) periodic.start()
 
@@ -422,6 +445,10 @@ export async function startIpPool(
   // covers every reconfigure.
   setStreamFailureReporter(createStreamFailureReporter(pool, (exitId) => {
     logger.warn(`opencode2dsh: exit ${exitId} went silent mid-stream; recorded and excluded from this turn's rotation`)
+    // Same verify-on-death rule as the dispatcher's transport seam (issue
+    // #106): a mid-stream silence is recorded as a transport death, so it gets
+    // the same immediate second opinion.
+    verifyDeath(exitId)
   }))
 
   return {
