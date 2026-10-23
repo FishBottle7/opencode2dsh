@@ -61,6 +61,23 @@ export interface ProberView {
   completed: number
 }
 
+/**
+ * The periodic (automatic) health-probe loop (issue #106).
+ *
+ * The card used to show only the shared queue counters, which look identical
+ * whether the queue is drained because the loop is working or because it never
+ * started — so a user with dead exits had no way to tell "automatic probing is
+ * running" from "nothing but my own button ever probes". `lastRunAt` (0 = never)
+ * plus the effective `intervalMs` make that state visible, and `intervalMs` also
+ * proves that the configured probeIntervalMs is what the loop actually uses.
+ */
+export interface PeriodicView {
+  running: boolean
+  lastRunAt: number
+  lastQueued: number
+  intervalMs: number
+}
+
 export interface RefillView {
   admitted: number
   rejected: number
@@ -97,6 +114,7 @@ export interface PoolStatusView {
   proxyHosts: string[]
   exits: ExitRowView[]
   prober: ProberView
+  periodic: PeriodicView
   refill: RefillView | null
   subscription: SubscriptionView | null
   at: number
@@ -153,6 +171,12 @@ export function buildStatusView(
     prober: runtime
       ? runtime.prober.stats
       : { queued: 0, inFlight: 0, enqueued: 0, completed: 0 },
+    // The loop is part of the runtime contract, but this view is also built
+    // over partial fakes (tests) and over a runtime assembled before the loop
+    // exists, so degrade to a disabled stub instead of throwing.
+    periodic: runtime?.periodic
+      ? runtime.periodic.stats
+      : { running: false, lastRunAt: 0, lastQueued: 0, intervalMs: 10 * 60_000 },
     refill: runtime?.refill
       ? { ...runtime.refill.lastRound, progress: runtime.refill.progress }
       : null,
