@@ -73,6 +73,8 @@ export interface IpPoolSettingsValue {
   enabled: boolean
   probeModels: string[]
   maxConcurrentProbes: number
+  /** Periodic health-probe tick in ms (docs §4.6 probeIntervalMs, issue #106). */
+  probeIntervalMs: number
   free: { enabled: boolean; targetSize: number; blockedCountries: string[] }
   manual: string[]
   subscription: { urls: string[]; refreshMs: number; userAgent: string }
@@ -141,6 +143,7 @@ const DEFAULTS: IpPoolSettingsValue = {
   enabled: false,
   probeModels: [],
   maxConcurrentProbes: 3,
+  probeIntervalMs: 10 * 60_000,
   free: { enabled: true, targetSize: 20, blockedCountries: ['CN'] },
   manual: [],
   subscription: { urls: [], refreshMs: 30 * 60_000, userAgent: DEFAULT_SUBSCRIPTION_USER_AGENT },
@@ -190,6 +193,7 @@ interface FormState {
   pinnedStrict: boolean
   probeModels: string[]
   maxConcurrentProbes: string
+  probeIntervalMs: string
 }
 
 function emptyForm(): FormState {
@@ -207,6 +211,7 @@ function emptyForm(): FormState {
     pinnedStrict: DEFAULTS.pinnedStrict,
     probeModels: [],
     maxConcurrentProbes: String(DEFAULTS.maxConcurrentProbes),
+    probeIntervalMs: String(DEFAULTS.probeIntervalMs),
   }
 }
 
@@ -225,6 +230,7 @@ function formFromValue(value: IpPoolSettingsValue): FormState {
     pinnedStrict: value.pinnedStrict,
     probeModels: [...value.probeModels],
     maxConcurrentProbes: String(value.maxConcurrentProbes),
+    probeIntervalMs: String(value.probeIntervalMs),
   }
 }
 
@@ -276,6 +282,7 @@ function diffWrites(form: FormState, value: IpPoolSettingsValue, base: Partial<I
   push('pinnedStrict', form.pinnedStrict, value.pinnedStrict, base.pinnedStrict)
   push('probeModels', form.probeModels, value.probeModels, base.probeModels)
   push('maxConcurrentProbes', Number(form.maxConcurrentProbes), value.maxConcurrentProbes, base.maxConcurrentProbes)
+  push('probeIntervalMs', Number(form.probeIntervalMs), value.probeIntervalMs, base.probeIntervalMs)
   return writes
 }
 
@@ -685,6 +692,9 @@ function CardBody(props: { settings: ConfigPageForm | undefined; t: IpPoolCardPr
     if (!/^\d+$/.test(form.targetSize.trim()) || size < 1 || size > 100) return t('invalidRange')
     const conc = Number(form.maxConcurrentProbes)
     if (!/^\d+$/.test(form.maxConcurrentProbes.trim()) || conc < 1 || conc > 8) return t('invalidRange')
+    // Same bounds as the settings schema: 1 minute .. 24 hours (issue #106).
+    const interval = Number(form.probeIntervalMs)
+    if (!/^\d+$/.test(form.probeIntervalMs.trim()) || interval < 60_000 || interval > 86_400_000) return t('invalidRange')
     const refresh = Number(form.refreshMs)
     if (!/^\d+$/.test(form.refreshMs.trim()) || refresh < 60_000) return t('invalidRange')
     for (const entry of form.manual) {
@@ -993,6 +1003,20 @@ function CardBody(props: { settings: ConfigPageForm | undefined; t: IpPoolCardPr
           max={8}
           step={1}
           onChange={(value) => { setSaved(false); setForm({ ...form, maxConcurrentProbes: value }) }}
+        />
+        {/* Issue #106: the tick used to be a schema value the page never showed
+            (and that the boot path dropped entirely) — "make auto-probing more
+            responsive" was impossible from this page. */}
+        <TextField
+          label={t('probeInterval')}
+          hint={t('probeIntervalHint')}
+          value={form.probeIntervalMs}
+          testId="field-probeIntervalMs"
+          type="number"
+          min={60_000}
+          max={86_400_000}
+          step={60_000}
+          onChange={(value) => { setSaved(false); setForm({ ...form, probeIntervalMs: value }) }}
         />
         <button
           type="button"
