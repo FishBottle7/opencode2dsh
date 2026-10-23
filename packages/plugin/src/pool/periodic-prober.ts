@@ -32,6 +32,39 @@ import type { ExitPool } from './pool.ts'
  *  the rotating cursor space the retries out from there. */
 const DEAD_RETRY_MS = 30 * 60_000
 
+/**
+ * Minimum gap before re-probing an exit that is STILL unmeasured after a probe
+ * (issue #106).
+ *
+ * The "never probed" bucket is selected on `state === 'unknown' ||
+ * latencyMs <= 0`, and nothing in it ever looked at `lastProbedAt`. A trusted
+ * exit whose echo endpoint is unreachable at admission is admitted with
+ * `latencyMs: 0` and is meant to have its facts re-derived "by a later probe"
+ * (admission.ts) — but when the echo stays blocked the probe can never fill
+ * them, so the exit matched the bucket again on every single round, forever.
+ * That is both a quota burn (a full probe per round, per such exit) and, given
+ * the priority order, the mechanism that starved the dead-retry queue behind it
+ * (see `select()`). A probed-but-unmeasured exit now waits this long before it
+ * may take another slot; a genuinely new exit (`lastProbedAt === 0`) is still
+ * due immediately.
+ */
+const UNMEASURED_RETRY_MS = 30 * 60_000
+
+/**
+ * Share of one round reserved for dead retries (issue #106).
+ *
+ * Recovering a false death is the point of the whole loop (docs §4.3 "dead
+ * 复探"): `markDeadStrike` flips an exit to `dead` on ONE transport failure, so
+ * a single transient network error takes a working exit out of rotation. Dead
+ * retries still sat LAST in the priority list and were then dropped by the
+ * per-round cap — with >= maxPerRound cooled/never-probed/stale exits the dead
+ * queue never ran at all, and the user's only way back was the manual probe
+ * button (issue #106: "If I do not manually click the probe, ..."). A quarter
+ * of the round is now reserved for dead retries; unused slots flow back to the
+ * live buckets, and the live buckets keep their priority within the rest.
+ */
+const DEAD_RETRY_SHARE = 0.25
+
 export interface PeriodicProbeOptions {
   /** Tick interval (docs §4.6 probeIntervalMs, default 10min). */
   intervalMs?: number
@@ -61,6 +94,10 @@ export class PeriodicProber {
   /** Rotating start offset into the due dead-retry list, so consecutive rounds
    *  cover different slices instead of re-probing the same head forever. */
   #deadCursor = 0
+  /** Rotating start offset per live bucket (issue #106). Insertion order plus
+   *  a stable cap re-probes the same head of the list every round, so the rest
+   *  of the bucket never gets measured. Keyed by candidate reason. */
+  #bucketCursor: Record<string, number> = {}
 
   constructor(
     pool: ExitPool,
@@ -127,16 +164,19 @@ export class PeriodicProber {
     // Rotating the start offset fixes the starvation and, with the cooldown
     // gate, spaces each exit's retries out instead of hammering the same head
     // of the list.
-    const retryable = this.#selectableDeadRetries(now)
+    //
     // Priority buckets (docs §4.3): re-measuring live-but-degraded exits
-    // comes before dead retries — with a large dead population an
-    // insertion-order pass starves the cooled/never-probed classes every
-    // round, and a subscription node is disable-only (§3.5), so a starved
-    // exit has no other route back.
+    // comes before dead retries — a dead population large enough to fill the
+    // round would otherwise starve the live classes every round. Since issue
+    // #106 the reverse starvation is prevented too: dead retries get a
+    // RESERVED share of the round (DEAD_RETRY_SHARE), so a saturated
+    // never-probed/cooled queue can no longer keep a dead exit out of rotation
+    // indefinitely — which is exactly what made users believe the pool never
+    // re-checks a proxy unless they press the probe button.
     const cooled: ProbeCandidate[] = []
     const neverProbed: ProbeCandidate[] = []
     const stale: ProbeCandidate[] = []
-    const deadRetry: ProbeCandidate[] = []
+    const deadDue: string[] = []
     for (const entry of this.#pool.list()) {
       const health = entry.health
       // A probe already in flight for this exit owns it (per-exit serial, §4.1).
@@ -145,7 +185,7 @@ export class PeriodicProber {
         // dead retry (docs §4.6 deadRetryMs): dead exits get another chance;
         // manual/subscription ones are disable-only and would otherwise never
         // come back.
-        if (retryable.has(entry.id)) deadRetry.push({ id: entry.id, reason: 'dead-retry' })
+        if (now - health.lastProbedAt >= DEAD_RETRY_MS) deadDue.push(entry.id)
         continue
       }
       if (health.cooldownUntil > now) continue // still cooling: probing now wastes quota
@@ -155,6 +195,9 @@ export class PeriodicProber {
         continue
       }
       if (health.state === 'unknown' || entry.latencyMs <= 0) {
+        // Issue #106: an exit that a previous probe already failed to measure
+        // must not jump the queue every round (and starve everything else).
+        if (health.lastProbedAt !== 0 && now - health.lastProbedAt < UNMEASURED_RETRY_MS) continue
         neverProbed.push({ id: entry.id, reason: 'never-probed' })
         continue
       }
@@ -163,11 +206,45 @@ export class PeriodicProber {
         stale.push({ id: entry.id, reason: 'stale' })
       }
     }
-    return [...cooled, ...neverProbed, ...stale, ...deadRetry].slice(0, this.#maxPerRound)
+
+    // Reserve the dead share first, then let the live buckets (still in
+    // priority order, but rotating within each bucket) fill what is left.
+    const reserve = Math.min(
+      deadDue.length,
+      Math.max(1, Math.floor(this.#maxPerRound * DEAD_RETRY_SHARE)),
+    )
+    const liveCap = Math.max(0, this.#maxPerRound - reserve)
+    const out: ProbeCandidate[] = []
+    const take = (bucket: ProbeCandidate[]): void => {
+      const room = liveCap - out.length
+      if (room > 0) out.push(...this.#rotate(bucket, room))
+    }
+    take(cooled)
+    take(neverProbed)
+    take(stale)
+    // Dead retries take the reserved slots and then any room the live buckets
+    // left unused; #selectableDeadRetries advances its cursor by exactly what
+    // it hands out, so no retry window is skipped.
+    for (const id of this.#selectableDeadRetries(deadDue, this.#maxPerRound - out.length)) {
+      out.push({ id, reason: 'dead-retry' })
+    }
+    return out
+  }
+
+  /** `take` entries of one live bucket starting at its rotating offset. */
+  #rotate(bucket: ProbeCandidate[], take: number): ProbeCandidate[] {
+    if (bucket.length === 0 || take <= 0) return []
+    const reason = bucket[0]!.reason
+    const start = (this.#bucketCursor[reason] ?? 0) % bucket.length
+    const count = Math.min(take, bucket.length)
+    const out: ProbeCandidate[] = []
+    for (let i = 0; i < count; i += 1) out.push(bucket[(start + i) % bucket.length]!)
+    this.#bucketCursor[reason] = (start + count) % bucket.length
+    return out
   }
 
   /**
-   * Which dead exits may be retried this round.
+   * The next `limit` due dead exits to retry, starting at the rotating offset.
    *
    * Two rules, both learned from the live pool of 559 dead subscription exits:
    *
@@ -180,25 +257,24 @@ export class PeriodicProber {
    *  2. **A rotating start offset.** Both `pool.list()` insertion order and the
    *     per-round cap are stable, so without a rotation the same head of the
    *     list wins forever and everything past `maxPerRound` starves. The offset
-   *     advances each round, so the retry window walks the whole table and a
-   *     recovered exit eventually gets its chance back — which matters because a
-   *     subscription node is disable-only (§3.5) and has no other route in.
+   *     advances by exactly what this round consumed, so the retry window walks
+   *     the whole table and a recovered exit eventually gets its chance back —
+   *     which matters because a subscription node is disable-only (§3.5) and has
+   *     no other route in.
+   *
+   * Takes the due id list instead of re-deriving it, because the caller already
+   * walked the table once (issue #106 split the "who is due" scan from the
+   * "who gets the reserved share" decision).
    */
-  #selectableDeadRetries(now: number): Set<string> {
-    const dead = this.#pool.list().filter((entry) => entry.health.state === 'dead')
-    if (dead.length === 0) return new Set()
-    const out = new Set<string>()
-    // How many of them are due for a retry right now.
-    const due = dead.filter((entry) => now - entry.health.lastProbedAt >= DEAD_RETRY_MS)
-    if (due.length === 0) return out
-    // Walk the due list from a rotating offset so consecutive rounds cover
-    // different slices; the offset advances by the per-round cap each round.
+  #selectableDeadRetries(due: string[], limit: number): string[] {
+    if (due.length === 0 || limit <= 0) return []
     const offset = this.#deadCursor % due.length
-    this.#deadCursor = (offset + Math.max(1, this.#maxPerRound)) % Math.max(1, due.length)
-    for (let i = 0; i < due.length && out.size < this.#maxPerRound; i += 1) {
-      const entry = due[(offset + i) % due.length]
-      if (entry !== undefined) out.add(entry.id)
-    }
+    const count = Math.min(limit, due.length)
+    const out: string[] = []
+    for (let i = 0; i < count; i += 1) out.push(due[(offset + i) % due.length]!)
+    // Advance by what was actually handed out: advancing by the full round
+    // while only a reserved share is used would silently skip retry windows.
+    this.#deadCursor = (offset + count) % due.length
     return out
   }
 
@@ -210,9 +286,15 @@ export class PeriodicProber {
       const candidates = this.select()
       this.#lastRunAt = this.#now()
       this.#lastQueued = candidates.length
-      for (const candidate of candidates) {
-        await this.#enqueue(candidate.id)
-      }
+      // Enqueue the whole round at once (issue #106). `#enqueue` resolves only
+      // once the probe has actually RUN, so awaiting the candidates one by one
+      // serialized a round to a single probe at a time — the Prober's
+      // `maxConcurrentProbes` (default 3) was never used from here, and a round
+      // of timeout-prone exits could outlast the tick interval entirely (the
+      // next tick is skipped while `#running`). The Prober still owns per-exit
+      // serialization and the global concurrency cap, so nothing overlaps that
+      // should not.
+      await Promise.allSettled(candidates.map((candidate) => this.#enqueue(candidate.id)))
     } finally {
       this.#running = false
     }
