@@ -71,10 +71,6 @@ export interface PoolRoutingOptions {
    *  composing the first token (measured 1.7-2.7s live), so this window is
    *  far looser than (a). Default 10s, test-injectable. */
   headersMs?: number
-  /** Called ONCE for every transport death this layer records (issue #106):
-   *  the runtime's verify-on-death probe. Bookkeeping only — dispatch never
-   *  waits on it, and it may not throw back into the request path. */
-  onTransportDeath?: (exitId: string) => void
   /** Log sink for routing decisions (diagnostics). */
   logger?: { warn(message: string): void }
 }
@@ -184,7 +180,6 @@ export class PoolRoutingDispatcher implements RoutingDispatcherSurface {
     this.#agentLruCap = options.agentLruCap ?? 16
     this.#sentinelMs = options.sentinelMs ?? 2_000
     this.#headersMs = options.headersMs ?? 10_000
-    this.#onTransportDeath = options.onTransportDeath
     this.#logger = options.logger
     this.#direct = new options.undici.Agent()
   }
@@ -197,7 +192,16 @@ export class PoolRoutingDispatcher implements RoutingDispatcherSurface {
     this.#proxyHosts = next
   }
 
-  /** Live re-apply of the verify-on-death hook (issue #106). */
+  /**
+   * Attach/replace the verify-on-death hook (issue #106).
+   *
+   * A setter rather than a constructor option on purpose: the runtime can only
+   * build the verifier after its probe queue exists, which is AFTER this router
+   * was installed at boot — so the hook has to be attachable to a live router.
+   * It is called at most once per recorded transport death, never awaited, and a
+   * throwing observer is contained (logged) rather than propagated into the
+   * request path.
+   */
   setTransportDeathObserver(next: ((exitId: string) => void) | undefined): void {
     this.#onTransportDeath = next
   }

@@ -14,6 +14,7 @@
 
 import type { IpPoolRuntime } from '../ip-pool.ts'
 import type { PoolState, ExitSource, ProbeFailure } from '../pool/pool.ts'
+import { DEFAULT_PROBE_INTERVAL_MS } from '../pool/periodic-prober.ts'
 
 /** Bridge route prefix (same-origin, loopback-only). */
 export const IP_POOL_BRIDGE_PREFIX = '/api/opencode2dsh/ip-pool'
@@ -171,12 +172,9 @@ export function buildStatusView(
     prober: runtime
       ? runtime.prober.stats
       : { queued: 0, inFlight: 0, enqueued: 0, completed: 0 },
-    // The loop is part of the runtime contract, but this view is also built
-    // over partial fakes (tests) and over a runtime assembled before the loop
-    // exists, so degrade to a disabled stub instead of throwing.
-    periodic: runtime?.periodic
+    periodic: runtime
       ? runtime.periodic.stats
-      : { running: false, lastRunAt: 0, lastQueued: 0, intervalMs: 10 * 60_000 },
+      : { running: false, lastRunAt: 0, lastQueued: 0, intervalMs: DEFAULT_PROBE_INTERVAL_MS },
     refill: runtime?.refill
       ? { ...runtime.refill.lastRound, progress: runtime.refill.progress }
       : null,

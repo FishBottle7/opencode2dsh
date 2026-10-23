@@ -113,9 +113,12 @@ export class RoutingInstaller {
       pool: this.#deps.pool,
       undici: this.#deps.undici,
       proxyHosts: this.#deps.proxyHosts,
-      onTransportDeath: this.#deps.onTransportDeath,
       logger: this.#deps.logger,
     })
+    // Attach the verify-on-death hook (issue #106) to the fresh router; the
+    // setter is the single mechanism (see PoolRoutingDispatcher). It may still
+    // be undefined here — the runtime installs it once its probe queue exists.
+    router.setTransportDeathObserver(this.#deps.onTransportDeath)
     // Read BEFORE swapping: undici's `setGlobalDispatcher` returns void (not
     // the replaced dispatcher) on Node 24 / undici 8.x — verified live, it
     // yields `undefined`. The old code trusted a return value that is never

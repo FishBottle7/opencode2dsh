@@ -65,6 +65,10 @@ const UNMEASURED_RETRY_MS = 30 * 60_000
  */
 const DEAD_RETRY_SHARE = 0.25
 
+/** Default tick (docs §4.6 probeIntervalMs): shared by the constructor default,
+ *  the runtime's boot seed and the /status stub so they cannot drift apart. */
+export const DEFAULT_PROBE_INTERVAL_MS = 10 * 60_000
+
 export interface PeriodicProbeOptions {
   /** Tick interval (docs §4.6 probeIntervalMs, default 10min). */
   intervalMs?: number
@@ -80,6 +84,14 @@ export interface ProbeCandidate {
   reason: 'cooled' | 'never-probed' | 'dead-retry' | 'stale'
 }
 
+/**
+ * The live (non-dead) buckets, in priority order. Dead retries are deliberately
+ * not part of this union: they carry their own rotation (`#deadCursor`) and are
+ * appended after the reserved live share.
+ */
+type LiveReason = 'cooled' | 'never-probed' | 'stale'
+type LiveCandidate = ProbeCandidate & { reason: LiveReason }
+
 export class PeriodicProber {
   readonly #pool: ExitPool
   readonly #enqueue: (exitId: string) => Promise<unknown>
@@ -94,10 +106,10 @@ export class PeriodicProber {
   /** Rotating start offset into the due dead-retry list, so consecutive rounds
    *  cover different slices instead of re-probing the same head forever. */
   #deadCursor = 0
-  /** Rotating start offset per live bucket (issue #106). Insertion order plus
-   *  a stable cap re-probes the same head of the list every round, so the rest
-   *  of the bucket never gets measured. Keyed by candidate reason. */
-  #bucketCursor: Record<string, number> = {}
+  /** Rotating start offset per live bucket (issue #106): insertion order plus a
+   *  stable cap re-probes the same head of the list every round, so the rest of
+   *  the bucket never gets measured. */
+  readonly #bucketCursor: Record<LiveReason, number> = { cooled: 0, 'never-probed': 0, stale: 0 }
 
   constructor(
     pool: ExitPool,
@@ -106,7 +118,7 @@ export class PeriodicProber {
   ) {
     this.#pool = pool
     this.#enqueue = enqueue
-    this.#intervalMs = options.intervalMs ?? 10 * 60_000
+    this.#intervalMs = options.intervalMs ?? DEFAULT_PROBE_INTERVAL_MS
     this.#maxPerRound = options.maxPerRound ?? 20
     this.#now = options.now ?? Date.now
   }
@@ -152,35 +164,19 @@ export class PeriodicProber {
   }
 
   /**
-   * Exits worth re-probing right now, most-degraded first. Pure read of pool
-   * state, so the selection is unit-testable without timers.
+   * Exits worth re-probing right now. Pure read of pool state, so the selection
+   * is unit-testable without timers.
+   *
+   * Priority (docs §4.3): cooled → never-probed → stale, then dead retries —
+   * which also get a RESERVED share of the round (`DEAD_RETRY_SHARE`). The
+   * history behind both rules lives on `#selectableDeadRetries` and on those two
+   * constants; a second copy here is how the two descriptions end up drifting
+   * apart.
    */
   select(now = this.#now()): ProbeCandidate[] {
-    // A dead retry only earns its quota once the exit has actually been given
-    // time to come back. Measured live (2026-10-15) on a pool of 559 dead
-    // subscription exits: without a gate the prober re-probed the SAME first 20
-    // of them every 10 minutes, forever — ~2880 smokes a day spent re-learning
-    // that an already-proven-dead link is dead — while the other 539 never got
-    // their dead-retry chance at all, because `pool.list()` walks in insertion
-    // order and the per-round cap simply truncated it. A subscription node is
-    // disable-only (§3.5) with no other route back, so that starvation is how a
-    // recovered node stays out of rotation permanently.
-    //
-    // Rotating the start offset fixes the starvation and, with the cooldown
-    // gate, spaces each exit's retries out instead of hammering the same head
-    // of the list.
-    //
-    // Priority buckets (docs §4.3): re-measuring live-but-degraded exits
-    // comes before dead retries — a dead population large enough to fill the
-    // round would otherwise starve the live classes every round. Since issue
-    // #106 the reverse starvation is prevented too: dead retries get a
-    // RESERVED share of the round (DEAD_RETRY_SHARE), so a saturated
-    // never-probed/cooled queue can no longer keep a dead exit out of rotation
-    // indefinitely — which is exactly what made users believe the pool never
-    // re-checks a proxy unless they press the probe button.
-    const cooled: ProbeCandidate[] = []
-    const neverProbed: ProbeCandidate[] = []
-    const stale: ProbeCandidate[] = []
+    const cooled: LiveCandidate[] = []
+    const neverProbed: LiveCandidate[] = []
+    const stale: LiveCandidate[] = []
     const deadDue: string[] = []
     for (const entry of this.#pool.list()) {
       const health = entry.health
@@ -220,13 +216,13 @@ export class PeriodicProber {
     )
     const liveCap = Math.max(0, this.#maxPerRound - reserve)
     const out: ProbeCandidate[] = []
-    const take = (bucket: ProbeCandidate[]): void => {
+    const take = (reason: LiveReason, bucket: LiveCandidate[]): void => {
       const room = liveCap - out.length
-      if (room > 0) out.push(...this.#rotate(bucket, room))
+      if (room > 0) out.push(...this.#rotate(reason, bucket, room))
     }
-    take(cooled)
-    take(neverProbed)
-    take(stale)
+    take('cooled', cooled)
+    take('never-probed', neverProbed)
+    take('stale', stale)
     // Dead retries take the reserved slots and then any room the live buckets
     // left unused; #selectableDeadRetries advances its cursor by exactly what
     // it hands out, so no retry window is skipped.
@@ -236,13 +232,12 @@ export class PeriodicProber {
     return out
   }
 
-  /** `take` entries of one live bucket starting at its rotating offset. */
-  #rotate(bucket: ProbeCandidate[], take: number): ProbeCandidate[] {
+  /** `take` entries of one live bucket starting at that bucket's rotating offset. */
+  #rotate(reason: LiveReason, bucket: LiveCandidate[], take: number): LiveCandidate[] {
     if (bucket.length === 0 || take <= 0) return []
-    const reason = bucket[0]!.reason
-    const start = (this.#bucketCursor[reason] ?? 0) % bucket.length
+    const start = this.#bucketCursor[reason] % bucket.length
     const count = Math.min(take, bucket.length)
-    const out: ProbeCandidate[] = []
+    const out: LiveCandidate[] = []
     for (let i = 0; i < count; i += 1) out.push(bucket[(start + i) % bucket.length]!)
     this.#bucketCursor[reason] = (start + count) % bucket.length
     return out
@@ -269,7 +264,9 @@ export class PeriodicProber {
    *
    * Takes the due id list instead of re-deriving it, because the caller already
    * walked the table once (issue #106 split the "who is due" scan from the
-   * "who gets the reserved share" decision).
+   * "who gets the reserved share" decision). The caller also guarantees `limit`
+   * slots for the result (`DEAD_RETRY_SHARE`), which is what stops the live
+   * buckets from truncating this list away entirely.
    */
   #selectableDeadRetries(due: string[], limit: number): string[] {
     if (due.length === 0 || limit <= 0) return []

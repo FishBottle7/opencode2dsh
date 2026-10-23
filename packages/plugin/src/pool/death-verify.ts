@@ -57,6 +57,10 @@ export function createDeathVerifier(deps: DeathVerifierDeps): (exitId: string) =
     // a verdict nothing is waiting on.
     if (entry === undefined || entry.health.state !== 'dead') return
     verifying.add(exitId)
+    // Deferred by a microtask on purpose: the caller is the dispatcher's
+    // handler callback (a request that is failing right now), and `probe` starts
+    // the probe synchronously up to its first await. Queueing first keeps a
+    // fresh probe out of the teardown of the request that discovered the death.
     void Promise.resolve()
       .then(() => deps.probe(exitId))
       .catch((err: unknown) => {

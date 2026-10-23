@@ -21,7 +21,7 @@ import { ExitPool, gradeOf, type ExitNode, type ExitProtocol } from './pool/pool
 import type { UndiciSeam } from './pool/dispatcher.ts'
 import type { AdmissionDeps } from './pool/admission.ts'
 import { Prober } from './pool/prober.ts'
-import { PeriodicProber } from './pool/periodic-prober.ts'
+import { DEFAULT_PROBE_INTERVAL_MS, PeriodicProber } from './pool/periodic-prober.ts'
 import { RefillScheduler } from './pool/refill.ts'
 import { SubscriptionFetcher } from './pool/subscription-fetcher.ts'
 import { SingBoxSupervisor } from './pool/singbox.ts'
@@ -112,8 +112,6 @@ export interface IpPoolRuntime {
     readonly enabled: boolean
     /** R1 coexistence: why the routing layer deferred (null when active). */
     readonly deferredReason: string | null
-    /** Install/refresh the verify-on-death hook (issue #106). */
-    setTransportDeathObserver?(next: ((exitId: string) => void) | undefined): void
   }
   /** Shared probe scheduler (admission + periodic probes + UI-triggered). */
   prober: Prober
@@ -250,7 +248,7 @@ export async function startIpPool(
     admissionDeps.blockedCountries = current.free?.blockedCountries
     admissionDeps.smokeModel = probeModels[0]
     prober.setMaxConcurrent(current.maxConcurrentProbes ?? 3)
-    periodicRef?.setIntervalMs(current.probeIntervalMs ?? 10 * 60_000)
+    periodicRef?.setIntervalMs(current.probeIntervalMs ?? DEFAULT_PROBE_INTERVAL_MS)
     installer.setProxyHosts?.(current.proxyHosts)
 
     // Free loop on/off + restart on target change (interval fixed 10min).
@@ -415,7 +413,7 @@ export async function startIpPool(
   // The dispatcher may already be installed (non-empty pool at boot), and the
   // installer rebuilds it on every enable flip, so the hook is pushed through
   // the installer rather than only handed to the constructor.
-  installer.setTransportDeathObserver?.(verifyDeath)
+  installer.setTransportDeathObserver(verifyDeath)
 
   // Periodic health probe (docs §4.3): the loop that re-measures cooled-down,
   // never-probed and dead exits. Without it a subscription node whose smoke
@@ -428,7 +426,7 @@ export async function startIpPool(
   // effect after the next settings save — the loop always ticked at the 10min
   // default meanwhile (issue #106). Later settings commits still hot-apply.
   const periodic = new PeriodicProber(pool, (exitId) => probeExit(exitId), {
-    intervalMs: config.ipPool?.probeIntervalMs ?? 10 * 60_000,
+    intervalMs: config.ipPool?.probeIntervalMs,
   })
   periodicRef = periodic
   if (pool.snapshot().total > 0) periodic.start()
