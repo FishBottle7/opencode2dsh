@@ -458,6 +458,7 @@ POST {zen}/v1/chat/completions
 | 周期 | 冷却到期的 + 从未探过的（新入池出口）+ dead 复探 + suspect 待复核的 | 默认 10min（probeIntervalMs，单轮上限 20） |
 | 按需 | 设置页单出口「探测」/「批量探活」按钮 | 用户点击 |
 | 被动 | 真实请求的成败写入两级健康（免费的探活） | 每次请求 |
+| 死亡复核 | 真实流量刚判死（transport）的出口立即插队复探一次（#106） | 每次死亡（在途去重） |
 
 周期探活由 `PeriodicProber` 驱动（`src/pool/periodic-prober.ts`）。挑选顺序即上表优先级，
 仍在冷却期的出口不入选——探测要烧匿名通道配额，不能白探。**为什么它必须存在**
@@ -465,6 +466,34 @@ POST {zen}/v1/chat/completions
 `exitIP: '' / latencyMs: 0`，因为订阅刷新用 `!pool.has(address)` 过滤、从不重新验证
 已在表里的节点；dead 的 manual/subscription 出口（只禁用不删除，§3.5）更是完全没有
 回池路径。
+
+**周期探活的公平性约束（2026-10-21 修订，issue #106）**：上面这条「挑选顺序」先前把
+dead 复探排在最后，再被单轮上限截断——于是死链能否回池完全取决于池里有没有别的待探
+出口。实测（issue #106 的原始报告）：一个池里有 ≥20 个 `latencyMs` 恒为 0 的订阅出口
+时，dead-retry 一轮都轮不到，用户只能点「批量探活」把节点捞回来，于是合理地被理解成
+「不点按钮就不复核」。现在：
+
+- **dead-retry 保底份额**（`DEAD_RETRY_SHARE` 25%，至少 1 个）：live 桶（cooled /
+  never-probed / stale）仍按上表优先，但只能拿走扣除保底后的名额；live 用不满时剩余
+  名额回流给 dead。
+- **未测出 facts 的出口退避**（`UNMEASURED_RETRY_MS` 30min）：`never-probed` 的判据是
+  `unknown || latencyMs <= 0`，而回声端点被墙的信任节点入池时 `latencyMs` 恒为 0、探完
+  也填不上（§4.5 受信任回退）。这类出口不再每轮抢名额；真正的新出口
+  （`lastProbedAt = 0`）仍旧立刻探。
+- **每个桶各自轮转**：单轮上限 + `pool.list()` 插入序会让同一批头部出口吃掉每一轮，
+  现在每个桶有自己的游标、按实际取出的条数前移，一轮结束从下一个开始。
+- **一轮不再串行 `await`**：整轮一次性交给 `Prober`（per-exit 串行与全局并发上限仍由
+  它保证），否则 20 个超时出口就能把一轮拖过一个 tick，而下一轮会因上一轮未完成被跳过。
+
+**死链即时复核（2026-10-21 修订，issue #106）**：`markDeadStrike` 是「一次 transport
+失败即 dead」（§4.2），而真实流量的死亡来源全部落在这一格：dispatcher 的静默哨兵
+（窗口 (a) 默认 2s，覆盖「连代理 + CONNECT」这一段，慢节点会被它判死）、真实
+`onResponseError`、以及内容落地后的断流（`reportStreamFailure`）。快速退出轮换是对的
+（同一回合再选中黑洞更糟），但回池原来只剩 30 分钟的 dead-retry 门槛——一次抖动等于
+半小时不可用，几次轮换就能把池打空。现在每次死亡都会立即入队一次复核探测
+（`src/pool/death-verify.ts`）：走同一个 `Prober` 队列与 `applyProbeVerdict`，探活通过
+即回轮换，仍为 `transport` 则维持 dead 并刷新时间戳；代价正好是 30 分钟后本来必花的
+那一次冒烟，且在途去重（一次失败风暴只排一次）。
 
 **订阅刷新同样是增量复探（2026-10-15 修订）**：刷新**不得**每轮重探整张出口表。实测
 2026-10-15：`enqueued` 涨到 2613 而表里只有 400 个出口（`refreshMs` 配的是 6 小时），
@@ -514,11 +543,13 @@ POST {zen}/v1/chat/completions
 | admissionFanout | **300** | 粗筛暴力并发（只打野生候选+IP 服务，不碰 Zen，§4.5；GoProxy ValidateConcurrency 同值） |
 | probeTimeoutMs | 8000 | 单探测超时 |
 | maxResponseMs | 3000 | 准入延迟门槛（critical 态放宽 6000） |
-| probeIntervalMs | 10min | 周期探活 + refill 状态检查节拍（上一轮未跑完则顺延） |
+| probeIntervalMs | 10min | 周期探活 + refill 状态检查节拍（上一轮未跑完则顺延）。**启动即按此值播种**（#106：先前构造发生在 applyConfig 之后，配置值只在下次设置保存前不生效）；设置页可调，热更新到同一对象 |
 | probeMaxPerRound | 20 | 周期探活单轮复探上限（每探一个都烧匿名通道配额，470 个订阅出口不能一轮打光） |
+| deadRetryShare | 25%（≥1） | 单轮里给 dead 复探预留的份额（#106）：live 桶优先但不得占满，避免死链回池被饿死 |
 | limitedCooldownBase | 60s | 首次 429 冷却 |
 | limitedCooldownMax | 30min | 指数退避上限 |
-| deadRetryMs | 30min | dead 出口重新探测间隔（从被打死一刻起算，`markDeadStrike` 记录死亡时间戳） |
+| deadRetryMs | 30min | dead 出口重新探测间隔（从被打死一刻起算，`markDeadStrike` 记录死亡时间戳）。真实流量判死时的即时复核见 §4.3，不走这条门槛 |
+| unmeasuredRetryMs | 30min | 探过但仍测不出 facts（`latencyMs` 恒为 0）的出口再次入队的最小间隔（#106）：否则它们每轮抢名额、并把它后面的 dead 复探挤掉 |
 | avoidMs | 30s | avoid 名单（旋转失败 backoff）有效期 |
 | modelBanConfirmations | 2 | suspect → banned 确认次数（防瞬时抖动误杀） |
 | maxRotateAttempts | 3 | 单请求换出口上限（§3.4） |
@@ -529,7 +560,10 @@ POST {zen}/v1/chat/completions
 | subscription.userAgent | `clash-verge/v2.0` | 订阅拉取的 User-Agent。机场普遍按 UA 做白名单：不在名单里会返回错误页，实测某机场对 `clash-verge/1.6.0` 直接 502 Bad Gateway、对 `clash-verge/v2.0` 正常；部分机场还按 UA 决定**返回格式**（Clash 形状给 `proxies:` YAML，v2ray 形状给 base64 链接）。空值回落默认值。 |
 | pinnedStrict | false | 绝对固定模式（§3.6）：true 时 pinned 失败透传、不换出口不直连 |
 
-全部进 settings namespace，设置页可调（maxConcurrentProbes 也开放：有些用户宁可慢也不并发）。
+探活相关的可调项（`probeModels` / `maxConcurrentProbes` / `probeIntervalMs` / `maxRotateAttempts`）进
+settings namespace，设置页可调（`maxConcurrentProbes` 也开放：有些用户宁可慢也不并发；
+`probeIntervalMs` 见 #106）；`probeMaxPerRound`、`deadRetryShare`、`deadRetryMs`、
+`unmeasuredRetryMs` 等仍是代码内常量，需要时再上提。
 
 ## 5. 设置页（DSH 设置 → 插件 → opencode2dsh 详情）
 
@@ -602,7 +636,7 @@ Config = Schema.object({
 
 dsh-llm-proxy 的 bridge 有四个面（describe/mutate/models/test），前两个是 rc.6 allowlist 逼出来的 settings 兜底。rc.2 宿主无 allowlist，我们只保留后两类面的思路：
 
-- `POST /status`：池状态机快照——四态徽章 + 可用/容量 + 来源计数（free/manual/subscription）+ 两级健康（出口表：地址/来源/位置/延迟/质量/出口 IP/状态/冷却到期时刻 + 封禁表：(出口, 模型, bannedAt)）+ Prober 队列进度（enqueued/completed/inFlight/queued）+ refill 上轮摘要 + 订阅层状态（running、pendingConversion 数、convertedAdmitted、lastFetch、lastError——**不含 URL 明文**）。返回结构化 JSON，卡片 3s 轮询（探活、补充或订阅刷新进行中 1s）。
+- `POST /status`：池状态机快照——四态徽章 + 可用/容量 + 来源计数（free/manual/subscription）+ 两级健康（出口表：地址/来源/位置/延迟/质量/出口 IP/状态/冷却到期时刻 + 封禁表：(出口, 模型, bannedAt)）+ Prober 队列进度（enqueued/completed/inFlight/queued）+ 周期探活自身状态（`periodic`：running / lastRunAt（0 = 从未运行）/ lastQueued / 实际生效的 intervalMs——没有它，队列排空在「循环在跑」与「循环从没启动」两种情况下完全一样，用户只能推断出「没有自动探活」）+ refill 上轮摘要 + 订阅层状态（running、pendingConversion 数、convertedAdmitted、lastFetch、lastError——**不含 URL 明文**）。返回结构化 JSON，卡片 3s 轮询（探活、补充或订阅刷新进行中 1s）。
 - `POST /probe`：`{scope: 'all'|'exit'|'refill'|'subscriptions', exitId?}`。`all`：全池出口 × probeModels 的周期探测一次（入 Prober 队列，返回队列长度，前端看 /status 进度）；`exit`：单出口插队探测；`refill`：手动触发一次状态机 refill 轮（免费源抓取+准入）；`subscriptions`：手动触发一次订阅拉取+转换轮（重取已配置的订阅 URL，加密节点交 sing-box，对应卡片「立即刷新」；未配置 URL 时返回 `no-subscriptions`，拉取失败返回 `subscription-refresh-failed`；正在刷新时等待同一轮完成）。两条手动轮次刻意分开：`refill` 抓的是公共免费代理源，`subscriptions` 只碰用户自己的订阅，互不代替。探测在宿主侧跑：走 Prober 两级调度（同出口串行 + 全局上限），不碰浏览器。
 - 路由护栏照抄 dsh-llm-proxy settings.js：loopback socket + 规范 Host + same-origin 三重校验、JSON body 上限、`{ok, code, message}` 信封。**不做 settings 代理面**（官方通道在）。
 - 页面注册进 `plugins.item`（`@deepseek-ai/dsh-client-ui-plugin-manager` 拥有的 list slot，`id: 'opencode2dsh'`）；插件页拥有卡片外框、标题、one-liner 与保存按钮，`view:'summary'` 返回描述、`view:'page'` 返回表单，保存走共享 `SettingsForm` 外框。挂载门控 `ctx.configForms.whileServed(['opencode2dsh'], …)`，官方 form ready 之前不渲染。0.1.7 之前的 keyed `settings.plugin.item` 与双形态兼容分支都已删除。
