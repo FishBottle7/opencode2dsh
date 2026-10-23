@@ -650,3 +650,84 @@ test('dispatcher sentinel: window (b) is looser than (a) — a slow LLM TTFB beh
   assert.deepEqual(pool.passiveStats('ttfb:1'), { ok: 1, limited: 0, refused: 0, dead: 0, transport: 0 }, 'slow TTFB behind a live tunnel classified ok, never struck')
   assert.equal(pool.isUsable('ttfb:1', 'm'), true)
 })
+
+// -- verify-on-death (issue #106) ----------------------------------------------
+// A transport failure marks an exit dead on the FIRST strike, and the only way
+// back used to be the 30-minute periodic retry. The routing layer now hands
+// every death it records to the runtime's verification probe, so the exit is
+// re-measured immediately instead of after "up to 30 minutes or a manual click".
+
+test('dispatcher verify-on-death: a sentinel death is reported exactly once (#106)', async () => {
+  const pool = new ExitPool()
+  pool.add(node({ id: 'mute:1', exitIP: '1.1.1.1' }))
+  const mute = {
+    Agent: class { constructor() { return { dispatch: () => true, close: () => Promise.resolve(), destroy: () => Promise.resolve() } } },
+    ProxyAgent: class {
+      constructor() {
+        return { dispatch: () => true, close: () => Promise.resolve(), destroy: () => Promise.resolve() }
+      }
+    },
+    setGlobalDispatcher: () => undefined,
+    getGlobalDispatcher: () => ({ dispatch: () => true }),
+  }
+  const died: string[] = []
+  const router = new PoolRoutingDispatcher({
+    pool,
+    undici: mute as never,
+    proxyHosts: ['opencode.ai'],
+    sentinelMs: 40,
+    onTransportDeath: (exitId) => died.push(exitId),
+  })
+  routingContext.run({ model: 'm', session: 's' }, () => {
+    router.dispatch({ origin: 'https://opencode.ai/x' } as never, {} as never)
+  })
+  assert.deepEqual(died, [], 'nothing is verified before the silence deadline')
+  await new Promise((r) => setTimeout(r, 120))
+  assert.deepEqual(died, ['mute:1'], 'the one recorded death is handed over once')
+})
+
+test('dispatcher verify-on-death: an answered request reports nothing (#106)', async () => {
+  const pool = new ExitPool()
+  pool.add(node({ id: 'live:1', exitIP: '1.1.1.1' }))
+  const answering = respondingSeam(() => 200)
+  const died: string[] = []
+  const router = new PoolRoutingDispatcher({
+    pool,
+    undici: answering.seam as never,
+    proxyHosts: ['opencode.ai'],
+    sentinelMs: 40,
+    onTransportDeath: (exitId) => died.push(exitId),
+  })
+  routingContext.run({ model: 'm', session: 's' }, () => {
+    router.dispatch({ origin: 'https://opencode.ai/x' } as never, {} as never)
+  })
+  await new Promise((r) => setTimeout(r, 120))
+  assert.deepEqual(died, [], 'a live exit is never sent to the verifier')
+})
+
+test('dispatcher: an unusable pool falls back to direct and says so, throttled (#106)', () => {
+  // The state the #106 reporter saw: every exit dead, so `pick` returns null and
+  // traffic silently goes direct — which on a proxied-only host surfaces as
+  // "Connection error." with no hint that the pool gave up.
+  const pool = new ExitPool()
+  pool.add(node({ id: 'dead:1', exitIP: '1.1.1.1' }))
+  pool.markDead('dead:1')
+  const { seam, hops } = fakeSeam()
+  const warnings: string[] = []
+  const router = new PoolRoutingDispatcher({
+    pool,
+    undici: seam as never,
+    proxyHosts: ['opencode.ai'],
+    logger: { warn: (message) => warnings.push(message) },
+  })
+  const handler = {} as never
+  routingContext.run({ model: 'm', session: 's1' }, () => {
+    router.dispatch({ origin: 'https://opencode.ai/x' } as never, handler)
+  })
+  routingContext.run({ model: 'm', session: 's2' }, () => {
+    router.dispatch({ origin: 'https://opencode.ai/x' } as never, handler)
+  })
+  assert.deepEqual(hops, ['direct', 'direct'], 'never fail closed: the request still goes out')
+  assert.equal(warnings.filter((w) => /goes DIRECT/.test(w)).length, 1, 'announced once, not per request')
+  assert.match(warnings[0]!, /dead/)
+})

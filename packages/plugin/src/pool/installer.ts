@@ -26,6 +26,8 @@ export interface InstallerDeps {
   pool: ExitPool
   undici: UndiciSeam
   proxyHosts?: string[]
+  /** Verify-on-death hook handed to every installed router (issue #106). */
+  onTransportDeath?: (exitId: string) => void
   logger?: { info(message: string): void; warn(message: string): void }
 }
 
@@ -62,6 +64,13 @@ export class RoutingInstaller {
   setProxyHosts(hosts?: string[]): void {
     this.#deps.proxyHosts = hosts
     this.#current?.setProxyHosts(hosts)
+  }
+
+  /** Install/refresh the verify-on-death hook (issue #106; forwards to the
+   *  running router, and every later install() picks it up from the deps). */
+  setTransportDeathObserver(next: ((exitId: string) => void) | undefined): void {
+    this.#deps.onTransportDeath = next
+    this.#current?.setTransportDeathObserver(next)
   }
 
   /**
@@ -104,6 +113,7 @@ export class RoutingInstaller {
       pool: this.#deps.pool,
       undici: this.#deps.undici,
       proxyHosts: this.#deps.proxyHosts,
+      onTransportDeath: this.#deps.onTransportDeath,
       logger: this.#deps.logger,
     })
     // Read BEFORE swapping: undici's `setGlobalDispatcher` returns void (not
