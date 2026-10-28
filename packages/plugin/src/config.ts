@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path'
 import { platform } from 'node:process'
 
 import Schema from '@deepseek-ai/schemastery'
+import type { BunTransportConfig } from './adapter/bun-transport.ts'
 
 import {
   DEFAULT_GC_PERCENT,
@@ -78,6 +79,8 @@ export interface Opencode2dshConfig {
    * Disabled/absent keeps the anonymous path byte-for-byte unchanged.
    */
   delegation?: DelegationConfig
+  /** Opt-in v2 compatibility; see docs/free-lane-20261028.md. */
+  bunTransport?: BunTransportConfig
 }
 
 /**
@@ -225,6 +228,12 @@ export const Config = Schema.object({
   responsesBodyIdleMs: Schema.number().step(1).min(1).max(600_000),
   /** The ip-pool settings form (docs/ip-pool.md §5.1); served as this entry. */
   ipPool: IpPoolConfigSchema.volatile(),
+  /** Opt-in anonymous inference compatibility; no runtime is downloaded. */
+  bunTransport: Schema.object({
+    enabled: Schema.boolean().default(false),
+    bunPath: Schema.string().default('bun'),
+    clientVersion: Schema.string().default('2.2.0'),
+  }),
   /**
    * Local OpenCode delegation (docs/delegation.md, issue #76). Ordinary config
    * (not a live settings form): flipping it means editing the profile patch, so

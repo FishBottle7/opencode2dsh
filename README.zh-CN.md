@@ -62,6 +62,11 @@ dsh plugin --profile web add ./opencode2dsh-dsh-plugin-<version>.tgz
 需要 DSH（DeepSeek Harness）0.1.7 及以上、带 web profile（IP 池设置页依赖 0.1.7
 的插件页契约）；Node.js ≥ 20（DSH 能跑就满足）；出站 HTTPS 需可达 `opencode.ai` 与 `models.dev`。
 
+
+### 可选：Bun / OpenCode v2 相容传输（#108）
+
+如果官方 v2 能用、插件却持续返回 `429 FreeUsageLimitError`，可选择使用现有的 Bun（实测 1.4.4）进行匿名推理传输。默认关闭，不下载二进制，不接管 DSH 工具；不兼容 Node IP 池，启用时须关闭 IP 池。配置、实测矩阵及限制见 [2026-10-28 相容说明](docs/free-lane-20261028.md)。这不保证解除真正的用量限制。
+
 ## 配置
 
 默认配置开箱即用。需要覆盖时，编辑 profile 的 `cordis.patch.yml`：

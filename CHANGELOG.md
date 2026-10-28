@@ -5,6 +5,7 @@
 ### Added
 
 - The IP-pool settings card now shows what the automatic probe loop is doing, and lets it be tuned (#106). `/status` gained a `periodic` block — `running`, `lastRunAt` (0 = never), `lastQueued`, and the **effective** `intervalMs` — and the probe section renders `每 N 分钟一轮 · 上次 HH:MM:SS 复探 K 个` (with distinct wording for "not yet" and "not running"). Before this the card exposed only the shared queue counters (`queued/inFlight/enqueued/completed`), which read identically whether the periodic loop was working or had never started, so "does anything re-check my exits without me pressing a button?" was unanswerable from the page. The same section now also exposes `probeIntervalMs` as an editable field (ms, same convention as `refreshMs`, validated 1 minute – 24 hours; a save hot-applies to the running loop). The reporter could previously neither see nor change the cadence.
+- Add an opt-in Bun inference transport for the measured 2026-10-28 v2 compatibility refusal (#108), preserving DSH instructions, tools and streaming; default transport remains unchanged. See docs/free-lane-20261028.md for configuration and live-test limits.
 
 ### Fixed
 
