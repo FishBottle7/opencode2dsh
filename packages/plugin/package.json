@@ -45,7 +45,7 @@
     }
   },
   "scripts": {
-    "build": "tsdown src/index.ts --format esm --dts --out-dir lib --no-clean",
+    "build": "tsdown src/index.ts --format esm --dts --out-dir lib --no-clean && node ../../scripts/prepare-bun-worker.mjs",
     "prepack": "node -e \"require('fs').rmSync('lib',{recursive:true,force:true})\" && npm run build && npm run build:client && node ../../scripts/prepare-package.mjs",
     "typecheck": "tsc --noEmit",
     "test": "node --test \"test/*.test.ts\"",

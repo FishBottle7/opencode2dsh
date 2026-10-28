@@ -66,6 +66,11 @@ Requires DSH (DeepSeek Harness) 0.1.7 or newer with a web profile (the IP 池
 settings page rides the 0.1.7 Plugins page contract); Node.js ≥ 20 (already
 present if DSH runs); outbound HTTPS to `opencode.ai` and `models.dev`.
 
+
+### Optional: Bun / OpenCode v2 compatibility transport (#108)
+
+When official v2 works but this adapter persistently returns `429 FreeUsageLimitError`, an existing Bun installation (tested: 1.4.4) can be used for anonymous inference. Disabled by default; no runtime download and no external agent tool execution. It requires the Node IP pool to be disabled. See the [configuration, measured matrix and limits](docs/free-lane-20261028.md). This does not promise to remove real quota limits.
+
 ## Configuration
 
 Defaults work out of the box. Override via the profile's `cordis.patch.yml`:
