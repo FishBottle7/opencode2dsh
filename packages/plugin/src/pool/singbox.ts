@@ -34,6 +34,9 @@ export interface SingBoxOptions {
   /** Port-readiness wait (default 10s). */
   readyTimeoutMs?: number
   logger?: { info(message: string): void; warn(message: string): void }
+  /** Process seam (tests inject fake children; default node:child_process).
+   *  Only the sing-box invocations ride it — taskkill stays real. */
+  spawnFn?: typeof spawn
 }
 
 export interface ConvertedExit {
@@ -288,6 +291,12 @@ export function generateConfig(nodes: ParsedNode[], basePort = 30_000): Generate
 
 const STOP_GRACE_MS = 5_000
 
+/** Watchdog restart backoff: first retry after 1s, doubling, capped at 60s. */
+const WATCHDOG_BASE_BACKOFF_MS = 1_000
+const WATCHDOG_MAX_BACKOFF_MS = 60_000
+/** A run this long counts as stable: the next crash starts backoff from 1s. */
+const WATCHDOG_STABLE_MS = 5 * 60_000
+
 /** One readable line from a `sing-box check` run (its FATAL line is last). */
 function summarizeCheck(output: string): string {
   const lines = output
@@ -312,15 +321,36 @@ function canConnect(port: number, timeoutMs = 1_000): Promise<boolean> {
 
 export class SingBoxSupervisor {
   readonly #options: SingBoxOptions
+  readonly #spawn: typeof spawn
   #child: ChildProcess | null = null
   #running = false
   #configPath: string
   #dataDir: string
   #portMap = new Map<string, number>()
   #nodes: ParsedNode[] = []
+  /** Pending watchdog restart timer (null when none scheduled). */
+  #watchdog: NodeJS.Timeout | null = null
+  /** Crashes since the last stable run; drives the backoff ladder. */
+  #watchdogAttempt = 0
+  /** True while a reload() is in flight, so the watchdog never spawns a
+   *  second child alongside one (stale-child crashes are told apart by the
+   *  `#child !== child` check in the exit handler, not by this flag). */
+  #reloading = false
+  /** Owner-intent latch: set by stop(), cleared by an explicit reload() and
+   *  re-cleared only after a spawn actually happens. Without it, a dispose()
+   *  that lands while a watchdog restart is mid-reload leaves the spawned
+   *  child arming the watchdog forever — ghost restarts every ≤60s after the
+   *  plugin is gone (the reload cannot be cancelled once it spawns, so the
+   *  spawn itself re-checks the latch). */
+  #ownerStopped = false
+  /** Bumped by every stop(); a reload only re-clears the latch post-spawn
+   *  when NO stop() landed inside its window (epoch unchanged) — a stop that
+   *  races past the pre-spawn check must still win. */
+  #stopEpoch = 0
 
   constructor(options: SingBoxOptions) {
     this.#options = options
+    this.#spawn = options.spawnFn ?? spawn
     this.#dataDir = options.dataDir
     this.#configPath = join(options.dataDir, 'singbox-config.json')
   }
@@ -349,7 +379,7 @@ export class SingBoxSupervisor {
     }
     // bare name: check via version output (LookPath semantics)
     const probe = await new Promise<boolean>((resolve) => {
-      const child = spawn(bin, ['version'], { stdio: 'ignore' })
+      const child = this.#spawn(bin, ['version'], { stdio: 'ignore' })
       child.once('error', () => resolve(false))
       child.once('exit', (code) => resolve(code === 0))
     })
@@ -372,7 +402,7 @@ export class SingBoxSupervisor {
     await rm(configPath, { force: true })
     await rename(tmp, configPath)
     return await new Promise<{ ok: boolean; output: string }>((resolve) => {
-      const child = spawn(binary, ['check', '-c', configPath, '-D', this.#dataDir], { stdio: ['ignore', 'pipe', 'pipe'] })
+      const child = this.#spawn(binary, ['check', '-c', configPath, '-D', this.#dataDir], { stdio: ['ignore', 'pipe', 'pipe'] })
       let output = ''
       const collect = (chunk: Buffer): void => {
         // keep the tail: the fatal line is last, and a pathological config can
@@ -420,8 +450,89 @@ export class SingBoxSupervisor {
     return bad
   }
 
+  /**
+   * Crash watchdog (issue #106): every converted exit is one local port of ONE
+   * sing-box process, so a crash takes the whole encrypted-node pool down at
+   * once — and until this existed, real traffic then struck each exit dead
+   * individually (transport failures through dead local ports) while the only
+   * thing that brought the process back was the next subscription refresh,
+   * up to 30 minutes later. The exit verdicts recover through the prober's
+   * starvation fast-path; this watchdog is what brings the tunnel itself back
+   * in seconds. Backoff 1s -> 2s -> ... -> 60s; a stable run resets the ladder.
+   */
+  #scheduleWatchdog(): void {
+    // One pending restart at a time. NOTE: scheduling must NOT be gated on
+    // #reloading — a child can die inside reload()'s own port-readiness wait
+    // (crash-during-startup), and that reload then throws without ever
+    // clearing this timer; #watchdogRestart re-checks #reloading when the
+    // timer fires, which is the only place the guard belongs. It IS gated on
+    // the owner-intent latch: after stop()/dispose() the supervisor must stay
+    // down, whatever exit events stale children still emit.
+    if (this.#watchdog !== null) return
+    if (this.#ownerStopped) return
+    const backoff = Math.min(WATCHDOG_MAX_BACKOFF_MS, WATCHDOG_BASE_BACKOFF_MS * 2 ** this.#watchdogAttempt)
+    this.#watchdogAttempt += 1
+    this.#options.logger?.warn(
+      `opencode2dsh: sing-box exited unexpectedly; watchdog restart #${this.#watchdogAttempt} in ${Math.round(backoff / 1000)}s (${this.#nodes.length} converted exit(s) down until then)`,
+    )
+    this.#watchdog = setTimeout(() => {
+      this.#watchdog = null
+      void this.#watchdogRestart()
+    }, backoff)
+    this.#watchdog.unref?.()
+  }
+
+  #clearWatchdog(): void {
+    if (this.#watchdog === null) return
+    clearTimeout(this.#watchdog)
+    this.#watchdog = null
+  }
+
+  async #watchdogRestart(): Promise<void> {
+    // A subscription refresh (or an earlier watchdog pass) already brought a
+    // child back, or the pool was intentionally emptied — nothing to do.
+    // NOTE: a reload in flight is NOT a reason to stand down — re-arm instead.
+    // A large port table (hundreds of converted exits) makes the readiness
+    // scan outlast the 1s base backoff, so the timer can fire while the reload
+    // that will FAIL for the crashed child is still looping. Returning bare
+    // there left nobody holding the recovery: the reload threw afterwards and
+    // the tunnel stayed down until the next subscription refresh (the exact
+    // shape issue #106 reported). #scheduleWatchdog's single-timer guard makes
+    // this re-arm idempotent, and if the in-flight reload actually succeeds,
+    // the next fire exits on the #running check below.
+    if (this.#reloading) {
+      this.#scheduleWatchdog()
+      return
+    }
+    if (this.#nodes.length === 0) return
+    if (this.#child !== null && this.#running) return
+    try {
+      await this.reload(this.#nodes)
+    } catch (err) {
+      // reload already logged the reason; climb the backoff ladder and try again.
+      this.#options.logger?.warn(`opencode2dsh: sing-box watchdog restart failed (${err instanceof Error ? err.message : String(err)}); retrying with backoff`)
+      this.#scheduleWatchdog()
+    }
+  }
+
   /** Full reload: regenerate the config for the node list and (re)start. */
   async reload(nodes: ParsedNode[]): Promise<ConvertedExit[]> {
+    this.#clearWatchdog()
+    // An explicit reload is the owner asking for a RUNNING tunnel again —
+    // clear the stop latch (set by any earlier stop()/dispose()), and remember
+    // the stop epoch so the post-spawn re-clear can tell whether a NEW stop
+    // landed inside this reload's window.
+    this.#ownerStopped = false
+    const epochAtEntry = this.#stopEpoch
+    this.#reloading = true
+    try {
+      return await this.#reloadInner(nodes, epochAtEntry)
+    } finally {
+      this.#reloading = false
+    }
+  }
+
+  async #reloadInner(nodes: ParsedNode[], epochAtEntry: number): Promise<ConvertedExit[]> {
     // no tunnel nodes -> stop and clean (GoProxy Reload empty case)
     if (nodes.length === 0) {
       await this.stop()
@@ -455,24 +566,49 @@ export class SingBoxSupervisor {
     }
     const { config, portMap } = generated
 
-    await this.stop()
-    this.#child = spawn(binary, ['run', '-c', this.#configPath, '-D', this.#dataDir], {
+    // Internal restart — #killChild, NOT stop(): bumping the stop epoch here
+    // would make the post-spawn epoch check fail on every reload and leave the
+    // owner-stop latch stuck armed (watchdog permanently dead).
+    await this.#killChild()
+    // Cancellation point: a stop()/dispose() that landed while this reload was
+    // resolving must not be followed by a fresh child. Spawn is the one step
+    // that cannot be undone, so it is where the latch is re-checked.
+    if (this.#ownerStopped) return []
+    this.#child = this.#spawn(binary, ['run', '-c', this.#configPath, '-D', this.#dataDir], {
       stdio: ['ignore', 'ignore', 'pipe'],
     })
     const child = this.#child
     this.#running = true
     this.#nodes = usable
     this.#portMap = portMap
+    // A live child is the owner's intent made real — the stop latch a reload's
+    // own internal stop() set above is spent, but ONLY if no external stop()
+    // landed inside this reload's window (epoch unchanged): one that slipped
+    // past the pre-spawn check must still win and keep the watchdog disarmed.
+    if (this.#stopEpoch === epochAtEntry) this.#ownerStopped = false
+    // A run that survives the stability window forgives the crash history:
+    // the next crash starts the backoff ladder from the bottom again. The
+    // attempt guard keeps an old timer from erasing a NEWER crash's ladder.
+    if (this.#watchdogAttempt > 0) {
+      const attempt = this.#watchdogAttempt
+      const stable = setTimeout(() => {
+        if (this.#watchdogAttempt === attempt) this.#watchdogAttempt = 0
+      }, WATCHDOG_STABLE_MS)
+      stable.unref?.()
+    }
     child.stderr?.on('data', (chunk: Buffer) => {
       const text = chunk.toString('utf8').trim()
       if (text.length > 0) this.#options.logger?.info(`[sing-box] ${text}`)
     })
-    child.once('exit', () => {
-      if (this.#child === child) this.#running = false
-    })
-    child.once('error', () => {
-      if (this.#child === child) this.#running = false
-    })
+    // Unexpected loss of the child (not via stop()/reload(), which both clear
+    // #child first): every converted exit just went dark — restart it.
+    const onGone = (): void => {
+      if (this.#child !== child) return
+      this.#running = false
+      this.#scheduleWatchdog()
+    }
+    child.once('exit', onGone)
+    child.once('error', onGone)
 
     // port readiness (GoProxy: 20 x 500ms over the first port)
     const deadline = Date.now() + (this.#options.readyTimeoutMs ?? 10_000)
@@ -500,8 +636,20 @@ export class SingBoxSupervisor {
     return exits
   }
 
-  /** Graceful stop: interrupt -> grace -> kill (taskkill /T on Windows). */
+  /** Graceful stop: interrupt -> grace -> kill (taskkill /T on Windows).
+   *  External intent — arms the owner-stop latch and bumps its epoch. The
+   *  kill mechanics live in #killChild(), which is what reload() runs before
+   *  respawning (an internal restart must NOT bump the epoch, or every
+   *  successful reload would leave the latch stuck and the watchdog dead). */
   async stop(): Promise<void> {
+    this.#clearWatchdog()
+    this.#ownerStopped = true
+    this.#stopEpoch += 1
+    await this.#killChild()
+  }
+
+  /** The kill part of stop(), shared with reload()'s internal restart. */
+  async #killChild(): Promise<void> {
     const child = this.#child
     if (child === null || child.exitCode !== null) {
       this.#running = false

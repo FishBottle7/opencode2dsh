@@ -254,3 +254,98 @@ test('supervisor: reload([]) stops cleanly; missing binary surfaces a clear erro
   // a binary that cannot be resolved rejects with an actionable message
   await assert.rejects(() => supervisor.reload([vmessNode()]), /not found/i)
 })
+
+// Regression, issue #106: every converted exit is one local port of ONE
+// sing-box process, but until the watchdog existed a crash was only ever
+// repaired by the next subscription refresh (default 30min) — while real
+// traffic struck every exit dead one by one through the dead local ports.
+test('supervisor: an unexpected child exit is restarted by the watchdog; an intentional stop is not', async () => {
+  interface FakeChild {
+    pid: number
+    exitCode: number | null
+    stderr: { on(): void }
+    once(event: string, cb: (arg?: unknown) => void): void
+    kill(): boolean
+    emit(event: string, code?: number): void
+  }
+  const runChildren: FakeChild[] = []
+  const spawned: string[][] = []
+  const fakeChild = (): FakeChild => {
+    const listeners = new Map<string, Array<(arg?: unknown) => void>>()
+    const child: FakeChild = {
+      pid: 10_000 + runChildren.length,
+      exitCode: null,
+      stderr: { on() {} },
+      once(event, cb) { listeners.set(event, [...(listeners.get(event) ?? []), cb]) },
+      kill() { return true },
+      emit(event, code) {
+        if (event === 'exit') child.exitCode = code ?? 0
+        for (const cb of listeners.get(event) ?? []) cb(code)
+      },
+    }
+    return child
+  }
+  const spawnFn = ((_binary: string, args: string[]) => {
+    spawned.push(args)
+    const child = fakeChild()
+    if (args[0] === 'version' || args[0] === 'check') {
+      queueMicrotask(() => child.emit('exit', 0))
+    } else if (args[0] === 'run') {
+      runChildren.push(child)
+    }
+    return child as unknown as import('node:child_process').ChildProcess
+  }) as typeof import('node:child_process').spawn
+
+  const warns: string[] = []
+  const supervisor = new SingBoxSupervisor({
+    // a path that exists (resolveBinary's existsSync), never actually spawned
+    binPath: process.execPath,
+    dataDir: 'test-tmp-singbox-watchdog',
+    basePort: 39_123,
+    // > the 500ms readiness poll so a mid-startup crash is actually noticed
+    // (the loop checks #running once per iteration, before its 500ms sleep)
+    readyTimeoutMs: 1_500,
+    spawnFn,
+    logger: { info: () => {}, warn: (message) => { warns.push(message) } },
+  })
+
+  // First reload: the run child "crashes" while the readiness wait is still
+  // polling (the crash-during-startup window) — reload must surface that AND
+  // the watchdog must still be scheduled despite reload being in flight.
+  // POLL for the run child instead of sleeping a fixed gap: reload does real
+  // filesystem work (mkdir + config write) before spawning, and under AV/load
+  // a fixed 50ms sometimes ran before the child existed (TypeError instead of
+  // the crash being delivered — the flake this test shipped with).
+  const first = supervisor.reload([vmessNode()])
+  const spawnDeadline = Date.now() + 5_000
+  while (runChildren.length === 0 && Date.now() < spawnDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  assert.ok(runChildren.length > 0, 'the run child spawned within the deadline')
+  runChildren[0]!.emit('exit', 1)
+  await assert.rejects(() => first, /exited immediately/i)
+  assert.equal(supervisor.running, false)
+  assert.ok(warns.some((message) => message.includes('watchdog restart #1')),
+    'a crash inside the startup window still schedules the watchdog')
+
+  // The watchdog fires on its own (base backoff 1s) and rebuilds the tunnel
+  // with the SAME node list — no subscription refresh involved.
+  const deadline = Date.now() + 5_000
+  while (!supervisor.running && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50))
+  }
+  assert.equal(supervisor.running, true, 'the watchdog restart brought sing-box back')
+  const runs = () => spawned.filter((args) => args[0] === 'run').length
+  assert.equal(runs(), 2, 'exactly one watchdog restart, same nodes')
+  assert.ok(supervisor.portMap.has(nodeKeyOf(vmessNode())), 'the restart rebuilt the port map')
+
+  // An INTENTIONAL teardown must leave the watchdog disarmed: let the second
+  // child exit (which arms the next backoff timer on its own), then stop() —
+  // the pending restart must be cancelled, not fire.
+  spawned.length = 0
+  runChildren[1]!.emit('exit', 0) // exitCode set -> stop() takes the no-kill path
+  await supervisor.stop()
+  await new Promise((resolve) => setTimeout(resolve, 2_300))
+  assert.equal(runs(), 0, 'stop() cancels the pending watchdog restart; a stopped pool stays stopped')
+  assert.equal(supervisor.running, false)
+})
