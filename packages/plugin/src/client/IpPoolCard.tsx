@@ -73,6 +73,8 @@ export interface IpPoolSettingsValue {
   enabled: boolean
   probeModels: string[]
   maxConcurrentProbes: number
+  /** Periodic health-probe tick in ms (docs §4.6 probeIntervalMs, issue #106). */
+  probeIntervalMs: number
   free: { enabled: boolean; targetSize: number; blockedCountries: string[] }
   manual: string[]
   subscription: { urls: string[]; refreshMs: number; userAgent: string }
@@ -116,6 +118,8 @@ export interface PoolStatusView {
     passive: { ok: number; limited: number; refused: number; dead: number; transport: number }
   }>
   prober: { queued: number; inFlight: number; enqueued: number; completed: number }
+  /** Automatic (periodic) probe loop state — see bridge.ts PeriodicView. */
+  periodic: { running: boolean; lastRunAt: number; lastQueued: number; intervalMs: number }
   refill: {
     admitted: number; rejected: number; fetched: number; coarsePassed: number; state: string; at: number
     progress: { running: boolean; stage: 'fetch' | 'coarse' | 'admit' | 'idle'; sourcesDone: number; sourcesTotal: number; fetched: number; candidates: number; coarsePassed: number; coarseDone: number; admissions: number; admitted: number }
@@ -139,6 +143,7 @@ const DEFAULTS: IpPoolSettingsValue = {
   enabled: false,
   probeModels: [],
   maxConcurrentProbes: 3,
+  probeIntervalMs: 10 * 60_000,
   free: { enabled: true, targetSize: 20, blockedCountries: ['CN'] },
   manual: [],
   subscription: { urls: [], refreshMs: 30 * 60_000, userAgent: DEFAULT_SUBSCRIPTION_USER_AGENT },
@@ -153,6 +158,24 @@ const DEFAULTS: IpPoolSettingsValue = {
 function redactUrl(url: string): string {
   if (url.length <= 24) return url
   return url.slice(0, 12) + '…' + url.slice(-6)
+}
+
+/**
+ * HH:MM:SS of an epoch timestamp (local time).
+ *
+ * Local, not relative: the question this answers is "did the automatic loop run
+ * recently, and when exactly" (issue #106), and a wall-clock stamp is what a
+ * user can compare against their own log lines.
+ */
+function formatClock(at: number): string {
+  const date = new Date(at)
+  const pad = (value: number): string => String(value).padStart(2, '0')
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+}
+
+/** Effective periodic-probe interval in whole minutes (never "0 min"). */
+function periodicMinutes(intervalMs: number): number {
+  return Math.max(1, Math.round(intervalMs / 60_000))
 }
 
 /** Draft form state (strings for inputs; arrays kept as string lists). */
@@ -170,6 +193,7 @@ interface FormState {
   pinnedStrict: boolean
   probeModels: string[]
   maxConcurrentProbes: string
+  probeIntervalMs: string
 }
 
 function emptyForm(): FormState {
@@ -187,6 +211,7 @@ function emptyForm(): FormState {
     pinnedStrict: DEFAULTS.pinnedStrict,
     probeModels: [],
     maxConcurrentProbes: String(DEFAULTS.maxConcurrentProbes),
+    probeIntervalMs: String(DEFAULTS.probeIntervalMs),
   }
 }
 
@@ -205,6 +230,7 @@ function formFromValue(value: IpPoolSettingsValue): FormState {
     pinnedStrict: value.pinnedStrict,
     probeModels: [...value.probeModels],
     maxConcurrentProbes: String(value.maxConcurrentProbes),
+    probeIntervalMs: String(value.probeIntervalMs),
   }
 }
 
@@ -256,6 +282,7 @@ function diffWrites(form: FormState, value: IpPoolSettingsValue, base: Partial<I
   push('pinnedStrict', form.pinnedStrict, value.pinnedStrict, base.pinnedStrict)
   push('probeModels', form.probeModels, value.probeModels, base.probeModels)
   push('maxConcurrentProbes', Number(form.maxConcurrentProbes), value.maxConcurrentProbes, base.maxConcurrentProbes)
+  push('probeIntervalMs', Number(form.probeIntervalMs), value.probeIntervalMs, base.probeIntervalMs)
   return writes
 }
 
@@ -665,6 +692,9 @@ function CardBody(props: { settings: ConfigPageForm | undefined; t: IpPoolCardPr
     if (!/^\d+$/.test(form.targetSize.trim()) || size < 1 || size > 100) return t('invalidRange')
     const conc = Number(form.maxConcurrentProbes)
     if (!/^\d+$/.test(form.maxConcurrentProbes.trim()) || conc < 1 || conc > 8) return t('invalidRange')
+    // Same bounds as the settings schema: 1 minute .. 24 hours (issue #106).
+    const interval = Number(form.probeIntervalMs)
+    if (!/^\d+$/.test(form.probeIntervalMs.trim()) || interval < 60_000 || interval > 86_400_000) return t('invalidRange')
     const refresh = Number(form.refreshMs)
     if (!/^\d+$/.test(form.refreshMs.trim()) || refresh < 60_000) return t('invalidRange')
     for (const entry of form.manual) {
@@ -974,6 +1004,20 @@ function CardBody(props: { settings: ConfigPageForm | undefined; t: IpPoolCardPr
           step={1}
           onChange={(value) => { setSaved(false); setForm({ ...form, maxConcurrentProbes: value }) }}
         />
+        {/* Issue #106: the tick used to be a schema value the page never showed
+            (and that the boot path dropped entirely) — "make auto-probing more
+            responsive" was impossible from this page. */}
+        <TextField
+          label={t('probeInterval')}
+          hint={t('probeIntervalHint')}
+          value={form.probeIntervalMs}
+          testId="field-probeIntervalMs"
+          type="number"
+          min={60_000}
+          max={86_400_000}
+          step={60_000}
+          onChange={(value) => { setSaved(false); setForm({ ...form, probeIntervalMs: value }) }}
+        />
         <button
           type="button"
           className={styles.ghostButton}
@@ -983,6 +1027,26 @@ function CardBody(props: { settings: ConfigPageForm | undefined; t: IpPoolCardPr
         >
           {probing ? t('probeRunning').replace('{done}', String(probeDone)).replace('{total}', String(probeTotal)) : t('probeAll')}
         </button>
+        {/* Issue #106: the automatic loop's own state. Before this, the card
+            only showed the shared queue counters, which read identically
+            whether the loop was working or had never started — so "does
+            anything re-check my exits without me pressing a button?" was
+            unanswerable from this page. */}
+        {status !== null && (
+          <div className={styles.field} data-testid="field-autoProbe">
+            <span className={styles.fieldLabel}>{t('autoProbe')}</span>
+            <span className={styles.fieldHint}>
+              {status.periodic.lastRunAt === 0
+                ? t('autoProbeNever').replace('{interval}', String(periodicMinutes(status.periodic.intervalMs)))
+                : t('autoProbeLast')
+                  .replace('{interval}', String(periodicMinutes(status.periodic.intervalMs)))
+                  .replace('{time}', formatClock(status.periodic.lastRunAt))
+                  .replace('{count}', String(status.periodic.lastQueued))}
+            </span>
+            {!status.periodic.running && <span className={styles.fieldHint}>{t('autoProbePaused')}</span>}
+            <span className={styles.fieldHint}>{t('autoProbeHint')}</span>
+          </div>
+        )}
       </div>
 
       {form.enabled && (

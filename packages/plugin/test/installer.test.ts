@@ -15,7 +15,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { RoutingInstaller } from '../src/pool/installer.ts'
-import { PoolRoutingDispatcher } from '../src/pool/dispatcher.ts'
+import { PoolRoutingDispatcher, routingContext } from '../src/pool/dispatcher.ts'
 
 /** Minimal undici stand-in: a dispatcher slot with the real setter semantics. */
 function makeUndiciStub() {
@@ -39,6 +39,19 @@ function makeUndiciStub() {
   const stub = {
     Agent,
     initial,
+    /**
+     * Per-exit proxy agent; only constructed when a dispatch actually picks an
+     * exit, which the tests below do. It fails the request in transport, so a
+     * routed request records a death.
+     */
+    ProxyAgent: class {
+      dispatch(_options: unknown, handler: { onResponseError?: (controller: unknown, error: Error) => void }): boolean {
+        handler.onResponseError?.({} as never, new Error('connect ECONNREFUSED'))
+        return true
+      }
+      async close(): Promise<void> {}
+      async destroy(): Promise<void> {}
+    },
     /** The module fetch the installer swaps in (differs from the built-in). */
     fetch: function moduleFetch(_input: unknown, _init?: unknown): Promise<unknown> {
       return Promise.resolve({ ok: true })
@@ -221,4 +234,48 @@ test('the plugin fetch is saved and restored alongside the dispatcher', () => {
 
   installer.disable()
   assert.equal(globalThis.fetch, builtinFetch, 'the built-in fetch must come back')
+})
+
+test('the verify-on-death hook survives install, late attach and re-install (#106)', () => {
+  // Boot order is fixed: install() runs during assembly, but the runtime can only
+  // build its verifier once the probe queue exists. So the hook arrives through
+  // the setter — and an enable flip builds a NEW router, which must carry it
+  // over, or a re-enabled pool silently stops verifying its deaths.
+  const undici = makeUndiciStub()
+  const pool = {
+    get: (id: string) => (id === 'dead:1' ? { id: 'dead:1', protocol: 'http' } : null),
+    pick: () => 'dead:1',
+    has: () => true,
+    list: () => [],
+    snapshot: () => ({ total: 1 }),
+    recordPassive: () => 'ok',
+    recordPassiveTransport: () => {},
+    rerouteSession: () => {},
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  } as any
+  const installer = new RoutingInstaller({
+    pool,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    undici: undici as any,
+    proxyHosts: ['opencode.ai'],
+    logger: { info: () => {}, warn: () => {} },
+  })
+  const died: string[] = []
+  const dispatchRouted = (): void => {
+    const router = undici.peek() as PoolRoutingDispatcher
+    routingContext.run({ model: 'm', session: 's' }, () => {
+      router.dispatch({ origin: 'https://opencode.ai/x' } as never, {} as never)
+    })
+  }
+
+  installer.install()
+  installer.setTransportDeathObserver((id) => died.push(id))
+  dispatchRouted()
+  assert.deepEqual(died, ['dead:1'], 'a hook attached after install reaches the running router')
+
+  installer.disable()
+  installer.install() // the enable flip that rebuilds the router
+  died.length = 0
+  dispatchRouted()
+  assert.deepEqual(died, ['dead:1'], 'a re-installed router keeps the hook')
 })

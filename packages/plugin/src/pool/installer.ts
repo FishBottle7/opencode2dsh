@@ -26,6 +26,8 @@ export interface InstallerDeps {
   pool: ExitPool
   undici: UndiciSeam
   proxyHosts?: string[]
+  /** Verify-on-death hook handed to every installed router (issue #106). */
+  onTransportDeath?: (exitId: string) => void
   logger?: { info(message: string): void; warn(message: string): void }
 }
 
@@ -62,6 +64,13 @@ export class RoutingInstaller {
   setProxyHosts(hosts?: string[]): void {
     this.#deps.proxyHosts = hosts
     this.#current?.setProxyHosts(hosts)
+  }
+
+  /** Install/refresh the verify-on-death hook (issue #106; forwards to the
+   *  running router, and every later install() picks it up from the deps). */
+  setTransportDeathObserver(next: ((exitId: string) => void) | undefined): void {
+    this.#deps.onTransportDeath = next
+    this.#current?.setTransportDeathObserver(next)
   }
 
   /**
@@ -106,6 +115,10 @@ export class RoutingInstaller {
       proxyHosts: this.#deps.proxyHosts,
       logger: this.#deps.logger,
     })
+    // Attach the verify-on-death hook (issue #106) to the fresh router; the
+    // setter is the single mechanism (see PoolRoutingDispatcher). It may still
+    // be undefined here — the runtime installs it once its probe queue exists.
+    router.setTransportDeathObserver(this.#deps.onTransportDeath)
     // Read BEFORE swapping: undici's `setGlobalDispatcher` returns void (not
     // the replaced dispatcher) on Node 24 / undici 8.x — verified live, it
     // yields `undefined`. The old code trusted a return value that is never

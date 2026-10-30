@@ -77,6 +77,8 @@ export interface PoolRoutingOptions {
 
 const DEFAULT_PROXY_HOSTS = ['opencode.ai']
 const PROXY_PROTOCOL_PREFIX = /^[a-z0-9+.-]+:\/\//i
+/** Throttle for the "no usable exit, going direct" warning (issue #106). */
+const DIRECT_FALLBACK_WARN_MS = 30_000
 
 /** 'host:port' -> 'host' (bracket-aware) for host matching. */
 export function normalizeHost(host: string): string {
@@ -158,6 +160,7 @@ export class PoolRoutingDispatcher implements RoutingDispatcherSurface {
   #agentLruCap: number
   #sentinelMs: number
   #headersMs: number
+  #onTransportDeath?: (exitId: string) => void
   #logger?: { warn(message: string): void }
   /** Direct path for non-pool hosts and loopback. */
   #direct: Dispatcher
@@ -165,6 +168,8 @@ export class PoolRoutingDispatcher implements RoutingDispatcherSurface {
   #agents = new Map<string, Dispatcher>()
   #agentsOrder: string[] = []
   #closed = false
+  /** Last "no usable exit" warning (throttled; issue #106). */
+  #lastDirectWarnAt = 0
 
   constructor(options: PoolRoutingOptions) {
     this.#pool = options.pool
@@ -185,6 +190,20 @@ export class PoolRoutingDispatcher implements RoutingDispatcherSurface {
       ? new Set(hosts.map((host) => normalizeHost(host)))
       : new Set(DEFAULT_PROXY_HOSTS.map((host) => normalizeHost(host)))
     this.#proxyHosts = next
+  }
+
+  /**
+   * Attach/replace the verify-on-death hook (issue #106).
+   *
+   * A setter rather than a constructor option on purpose: the runtime can only
+   * build the verifier after its probe queue exists, which is AFTER this router
+   * was installed at boot — so the hook has to be attachable to a live router.
+   * It is called at most once per recorded transport death, never awaited, and a
+   * throwing observer is contained (logged) rather than propagated into the
+   * request path.
+   */
+  setTransportDeathObserver(next: ((exitId: string) => void) | undefined): void {
+    this.#onTransportDeath = next
   }
 
   /** The proxied-host set as configured (diagnostics / status bridge). */
@@ -246,7 +265,19 @@ export class PoolRoutingDispatcher implements RoutingDispatcherSurface {
     const session = context.session ?? 'default'
     const exitId = this.#pool.pick(session, model)
     if (exitId === null) {
-      // Pool unusable (empty / all cooling): direct, never fail closed (3.3).
+      // Pool unusable (empty / all cooling / all dead): direct, never fail
+      // closed (3.3). Say so, throttled (issue #106): a proxied host silently
+      // switching to a direct connection is indistinguishable in the user's
+      // chat from "every exit is broken", and it is the one state the pool can
+      // do nothing about — the report in #106 was exactly this, read as
+      // "proxies are marked dead and nothing verifies them".
+      const at = Date.now()
+      if (at - this.#lastDirectWarnAt >= DIRECT_FALLBACK_WARN_MS) {
+        this.#lastDirectWarnAt = at
+        this.#logger?.warn(
+          `opencode2dsh: no usable exit for ${host} — request goes DIRECT (pool empty, all dead, cooling or banned)`,
+        )
+      }
       return this.#direct.dispatch(options, handler)
     }
     const agent = this.#agentFor(exitId)
@@ -308,6 +339,17 @@ export class PoolRoutingDispatcher implements RoutingDispatcherSurface {
       classified = true
       pool.recordPassiveTransport(exitId)
       pool.rerouteSession(session)
+      // Issue #106: hand the death to the runtime's verification probe. This is
+      // the ONLY place real traffic records a death at the routing layer, so it
+      // is the one place the hook belongs. Guarded because a throwing observer
+      // must never corrupt the request path the way a lost error would.
+      try {
+        this.#onTransportDeath?.(exitId)
+      } catch (err) {
+        this.#logger?.warn(
+          `opencode2dsh: transport-death observer threw for ${exitId}: ${err instanceof Error ? err.message : String(err)}`,
+        )
+      }
       return true
     }
     /**

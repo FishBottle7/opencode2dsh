@@ -131,6 +131,7 @@ function fakeRuntime(overrides: Record<string, unknown> = {}): unknown {
     pool,
     installer: { enabled: true, deferredReason: null, install() {}, disable() {}, dispose() {} },
     prober: { stats: { queued: 0, inFlight: 1, enqueued: 5, completed: 4 } },
+    periodic: { stats: { running: true, lastRunAt: 1_700_000_000_000, lastQueued: 3, intervalMs: 120_000 } },
     refill: { lastRound: { admitted: 2, rejected: 30, fetched: 1600, coarsePassed: 8, state: 'warning', at: 456 } },
     subscriptions: {
       urlCount: 2,
@@ -160,6 +161,9 @@ test('status view projects the four-state machine, exits, bans and prober progre
   assert.deepEqual(cooling?.bannedModels, [{ model: 'muse-spark-1.2-contributor-free', state: 'banned', bannedAt: 123 }])
   assert.deepEqual(cooling?.passive, { ok: 12, limited: 2, refused: 0, dead: 1, transport: 0 })
   assert.deepEqual(view.prober, { queued: 0, inFlight: 1, enqueued: 5, completed: 4 })
+  // Issue #106: the automatic loop's own state rides /status, so the card can
+  // distinguish "the loop is working" from "nothing but my button probes".
+  assert.deepEqual(view.periodic, { running: true, lastRunAt: 1_700_000_000_000, lastQueued: 3, intervalMs: 120_000 })
   assert.equal(view.refill?.admitted, 2)
   // URL count only — subscription URLs never ride the bridge.
   assert.equal(view.subscription?.urlCount, 2)
@@ -185,6 +189,8 @@ test('status view degrades to a disabled stub without a runtime', () => {
   assert.equal(view.total, 0)
   assert.equal(view.pinned, null)
   assert.deepEqual(view.exits, [])
+  assert.equal(view.periodic.running, false)
+  assert.equal(view.periodic.lastRunAt, 0)
 })
 
 // -- bridge: handlers ------------------------------------------------------------
