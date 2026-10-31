@@ -46,6 +46,8 @@ export class RoutingInstaller {
   #deferredReason: DeferredReason = null
   /** The built-in fetch saved aside while the module fetch is installed (R2). */
   #savedGlobalFetch: unknown = null
+  /** The module fetch this installer installed, so disable() only restores its own hook. */
+  #installedGlobalFetch: unknown = null
 
   constructor(deps: InstallerDeps) {
     this.#deps = deps
@@ -150,6 +152,7 @@ export class RoutingInstaller {
     if (typeof moduleFetch === 'function' && globalThis.fetch !== moduleFetch) {
       this.#savedGlobalFetch = globalThis.fetch
       ;(globalThis as { fetch: unknown }).fetch = moduleFetch
+      this.#installedGlobalFetch = moduleFetch
       this.#deps.logger?.info('opencode2dsh: globalThis.fetch -> undici module fetch (built-in fetch bypasses the pool dispatcher otherwise)')
     }
     this.#deps.logger?.info('opencode2dsh: global dispatcher -> PoolRoutingDispatcher (exit routing enabled)')
@@ -160,10 +163,18 @@ export class RoutingInstaller {
     if (!this.#enabled) return
     this.#enabled = false
     const restoreFetch = this.#savedGlobalFetch !== null
-    if (restoreFetch) {
+    const ownsFetch = restoreFetch && globalThis.fetch === this.#installedGlobalFetch
+    // Identity-guarded restore (same rule as bun-transport.ts): a newer hook
+    // may own globalThis.fetch now — e.g. the opt-in Bun transport installed
+    // after the pool — and disabling the pool must not silently wipe it, which
+    // would drop the free lane back to the Node transport and resurrect 429.
+    if (ownsFetch) {
       ;(globalThis as { fetch: unknown }).fetch = this.#savedGlobalFetch
-      this.#savedGlobalFetch = null
+    } else if (restoreFetch) {
+      this.#deps.logger?.warn('opencode2dsh: globalThis.fetch was replaced after the pool installed its hook; leaving the newer hook in place')
     }
+    this.#savedGlobalFetch = null
+    this.#installedGlobalFetch = null
     let restored = false
     // Destroy OUR layer before installing the previous one back: leaving the
     // router alive while the slot points elsewhere would keep its per-exit
@@ -192,7 +203,7 @@ export class RoutingInstaller {
     }
     this.#deps.logger?.info(
       restored
-        ? `opencode2dsh: exit routing disabled; previous global dispatcher restored${restoreFetch ? ' and globalThis.fetch restored' : ''}`
+        ? `opencode2dsh: exit routing disabled; previous global dispatcher restored${ownsFetch ? ' and globalThis.fetch restored' : ''}`
         : 'opencode2dsh: exit routing disabled; no previous dispatcher to restore',
     )
   }
