@@ -42,11 +42,16 @@ export function environmentPayload(body: string, platform = process.platform): s
   const payload = JSON.parse(body) as Record<string, unknown>
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('Expected a JSON request object')
   const environment = `<env>\n  Working directory: .\n  Platform: ${platform}\n</env>`
+  // The lane inspects the prompt for both markers, not merely an <env> tag:
+  // a block that lacks "Working directory:" does not satisfy the gate
+  // (probed 2026-10-31: <env> + Platform only → 429, <env> + Working directory
+  // → 200). Append our block when either marker is missing.
+  const hasEnvironment = (text: string) => /<env>/i.test(text) && /Working directory\s*:/i.test(text)
   if (Array.isArray(payload.messages)) {
     const messages = payload.messages as Array<{ role: string; content: unknown }>
     const system = messages.filter(message => message.role === 'system' || message.role === 'developer')
     const text = system.map(message => typeof message.content === 'string' ? message.content : JSON.stringify(message.content)).join('\n')
-    if (!/<env>[\s\S]*?<\/env>/.test(text)) {
+    if (!hasEnvironment(text)) {
       const existing = messages.find(message => message.role === 'system' && typeof message.content === 'string')
       if (existing) existing.content += `\n\nProtocol environment metadata; resolve relative paths using the host workspace instructions:\n${environment}`
       else messages.unshift({ role: 'system', content: environment })
@@ -54,7 +59,7 @@ export function environmentPayload(body: string, platform = process.platform): s
   } else if (Array.isArray(payload.input)) {
     if (payload.instructions !== undefined && typeof payload.instructions !== 'string') throw new Error('Expected text instructions')
     const instructions = payload.instructions as string | undefined
-    if (!/<env>[\s\S]*?<\/env>/.test(instructions ?? '')) payload.instructions = `${instructions ? instructions + '\n\n' : ''}${environment}`
+    if (!hasEnvironment(instructions ?? '')) payload.instructions = `${instructions ? instructions + '\n\n' : ''}${environment}`
   } else throw new Error('Expected chat messages or Responses input')
   return JSON.stringify(payload)
 }
@@ -165,10 +170,13 @@ export class BunTransport {
     this.#active.set(child, stop)
     request.signal.addEventListener('abort', onAbort, { once: true })
     if (request.signal.aborted) onAbort()
-    arm(this.#options.headerTimeoutMs ?? 30_000, 'response-header')
     try {
       await new Promise<void>((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject) })
       if (terminal) { child.kill(); throw terminal }
+      // Start the header deadline only after the worker has spawned: process
+      // startup latency under parallel load must not eat the response-header
+      // budget (this made the deadline test flaky at 250 ms budgets).
+      arm(this.#options.headerTimeoutMs ?? 30_000, 'response-header')
       const pairs: Array<[string, string]> = []
       headers.forEach((value, name) => pairs.push([name, value]))
       child.stdin.end(JSON.stringify({ url: destination.href, headers: pairs, body }))
