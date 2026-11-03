@@ -73,6 +73,12 @@ export interface PoolRoutingOptions {
   headersMs?: number
   /** Log sink for routing decisions (diagnostics). */
   logger?: { warn(message: string): void }
+  /** Starvation signal (issue #106): fired when a proxied request finds the
+   *  pool NON-empty but with no usable exit (pick -> null) and falls back
+   *  direct. The runtime wires this to PeriodicProber.urgent() so a collapsed
+   *  pool re-probes its dead exits immediately instead of after the 30-min
+   *  dead-retry gate; the prober rate-limits, so per-request firing is fine. */
+  onStarved?: () => void
 }
 
 const DEFAULT_PROXY_HOSTS = ['opencode.ai']
@@ -162,6 +168,7 @@ export class PoolRoutingDispatcher implements RoutingDispatcherSurface {
   #headersMs: number
   #onTransportDeath?: (exitId: string) => void
   #logger?: { warn(message: string): void }
+  #onStarved?: () => void
   /** Direct path for non-pool hosts and loopback. */
   #direct: Dispatcher
   /** LRU of per-exit ProxyAgents (docs/ip-pool.md 2, exit multi-instance). */
@@ -181,6 +188,7 @@ export class PoolRoutingDispatcher implements RoutingDispatcherSurface {
     this.#sentinelMs = options.sentinelMs ?? 2_000
     this.#headersMs = options.headersMs ?? 10_000
     this.#logger = options.logger
+    this.#onStarved = options.onStarved
     this.#direct = new options.undici.Agent()
   }
 
@@ -278,6 +286,13 @@ export class PoolRoutingDispatcher implements RoutingDispatcherSurface {
           `opencode2dsh: no usable exit for ${host} — request goes DIRECT (pool empty, all dead, cooling or banned)`,
         )
       }
+      // A NON-empty pool here means every exit is dead/banned/cooling — the
+      // collapse case issue #106 reported: real traffic strikes each exit
+      // dead one by one (a shared cause: tunnel crash, local outage), then
+      // sits on the direct fallback until the 30-min dead-retry gate opens.
+      // Hand the runtime the starvation signal so recovery probing starts on
+      // its own; an empty pool has nothing to recover and stays silent.
+      if (this.#pool.list().length > 0) this.#onStarved?.()
       return this.#direct.dispatch(options, handler)
     }
     const agent = this.#agentFor(exitId)

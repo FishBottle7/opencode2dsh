@@ -126,6 +126,8 @@ FATAL[0000] initialize outbound[140]: unknown uTLS fingerprint: unsafe
 
 1. **映射期白名单**：`applyTLS` 只透传 sing-box 实测接受的 uTLS 指纹集合（chrome/firefox/edge/safari/360/qq/ios/android/random/randomized），未知值直接丢弃、退回 sing-box 自带 TLS 栈——这正是源词表里 `unsafe` 的语义。
 2. **预检失败即二分隔离**：坏节点逐个剔除后重生成配置，只牺牲真正非法的节点（实测：4 节点批次里 1 个 `unknown method` 被精确摘出，其余 3 个正常转换），并把 check 的输出尾部（FATAL 行在最后）回显给用户，而不是只抛一句无从下手的 "config check failed"。全部节点都被判非法时才报错——那说明问题不在节点而在二进制/环境。
+
+**崩溃看护（2026-10-22，issue #106）**：所有转换出口是**同一个** sing-box 进程的本地端口，进程一崩整池加密节点同时失联——真实流量会把每个出口逐个判死（对着死端口全是 transport），而修复进程的却只有下一次订阅刷新（默认 30min）。现在子进程意外退出由 watchdog 自动带退避重启（1s→2s→…→60s 封顶，稳定运行 5min 后退避重置），与刷新解耦；出口侧的误判恢复交给 §4.3 的塌空紧急探活。
 2. ~~**GoProxy 实例**~~（原选项 2，2026-09-05 摘牌）：内建能力覆盖后残余价值归零（§1.2）；外部核心只剩 sing-box standalone 一条路。
 
 **「我们历史上外挂过 Go（legacy/ sidecar），是不是自己写个 Go 端更好做？」——不。要外挂的是 sing-box 这个进程，不是「我们的 Go」**
@@ -456,9 +458,12 @@ POST {zen}/v1/chat/completions
 | --- | --- | --- |
 | 启动/启用后首轮 | 全出口 × probeModels（两级调度，§4.1） | 一次性 |
 | 周期 | 冷却到期的 + 从未探过的（新入池出口）+ dead 复探 + suspect 待复核的 | 默认 10min（probeIntervalMs，单轮上限 20） |
+| **塌空紧急（2026-10-22，issue #106）** | 池子非空但**无任何可用出口**（pick→null，流量被迫直连）→ 一轮**无视 deadRetryMs 门槛**的 dead 复探（单轮上限照旧；冷却中的出口仍不探——429 冷却的正确恢复就是等） | 每次请求触发、内部 5min 冷却限流 |
 | 按需 | 设置页单出口「探测」/「批量探活」按钮 | 用户点击 |
 | 被动 | 真实请求的成败写入两级健康（免费的探活） | 每次请求 |
 | 死亡复核 | 真实流量刚判死（transport）的出口立即插队复探一次（#106） | 每次死亡（在途去重） |
+
+**塌空时保守节拍反转为停电（issue #106 修订）**：dead 复探的 30min 门槛与单轮 20 上限是为「大量死出口、配额高于一切」的场景定制的（559 死订阅实测）；但池子**一个可用出口都不剩**时这笔账反过来了——配额要保护的流量已经没了，恢复延迟本身就是故障时长。实测形态：一个共享根因（sing-box 崩溃、本机断网）把所有出口逐个打死，随后 30+ 分钟里唯一快的恢复手段是用户手动点「探测」。现在 dispatcher 在 pick→null 且表非空时触发 `PeriodicProber.urgent()`：秒级重探刚打死的出口（多数误判当场翻案），5min 冷却保证全死池子最多每 5 分钟烧 20 个冒烟而不是每个失败请求烧一次。空池不触发（没有可恢复的东西）。
 
 周期探活由 `PeriodicProber` 驱动（`src/pool/periodic-prober.ts`）。挑选顺序即上表优先级，
 仍在冷却期的出口不入选——探测要烧匿名通道配额，不能白探。**为什么它必须存在**
@@ -548,8 +553,9 @@ dead 复探排在最后，再被单轮上限截断——于是死链能否回池
 | deadRetryShare | 25%（≥1） | 单轮里给 dead 复探预留的份额（#106）：live 桶优先但不得占满，避免死链回池被饿死 |
 | limitedCooldownBase | 60s | 首次 429 冷却 |
 | limitedCooldownMax | 30min | 指数退避上限 |
-| deadRetryMs | 30min | dead 出口重新探测间隔（从被打死一刻起算，`markDeadStrike` 记录死亡时间戳）。真实流量判死时的即时复核见 §4.3，不走这条门槛 |
+| deadRetryMs | 30min | dead 出口重新探测间隔（从被打死一刻起算，`markDeadStrike` 记录死亡时间戳）。真实流量判死时的即时复核见 §4.3，不走这条门槛；池子塌空时被 urgent 旁路（§4.3） |
 | unmeasuredRetryMs | 30min | 探过但仍测不出 facts（`latencyMs` 恒为 0）的出口再次入队的最小间隔（#106）：否则它们每轮抢名额、并把它后面的 dead 复探挤掉 |
+| urgentCooldownMs | 5min | 塌空紧急复探的内部冷却（全死池持续失败时的配额护栏，§4.3） |
 | avoidMs | 30s | avoid 名单（旋转失败 backoff）有效期 |
 | modelBanConfirmations | 2 | suspect → banned 确认次数（防瞬时抖动误杀） |
 | maxRotateAttempts | 3 | 单请求换出口上限（§3.4） |

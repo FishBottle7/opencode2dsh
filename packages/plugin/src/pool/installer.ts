@@ -29,6 +29,8 @@ export interface InstallerDeps {
   /** Verify-on-death hook handed to every installed router (issue #106). */
   onTransportDeath?: (exitId: string) => void
   logger?: { info(message: string): void; warn(message: string): void }
+  /** Starvation signal, forwarded to the router (dispatcher onStarved). */
+  onStarved?: () => void
 }
 
 /**
@@ -114,6 +116,7 @@ export class RoutingInstaller {
       undici: this.#deps.undici,
       proxyHosts: this.#deps.proxyHosts,
       logger: this.#deps.logger,
+      onStarved: this.#deps.onStarved,
     })
     // Attach the verify-on-death hook (issue #106) to the fresh router; the
     // setter is the single mechanism (see PoolRoutingDispatcher). It may still

@@ -161,11 +161,21 @@ export async function startIpPool(
   }
 
   const { RoutingInstaller } = await import('./pool/installer.ts')
+  /**
+   * Periodic health probe loop, assigned once the piece it drives (probeExit)
+   * exists below. Declared before the installer because the installer's
+   * starvation hook (issue #106) closes over it: a proxied request finding a
+   * non-empty pool with no usable exit fires PeriodicProber.urgent(), one
+   * dead-retry round that ignores the 30-min gate, so a collapsed pool
+   * recovers on its own instead of waiting for the user to click "probe".
+   */
+  let periodicRef: PeriodicProber | null = null
   const installer = new RoutingInstaller({
     pool,
     undici,
     proxyHosts: ipPool.proxyHosts,
     logger,
+    onStarved: () => { void periodicRef?.urgent() },
   })
 
   const admissionDeps: AdmissionDeps = {
@@ -233,13 +243,6 @@ export async function startIpPool(
     subscriptions.setUrls(urls)
     return subscriptions
   }
-
-  /**
-   * Periodic health probe loop, assigned once the piece it drives (probeExit)
-   * exists below. Declared here because applyConfig — defined next and invoked
-   * at start AND on every settings commit — needs to start/stop it.
-   */
-  let periodicRef: PeriodicProber | null = null
 
   /** Apply the config to the live objects (initial start + reconfigure). */
   const applyConfig = (): void => {
