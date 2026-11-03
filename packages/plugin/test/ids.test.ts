@@ -237,3 +237,18 @@ test('mintProbeSessionID does not touch the conversation memo', () => {
   assert.equal(canonicalSessionID('memo-isolation-check'), conversation,
     'a probe mint never evicts or rewrites a live conversation session')
 })
+
+test('probe mints cannot evict a live conversation even at the memo cap (strong form)', () => {
+  // Review finding: the earlier 50-mint check never fills the memo, so an
+  // implementation that (wrongly) wrote probe ids into sessionMemo would
+  // still pass it. Strong form: fill the memo to its 1024 cap with the
+  // guarded conversation as the OLDEST entry — at the cap, any insert evicts
+  // FIFO-first, so if mintProbeSessionID touched the memo at all, the very
+  // first mint would evict exactly this conversation.
+  const guarded = 'memo-cap-guard-conversation'
+  const expected = canonicalSessionID(guarded)
+  for (let i = 0; i < 1023; i += 1) canonicalSessionID(`cap-filler-${i}`)
+  for (let i = 0; i < 50; i += 1) mintProbeSessionID()
+  assert.equal(canonicalSessionID(guarded), expected,
+    'the oldest live conversation survives 50 probe mints at the memo cap')
+})
