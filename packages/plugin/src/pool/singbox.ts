@@ -461,25 +461,45 @@ export class SingBoxSupervisor {
    * in seconds. Backoff 1s -> 2s -> ... -> 60s; a stable run resets the ladder.
    */
   #scheduleWatchdog(): void {
-    // One pending restart at a time. NOTE: scheduling must NOT be gated on
-    // #reloading — a child can die inside reload()'s own port-readiness wait
-    // (crash-during-startup), and that reload then throws without ever
-    // clearing this timer; #watchdogRestart re-checks #reloading when the
-    // timer fires, which is the only place the guard belongs. It IS gated on
-    // the owner-intent latch: after stop()/dispose() the supervisor must stay
-    // down, whatever exit events stale children still emit.
-    if (this.#watchdog !== null) return
-    if (this.#ownerStopped) return
-    const backoff = Math.min(WATCHDOG_MAX_BACKOFF_MS, WATCHDOG_BASE_BACKOFF_MS * 2 ** this.#watchdogAttempt)
-    this.#watchdogAttempt += 1
-    this.#options.logger?.warn(
-      `opencode2dsh: sing-box exited unexpectedly; watchdog restart #${this.#watchdogAttempt} in ${Math.round(backoff / 1000)}s (${this.#nodes.length} converted exit(s) down until then)`,
-    )
+    const attempt = this.#watchdogAttempt
+    if (this.#armWatchdog(attempt)) {
+      this.#watchdogAttempt = attempt + 1
+      const backoff = Math.min(WATCHDOG_MAX_BACKOFF_MS, WATCHDOG_BASE_BACKOFF_MS * 2 ** attempt)
+      this.#options.logger?.warn(
+        `opencode2dsh: sing-box exited unexpectedly; watchdog restart #${attempt + 1} in ${Math.round(backoff / 1000)}s (${this.#nodes.length} converted exit(s) down until then)`,
+      )
+    }
+  }
+
+  /**
+   * Re-arm WITHOUT climbing the backoff ladder or logging again (review
+   * finding): the re-arm in #watchdogRestart covers a reload that is still
+   * working the problem — the same crash, not a new one. Bumping the attempt
+   * there let a single 10s reload re-arm at 1s/2s/4s/8s and left the NEXT
+   * real crash starting the ladder at 8s instead of 1s.
+   */
+  #rearmWatchdog(): void {
+    this.#armWatchdog(this.#watchdogAttempt)
+  }
+
+  /** Shared arm step; false when a timer is pending or the owner said stop.
+   *  NOTE: arming must NOT be gated on #reloading — a child can die inside
+   *  reload()'s own port-readiness wait (crash-during-startup), and that
+   *  reload then throws without ever clearing this timer; #watchdogRestart
+   *  re-checks #reloading when the timer fires, which is the only place the
+   *  guard belongs. It IS gated on the owner-intent latch: after
+   *  stop()/dispose() the supervisor must stay down, whatever exit events
+   *  stale children still emit. */
+  #armWatchdog(attemptForBackoff: number): boolean {
+    if (this.#watchdog !== null) return false
+    if (this.#ownerStopped) return false
+    const backoff = Math.min(WATCHDOG_MAX_BACKOFF_MS, WATCHDOG_BASE_BACKOFF_MS * 2 ** attemptForBackoff)
     this.#watchdog = setTimeout(() => {
       this.#watchdog = null
       void this.#watchdogRestart()
     }, backoff)
     this.#watchdog.unref?.()
+    return true
   }
 
   #clearWatchdog(): void {
@@ -497,11 +517,12 @@ export class SingBoxSupervisor {
     // that will FAIL for the crashed child is still looping. Returning bare
     // there left nobody holding the recovery: the reload threw afterwards and
     // the tunnel stayed down until the next subscription refresh (the exact
-    // shape issue #106 reported). #scheduleWatchdog's single-timer guard makes
-    // this re-arm idempotent, and if the in-flight reload actually succeeds,
-    // the next fire exits on the #running check below.
+    // shape issue #106 reported). The re-arm is idempotent (single-timer
+    // guard) and does not climb the backoff ladder — this is the same crash,
+    // not a new one; if the in-flight reload actually succeeds, the next fire
+    // exits on the #running check below.
     if (this.#reloading) {
-      this.#scheduleWatchdog()
+      this.#rearmWatchdog()
       return
     }
     if (this.#nodes.length === 0) return
@@ -586,6 +607,10 @@ export class SingBoxSupervisor {
     // landed inside this reload's window (epoch unchanged): one that slipped
     // past the pre-spawn check must still win and keep the watchdog disarmed.
     if (this.#stopEpoch === epochAtEntry) this.#ownerStopped = false
+    // A successful spawn makes any pending watchdog pass moot — without this
+    // a re-armed timer lingered and fired into the #running check (harmless
+    // but noisy). The next real crash arms a fresh one via onGone.
+    this.#clearWatchdog()
     // A run that survives the stability window forgives the crash history:
     // the next crash starts the backoff ladder from the bottom again. The
     // attempt guard keeps an old timer from erasing a NEWER crash's ladder.
@@ -605,6 +630,15 @@ export class SingBoxSupervisor {
     const onGone = (): void => {
       if (this.#child !== child) return
       this.#running = false
+      // Drop the dead child NOW. A spawn-level failure (ENOENT/EACCES/EMFILE)
+      // fires 'error' with NO 'exit' — Node documents exit as "may or may not
+      // fire" after error — and #killChild's kill branch then waits on an
+      // 'exit' that never comes, so a watchdog reload's promise never settles,
+      // #reloading sticks true, and every later timer hit just re-arms: the
+      // watchdog dead-ends until the next subscription refresh. Nulling here
+      // routes #killChild through its fast path instead. The identity guard
+      // above keeps a stale handler (stop()/reload() already moved on) a no-op.
+      this.#child = null
       this.#scheduleWatchdog()
     }
     child.once('exit', onGone)

@@ -349,3 +349,72 @@ test('supervisor: an unexpected child exit is restarted by the watchdog; an inte
   assert.equal(runs(), 0, 'stop() cancels the pending watchdog restart; a stopped pool stays stopped')
   assert.equal(supervisor.running, false)
 })
+
+// Regression (review of #111): a spawn-LEVEL failure fires 'error' with no
+// 'exit' (Node: exit "may or may not fire" after error). Before the fix the
+// dead child stayed in #child with exitCode null, so the watchdog restart's
+// #killChild waited on an exit that never comes — the reload promise never
+// settled, #reloading stuck true, and every later timer hit just re-armed:
+// the watchdog dead-ended until the next subscription refresh.
+test('supervisor: a spawn failure (error, no exit) does not wedge the watchdog', async () => {
+  const runChildren: Array<{ exitCode: number | null; once(event: string, cb: (arg?: unknown) => void): void; emit(event: string, code?: number): void; kill(): boolean; pid: number; stderr: { on(): void } }> = []
+  const fakeChild = () => {
+    const listeners = new Map<string, Array<(arg?: unknown) => void>>()
+    const child = {
+      pid: 20_000 + runChildren.length,
+      exitCode: null as number | null,
+      stderr: { on() {} },
+      once(event: string, cb: (arg?: unknown) => void) { listeners.set(event, [...(listeners.get(event) ?? []), cb]) },
+      kill() { return true },
+      emit(event: string, code?: number) {
+        if (event === 'exit') child.exitCode = code ?? 0
+        for (const cb of listeners.get(event) ?? []) cb(code)
+      },
+    }
+    return child
+  }
+  const spawnFn = ((_binary: string, args: string[]) => {
+    const child = fakeChild()
+    if (args[0] === 'version' || args[0] === 'check') {
+      const check = child
+      queueMicrotask(() => check.emit('exit', 0))
+    } else if (args[0] === 'run') {
+      runChildren.push(child)
+    }
+    return child as unknown as import('node:child_process').ChildProcess
+  }) as typeof import('node:child_process').spawn
+
+  const supervisor = new SingBoxSupervisor({
+    binPath: process.execPath,
+    dataDir: 'test-tmp-singbox-watchdog',
+    basePort: 39_223,
+    readyTimeoutMs: 1_500,
+    spawnFn,
+    logger: { info: () => {}, warn: () => {} },
+  })
+  try {
+    const first = supervisor.reload([vmessNode()])
+    const deadline = Date.now() + 5_000
+    while (runChildren.length === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    // the spawn itself fails: 'error' and NO 'exit' ever
+    runChildren[0]!.emit('error')
+    await assert.rejects(() => first, /exited immediately/i)
+    // The watchdog must actually recover (the bug: its reload hung forever in
+    // #killChild waiting on the exit that never fires). 2.5s > 1s backoff.
+    const restartDeadline = Date.now() + 2_500
+    while (!supervisor.running && Date.now() < restartDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+    assert.equal(supervisor.running, true, 'the watchdog restart settles despite the missing exit event')
+  } finally {
+    // Same discipline as the test above: settle the child (exitCode set) so
+    // stop() takes the no-kill fast path — a stay-alive fake would hang the
+    // kill branch forever (its 'exit' never fires) AND risk taskkill /T on a
+    // pid that may belong to a real process.
+    const last = runChildren[runChildren.length - 1]
+    if (last && last.exitCode === null) last.emit('exit', 0)
+    await supervisor.stop()
+  }
+})
