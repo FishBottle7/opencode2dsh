@@ -136,13 +136,18 @@ export function invertedTimestampHex(now: number = Date.now()): string {
 const SESSION_MEMO_LIMIT = 1024
 const sessionMemo = new Map<string, string>()
 
+/** The common mint: real inverted-clock timestamp + a 14-char Base62 tail. */
+function mintSession(randomTail: bigint, now: number): string {
+  return `ses_${invertedTimestampHex(now)}${base62Fixed(randomTail, 14)}`
+}
+
 /**
  * The session id sent upstream. A signal that already carries an official
  * OpenCode session passes through unchanged (preserving upstream prompt-cache
  * affinity); any other identity — the conversation seed in adapter mode,
- * foreign client sessions, admission probes — is expanded into a canonical id
- * whose timestamp segment is a REAL clock (issue #62), with the conversation
- * identity folded into the Base62 tail so distinct conversations never collide.
+ * foreign client sessions — is expanded into a canonical id whose timestamp
+ * segment is a REAL clock (issue #62), with the conversation identity folded
+ * into the Base62 tail so distinct conversations never collide.
  */
 export function canonicalSessionID(signal: string): string {
   if (CANONICAL_SESSION_PATTERN.test(signal)) return signal
@@ -151,9 +156,7 @@ export function canonicalSessionID(signal: string): string {
   if (memoized !== undefined) return memoized
 
   const sum = createHash('sha256').update('ses\x00' + signal).digest()
-  const timePart = invertedTimestampHex()
-  const randomPart = base62Fixed(BigInt('0x' + sum.subarray(6, 16).toString('hex')), 14)
-  const session = `ses_${timePart}${randomPart}`
+  const session = mintSession(BigInt('0x' + sum.subarray(6, 16).toString('hex')), Date.now())
 
   // Evict the oldest entry rather than clearing. Insertion-ordered Map, so
   // this is FIFO by first mint, NOT LRU: a hit returns early above and does
@@ -165,6 +168,28 @@ export function canonicalSessionID(signal: string): string {
   }
   sessionMemo.set(signal, session)
   return session
+}
+
+/**
+ * A FRESH canonical session per call, for probes — never memoized, never
+ * derived from a stable signal.
+ *
+ * The free tier meters per session(+project) id and egress IP: a probe path
+ * presenting one pinned identity charges a single shared bucket, and once a
+ * busy exit has drained that bucket every further probe answers 429
+ * FreeUsageLimitError while real conversations on the same process and egress
+ * still succeed — the probe then records the model/exit as unavailable for
+ * the next probe interval (observed and fixed in jasonxu114514/opencode2api
+ * #162, 2026-10-29; NeeYoonc's #112 lane doc independently notes the
+ * per-egress daily quota that "diagnostic traffic drains"). A probe is not a
+ * conversation, so it must not present one: each attempt mints its own id.
+ *
+ * Shape stays canonical (real clock, counter 1 — the #62 gate rules), and it
+ * bypasses the conversation memo both ways: probes never evict live
+ * conversations, and two probes never collide on one bucket.
+ */
+export function mintProbeSessionID(): string {
+  return mintSession(BigInt('0x' + randomBytes(10).toString('hex')), Date.now())
 }
 
 /** CLI-identical user agent (ids.go opencodeUserAgent, node runtime values). */
