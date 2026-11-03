@@ -20,7 +20,7 @@ import type { Dispatcher } from 'undici'
 
 import { ZEN_BASE_URL } from '../adapter/catalog.ts'
 import { FREE_LANE_GATE_TOOL_NAMES, freeLaneGateTool } from '../adapter/messages.ts'
-import { canonicalSessionID, disguiseHeaders, opencodeUserAgent, randomID, stableID } from '../adapter/ids.ts'
+import { disguiseHeaders, mintProbeSessionID, opencodeUserAgent, randomID, stableID } from '../adapter/ids.ts'
 import { gradeOf, type ExitNode, type ExitPool, type ExitProtocol, type ProbeFailure } from './pool.ts'
 import { exitProxyUri, httpsProxyOptions } from './dispatcher.ts'
 
@@ -285,12 +285,17 @@ export async function admitCandidate(
   // OpenCode") — the smoke request must carry the same disguise set the
   // adapter sends, or every candidate fails step 4 regardless of exit
   // quality (a full refill round admitted 0 of 701 tunnel-OK survivors).
-  // Per-candidate ids: the upstream correlates sessions with exits, so a
-  // probe session must not collide with real adapter sessions. The canonical
-  // mapping (ids.ts) is mandatory here too — the old 24-hex probe sessions
-  // drew 403 FreeTierError on the free lane like every other foreign shape.
+  // FRESH identity per attempt (2026-11-03, borrowed from
+  // jasonxu114514/opencode2api #162): the free tier meters per session id
+  // and egress IP, and the upstream correlates sessions with exits — a probe
+  // session pinned per candidate (the previous shape) charged ONE bucket per
+  // exit across every admission/re-probe/verify attempt, so a busy exit's
+  // bucket drained and every later smoke read 429 as "exit dead". A probe is
+  // not a conversation; each attempt mints its own canonical id (the #62
+  // shape rules still apply — the old 24-hex probe sessions drew 403
+  // FreeTierError like every other foreign shape).
   const probeHeaders = disguiseHeaders({
-    session: canonicalSessionID(`admission:${candidate.address}`),
+    session: mintProbeSessionID(),
     request: randomID('req', 16),
     project: stableID('prj', 'opencode2dsh:default-project'),
     parentSession: '',
@@ -373,12 +378,6 @@ export async function admitCandidate(
       headers: {
         authorization: 'Bearer public',
         'content-type': 'application/json',
-        ...disguiseHeaders({
-          session: canonicalSessionID('opencode2dsh:admission-smoke'),
-          request: randomID('req', 16),
-          project: stableID('prj', 'opencode2dsh:admission'),
-          parentSession: '',
-        }),
         ...probeHeaders,
       },
       body: JSON.stringify({

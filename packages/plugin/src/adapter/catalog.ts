@@ -1,7 +1,7 @@
 import { readFile, rename, rm, writeFile, mkdir } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
-import { deriveRequestIDs, disguiseHeaders, opencodeUserAgent } from './ids.ts'
+import { disguiseHeaders, mintProbeSessionID, opencodeUserAgent, randomID, stableID } from './ids.ts'
 import { FREE_LANE_GATE_TOOL_NAMES, freeLaneGateTool } from './messages.ts'
 import { apiForModel } from './routing.ts'
 
@@ -797,7 +797,18 @@ export function defaultProbeImpl(
 ): (model: string, api: 'openai-responses' | 'openai-completions') => Promise<ProbeVerdict> {
   const base = zenBaseUrl.replace(/\/+$/, '')
   return async (model, api) => {
-    const ids = deriveRequestIDs([{ role: 'user', content: 'probe' }])
+    // FRESH identity per probe attempt (2026-11-03, borrowed from
+    // jasonxu114514/opencode2api #162): this used to derive from a pinned
+    // "probe" signal, so every probe everywhere shared ONE (session, egress)
+    // bucket — once a busy egress drained it, every probe answered 429 and
+    // the model was cached as unavailable while real conversations on the
+    // same egress still worked. A probe is not a conversation.
+    const ids = {
+      session: mintProbeSessionID(),
+      request: randomID('req', 16),
+      project: stableID('prj', 'opencode2dsh:default-project'),
+      parentSession: '',
+    }
     const headers: Record<string, string> = {
       ...disguiseHeaders(ids),
       'content-type': 'application/json',

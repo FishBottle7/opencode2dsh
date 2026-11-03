@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { canonicalSessionID, conversationSeed, deriveRequestIDs, disguiseHeaders, invertedTimestampHex, opencodeUserAgent, randomID, stableID } from '../src/adapter/ids.ts'
+import { canonicalSessionID, conversationSeed, deriveRequestIDs, disguiseHeaders, invertedTimestampHex, mintProbeSessionID, opencodeUserAgent, randomID, stableID } from '../src/adapter/ids.ts'
 
 test('stableID is deterministic and sha256-truncated', () => {
   const first = stableID('ses', 'hello')
@@ -210,4 +210,30 @@ test('disguiseHeaders carries the CLI-identical correlation set', () => {
   assert.equal(headers['x-opencode-project'], 'global')
   assert.ok(headers['user-agent'].startsWith('opencode/'))
   assert.ok(headers['user-agent'].includes(process.platform))
+})
+
+// -- probe identity: fresh per attempt (borrowed from opencode2api #162) ------
+
+test('mintProbeSessionID: canonical shape, gate-legal counter, never repeats', () => {
+  const seen = new Set<string>()
+  for (let i = 0; i < 200; i += 1) {
+    const id = mintProbeSessionID()
+    assert.match(id, /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/, 'canonical shape')
+    // #62 gate rules: decode the inverted timestamp half back — the low 12
+    // bits must be a counter the free tier accepts ([0, 63]); we mint 1.
+    const inverted = BigInt('0x' + id.slice(4, 16))
+    const counter = Number(~inverted & 0xfffn)
+    assert.ok(counter <= 63, `counter ${counter} inside the gate window`)
+    assert.ok(!seen.has(id), 'every attempt presents a fresh identity')
+    seen.add(id)
+  }
+})
+
+test('mintProbeSessionID does not touch the conversation memo', () => {
+  const conversation = canonicalSessionID('memo-isolation-check')
+  const before = canonicalSessionID('memo-isolation-check')
+  assert.equal(conversation, before, 'sanity: memoized')
+  for (let i = 0; i < 50; i += 1) mintProbeSessionID()
+  assert.equal(canonicalSessionID('memo-isolation-check'), conversation,
+    'a probe mint never evicts or rewrites a live conversation session')
 })
