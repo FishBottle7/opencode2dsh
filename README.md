@@ -69,7 +69,7 @@ present if DSH runs); outbound HTTPS to `opencode.ai` and `models.dev`.
 
 ### Optional: Bun / OpenCode v2 compatibility transport (#108)
 
-When official v2 works but this adapter persistently returns `429 FreeUsageLimitError`, an existing Bun installation (tested: 1.4.4) can be used for anonymous inference. Disabled by default; no runtime download and no external agent tool execution. It requires the Node IP pool to be disabled. See the [configuration, measured matrix and limits](docs/free-lane-20261028.md). This does not promise to remove real quota limits.
+When official v2 works but this adapter persistently returns `429 FreeUsageLimitError`, an existing Bun installation (tested: 1.4.4) can be used for anonymous inference. Disabled by default; no runtime download and no external agent tool execution. It requires the Node IP pool to be disabled. The transport also caps the free-lane `tools` block to a 16-tool core (`read` first, serialized ≤14 KB, `bunTransport.maxTools` configurable, default 16) and logs the tools hidden for that turn. See the [configuration, measured matrix and limits](docs/free-lane-20261028.md). This does not promise to remove real quota limits.
 
 ## Configuration
 
