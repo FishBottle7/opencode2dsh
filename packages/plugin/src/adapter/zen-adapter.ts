@@ -3,6 +3,7 @@ import * as openaiCompletions from '@earendil-works/pi-ai/api/openai-completions
 import * as openaiResponses from '@earendil-works/pi-ai/api/openai-responses'
 
 import { ModelCatalog, ZEN_BASE_URL } from './catalog.ts'
+import { BunTransport, type BunTransportOptions } from './bun-transport.ts'
 import type { DelegationDelegate } from './delegate.ts'
 import { toStreamChunks, type HarnessChunk, type PiDoneMessage, type PiEvent } from './events.ts'
 import { deriveRequestIDs, disguiseHeaders } from './ids.ts'
@@ -391,6 +392,7 @@ export class ZenAdapter {
    * byte-for-byte unchanged.
    */
   readonly #delegate: DelegationDelegate | null
+  readonly #bunTransport: BunTransport | null = null
 
   constructor(catalog: CatalogLike, options: {
     zenBaseUrl?: string
@@ -402,6 +404,7 @@ export class ZenAdapter {
     responsesBodyIdleMs?: number
     /** Local-opencode delegate for the persistent FreeTierError fallback. */
     delegate?: DelegationDelegate | null
+    bunTransport?: BunTransportOptions
   } = {}) {
     this.#catalog = catalog
     this.#firstEventMs = options.firstEventMs ?? DEFAULT_FIRST_EVENT_MS
@@ -414,6 +417,12 @@ export class ZenAdapter {
       this.#responsesProvider = null
       return
     }
+    this.#bunTransport = options.bunTransport?.enabled ? new BunTransport({
+      ...options.bunTransport,
+      headerTimeoutMs: this.#firstEventMs,
+      bodyIdleMs: this.#bodyIdleMs,
+      responsesBodyIdleMs: this.#responsesBodyIdleMs,
+    }) : null
     const baseUrl = `${(options.zenBaseUrl ?? ZEN_BASE_URL).replace(/\/+$/, '')}/v1`
     const auth = {
       apiKey: {
@@ -427,7 +436,7 @@ export class ZenAdapter {
       baseUrl,
       auth,
       models: [],
-      api: openaiCompletions,
+      api: this.#bunTransport?.wrapApi(openaiCompletions) ?? openaiCompletions,
     }))
     this.#responsesProvider = modelsTransport(createProvider<Api>({
       id: PROVIDER_ID,
@@ -435,9 +444,12 @@ export class ZenAdapter {
       baseUrl,
       auth,
       models: [],
-      api: openaiResponses,
+      api: this.#bunTransport?.wrapApi(openaiResponses) ?? openaiResponses,
     }))
   }
+
+  /** Reap in-flight transport children and release the scoped fetch hook. */
+  dispose(): void { this.#bunTransport?.dispose() }
 
   providerInfo(provider: string): { id: string; name: string } {
     return { id: provider, name: PROVIDER_ID }

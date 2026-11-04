@@ -167,6 +167,16 @@ function applyAdapter(
     bodyIdleMs: cfg.bodyIdleMs,
     responsesBodyIdleMs: cfg.responsesBodyIdleMs,
     delegate,
+    bunTransport: cfg.bunTransport?.enabled
+      ? {
+          ...cfg.bunTransport,
+          isPoolEnabled: () => readIpPool()?.enabled === true,
+          onToolsTrimmed: (dropped: string[]) =>
+            logger.info(
+              `opencode2dsh: free lane hid ${dropped.length} tool(s) for this turn (bunTransport.maxTools=${cfg.bunTransport?.maxTools ?? 16}): ${dropped.join(', ')}`,
+            ),
+        }
+      : undefined,
   })
 
   // Register FIRST: the provider must appear in the selector right away. The
@@ -228,6 +238,7 @@ function applyAdapter(
     maybeEffect.call(ctx, () => () => {
       disposed = true
       catalog.stop()
+      adapter.dispose()
       // Reap the delegated opencode child (no-op when delegation never armed).
       void delegate?.dispose()
     })
