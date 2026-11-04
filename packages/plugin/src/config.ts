@@ -233,6 +233,8 @@ export const Config = Schema.object({
     enabled: Schema.boolean().default(false),
     bunPath: Schema.string().default('bun'),
     clientVersion: Schema.string().default('2.2.0'),
+    /** Max tools forwarded to the free lane (default 16; the lane refuses ~>18). */
+    maxTools: Schema.number().step(1).min(1).max(64).default(16),
   }),
   /**
    * Local OpenCode delegation (docs/delegation.md, issue #76). Ordinary config

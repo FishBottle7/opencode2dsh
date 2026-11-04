@@ -9,6 +9,8 @@ export interface BunTransportConfig {
   /** Existing Bun executable; this feature never downloads a runtime. */
   bunPath?: string
   clientVersion?: string
+  /** Max tools forwarded to the free lane (default 16; the lane refuses ~>18). */
+  maxTools?: number
 }
 
 export interface BunTransportOptions extends BunTransportConfig {
@@ -18,6 +20,8 @@ export interface BunTransportOptions extends BunTransportConfig {
   headerTimeoutMs?: number
   bodyIdleMs?: number
   responsesBodyIdleMs?: number
+  /** Called once per request when the free-lane tool cap hides host tools. */
+  onToolsTrimmed?: (dropped: string[]) => void
 }
 
 const paths = new Set([
@@ -62,6 +66,100 @@ export function environmentPayload(body: string, platform = process.platform): s
     if (!hasEnvironment(instructions ?? '')) payload.instructions = `${instructions ? instructions + '\n\n' : ''}${environment}`
   } else throw new Error('Expected chat messages or Responses input')
   return JSON.stringify(payload)
+}
+
+/**
+ * The free lane inspects the agent-shaped `tools` block more strictly than a
+ * simple non-empty check (live-probed 2026-11-03 with a real quota window):
+ *   - `read` must be present (16 synthetic tools without read → 429);
+ *   - the list may not exceed roughly 18 entries (18 synthetic with read →
+ *     200, 26 DSH tools → 429 even with tiny schemas);
+ *   - the serialized tools block may not exceed roughly 14 KB (16 DSH tools =
+ *     11.9 KB → 200, 18 DSH tools = 15.4 KB → 429, while 45 KB of user
+ *     messages with 16 tools → 200, so the block is what matters).
+ *
+ * Real DSH turns carry 26 tools, so forwarding them unchanged still 429s even
+ * with the correct TLS stack and `<env>` block. This caps the block to the
+ * first `maxTools` entries in a core priority order (read first), injects
+ * `read` when missing, and drops the tail until the serialized block fits the
+ * byte budget. Tool names are never rewritten; dropped tools are simply not
+ * visible to the model for that turn. These numbers are single-day observations
+ * and may change if the upstream tightens again.
+ */
+export const FREE_LANE_TOOL_LIMIT = 16
+export const FREE_LANE_TOOL_BYTES = 14_000
+const FREE_LANE_TOOL_PRIORITY = [
+  'read', 'write', 'edit', 'glob', 'grep', 'bash', 'shell', 'pwsh',
+  'web_search', 'web_fetch', 'webfetch', 'websearch', 'skill', 'subagent',
+  'todo_write', 'working_directory', 'create_goal', 'update_goal', 'get_goal',
+  'exit_plan_mode', 'read_image', 'job_output', 'job_kill', 'job_list',
+  'list_agents', 'send_message', 'subagent_fork', 'interrupt_agent', 'workflow',
+]
+const READ_TOOL_SCHEMA = {
+  description: 'Read a file from the filesystem.',
+  parameters: {
+    type: 'object',
+    properties: {
+      filePath: { type: 'string', description: 'Absolute path of the file to read.' },
+      offset: { type: 'integer', description: 'Line number to start reading from.' },
+      limit: { type: 'integer', description: 'Maximum number of lines to read.' },
+    },
+    required: ['filePath'],
+    additionalProperties: false,
+  },
+}
+
+function toolName(tool: unknown): string {
+  if (!tool || typeof tool !== 'object') return ''
+  const value = tool as Record<string, unknown>
+  if (typeof value.name === 'string') return value.name
+  const fn = value.function as Record<string, unknown> | undefined
+  return fn && typeof fn.name === 'string' ? fn.name : ''
+}
+
+function readToolForShape(tools: unknown[]): unknown {
+  const flat = tools.some(tool => tool && typeof tool === 'object' && typeof (tool as Record<string, unknown>).name === 'string' && !(tool as Record<string, unknown>).function)
+  return flat
+    ? { type: 'function', name: 'read', ...READ_TOOL_SCHEMA }
+    : { type: 'function', function: { name: 'read', ...READ_TOOL_SCHEMA } }
+}
+
+/**
+ * Cap and budget the `tools` block for the free lane.
+ * @returns the possibly rewritten body and the names hidden from this turn.
+ */
+export function capToolPayload(body: string, options: { maxTools?: number; maxBytes?: number } = {}): { body: string; dropped: string[] } {
+  const payload = JSON.parse(body) as Record<string, unknown>
+  const tools = Array.isArray(payload.tools) ? payload.tools as unknown[] : null
+  if (!tools) return { body, dropped: [] }
+  const limit = Math.max(1, Math.floor(options.maxTools ?? FREE_LANE_TOOL_LIMIT))
+  const maxBytes = options.maxBytes ?? FREE_LANE_TOOL_BYTES
+  const remaining = new Map<string, unknown>()
+  for (const tool of tools) {
+    const name = toolName(tool)
+    if (name) remaining.set(name, tool)
+  }
+  const selected: unknown[] = []
+  for (const name of FREE_LANE_TOOL_PRIORITY) {
+    if (remaining.has(name)) {
+      selected.push(remaining.get(name))
+      remaining.delete(name)
+    }
+  }
+  for (const tool of tools) {
+    const name = toolName(tool)
+    if (name && remaining.has(name)) {
+      selected.push(tool)
+      remaining.delete(name)
+    }
+  }
+  if (!selected.some(tool => toolName(tool) === 'read')) selected.unshift(readToolForShape(tools))
+  const capped = selected.slice(0, limit)
+  while (capped.length > 1 && JSON.stringify(capped).length > maxBytes) capped.pop()
+  const kept = new Set(capped.map(tool => toolName(tool)))
+  const dropped = tools.map(tool => toolName(tool)).filter(name => name && !kept.has(name))
+  if (dropped.length === 0) return { body, dropped }
+  return { body: JSON.stringify({ ...payload, tools: capped }), dropped }
 }
 
 // The shared pi-ai/OpenAI SDK has no per-provider fetch seam. Only SDK calls
@@ -135,7 +233,9 @@ export class BunTransport {
     const names: string[] = []
     headers.forEach((_value, name) => names.push(name))
     for (const key of names) if (key.startsWith('x-stainless-') || ['cookie', 'host', 'content-length', 'connection'].includes(key)) headers.delete(key)
-    const body = environmentPayload(await request.text())
+    const capped = capToolPayload(environmentPayload(await request.text()), { maxTools: this.#options.maxTools })
+    if (capped.dropped.length > 0) this.#options.onToolsTrimmed?.(capped.dropped)
+    const body = capped.body
     request.signal.throwIfAborted()
     if (this.#disposed) throw new Error('OpenCode Bun transport is disposed')
     const child = spawn(this.#options.bunPath?.trim() || 'bun', [this.#options.workerPath ?? fileURLToPath(new URL('./bun-worker.mjs', import.meta.url))], {

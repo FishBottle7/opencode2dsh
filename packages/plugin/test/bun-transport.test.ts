@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { setTimeout as delay } from 'node:timers/promises'
-import { BunTransport, environmentPayload, inferenceURL } from '../src/adapter/bun-transport.ts'
+import { BunTransport, FREE_LANE_TOOL_LIMIT, capToolPayload, environmentPayload, inferenceURL } from '../src/adapter/bun-transport.ts'
 import { ZenAdapter } from '../src/adapter/zen-adapter.ts'
 import { Config, resolveConfig } from '../src/config.ts'
 import type { HarnessBlock, HarnessMessage } from '../src/adapter/messages.ts'
@@ -146,4 +146,36 @@ test('actual pi-ai SDK preserves DSH host tools and consumes their results throu
     if (chunk.type === 'finish') finish = chunk.reason
   }
   assert.equal(text, 'PONG'); assert.deepEqual(finish, { kind: 'stop' })
+})
+
+test('tools block is capped for the free lane and reports hidden host tools', () => {
+  const tools = Array.from({ length: 26 }, (_, index) => ({
+    type: 'function',
+    function: { name: index === 0 ? 'read' : `host_tool_${index}`, description: 'Host tool.', parameters: { type: 'object', properties: { input: { type: 'string' } } } },
+  }))
+  const body = JSON.stringify({ messages: [{ role: 'system', content: 'You are DSH.' }, { role: 'user', content: 'hi' }], tools })
+  const capped = capToolPayload(body)
+  const decoded = JSON.parse(capped.body)
+  assert.equal(decoded.tools.length, FREE_LANE_TOOL_LIMIT)
+  assert.equal(decoded.tools[0].function.name, 'read')
+  assert.ok(capped.dropped.length > 0)
+  assert.equal(capped.dropped.length + decoded.tools.length, tools.length)
+  assert.ok(capped.dropped.every(name => !decoded.tools.some((tool: { function: { name: string } }) => tool.function.name === name)))
+})
+
+test('maxTools is honoured and read is injected when the host block lacks it', () => {
+  const tools = Array.from({ length: 10 }, (_, index) => ({ type: 'function', function: { name: `host_tool_${index}`, parameters: { type: 'object', properties: {} } } }))
+  const capped = capToolPayload(JSON.stringify({ messages: [{ role: 'user', content: 'hi' }], tools }), { maxTools: 4 })
+  const decoded = JSON.parse(capped.body)
+  assert.equal(decoded.tools.length, 4)
+  assert.equal(decoded.tools[0].function.name, 'read')
+})
+
+test('flat Responses tools are capped with a flat read definition', () => {
+  const tools = Array.from({ length: 20 }, (_, index) => ({ type: 'function', name: `host_tool_${index}`, parameters: { type: 'object', properties: {} } }))
+  const capped = capToolPayload(JSON.stringify({ input: [{ role: 'user', content: 'hi' }], tools }))
+  const decoded = JSON.parse(capped.body)
+  assert.equal(decoded.tools.length, FREE_LANE_TOOL_LIMIT)
+  assert.equal(decoded.tools[0].name, 'read')
+  assert.equal(decoded.tools[0].function, undefined)
 })
